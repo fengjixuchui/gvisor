@@ -160,9 +160,9 @@ func CopyInPollFDs(t *kernel.Task, addr usermem.Addr, nfds uint) ([]linux.PollFD
 		return nil, syserror.EINVAL
 	}
 
-	pfd := make([]linux.PollFD, nfds)
+	pfd := linux.PollFDSlice(make([]linux.PollFD, nfds))
 	if nfds > 0 {
-		if _, err := t.CopyIn(addr, &pfd); err != nil {
+		if _, err := pfd.CopyInVec(t, addr); err != nil {
 			return nil, err
 		}
 	}
