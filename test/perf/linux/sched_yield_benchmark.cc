@@ -1,4 +1,4 @@
-// Copyright 2019 The gVisor Authors.
+// Copyright 2020 The gVisor Authors.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,16 +12,26 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package usermem
+#include <sched.h>
 
-import (
-	"unsafe"
-)
+#include "gtest/gtest.h"
+#include "benchmark/benchmark.h"
+#include "test/util/test_util.h"
 
-// stringFromImmutableBytes is equivalent to string(bs), except that it never
-// copies even if escape analysis can't prove that bs does not escape. This is
-// only valid if bs is never mutated after stringFromImmutableBytes returns.
-func stringFromImmutableBytes(bs []byte) string {
-	// Compare strings.Builder.String().
-	return *(*string)(unsafe.Pointer(&bs))
+namespace gvisor {
+namespace testing {
+
+namespace {
+
+void BM_Sched_yield(benchmark::State& state) {
+  for (auto ignored : state) {
+    TEST_CHECK(sched_yield() == 0);
+  }
 }
+
+BENCHMARK(BM_Sched_yield)->ThreadRange(1, 2000)->UseRealTime();
+
+}  // namespace
+
+}  // namespace testing
+}  // namespace gvisor

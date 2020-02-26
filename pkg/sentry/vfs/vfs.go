@@ -126,17 +126,23 @@ func (vfs *VirtualFilesystem) Init() error {
 	// Construct vfs.anonMount.
 	anonfsDevMinor, err := vfs.GetAnonBlockDevMinor()
 	if err != nil {
-		return err
+		// This shouldn't be possible since anonBlockDevMinorNext was
+		// initialized to 1 above (no device numbers have been allocated yet).
+		panic(fmt.Sprintf("VirtualFilesystem.Init: device number allocation for anonfs failed: %v", err))
 	}
 	anonfs := anonFilesystem{
 		devMinor: anonfsDevMinor,
 	}
 	anonfs.vfsfs.Init(vfs, &anonfs)
-	vfs.anonMount = &Mount{
-		vfs:  vfs,
-		fs:   &anonfs.vfsfs,
-		refs: 1,
+	defer anonfs.vfsfs.DecRef()
+	anonMount, err := vfs.NewDisconnectedMount(&anonfs.vfsfs, nil, &MountOptions{})
+	if err != nil {
+		// We should not be passing any MountOptions that would cause
+		// construction of this mount to fail.
+		panic(fmt.Sprintf("VirtualFilesystem.Init: anonfs mount failed: %v", err))
 	}
+	vfs.anonMount = anonMount
+
 	return nil
 }
 
@@ -385,15 +391,11 @@ func (vfs *VirtualFilesystem) OpenAt(ctx context.Context, creds *auth.Credential
 				// Only a regular file can be executed.
 				stat, err := fd.Stat(ctx, StatOptions{Mask: linux.STATX_TYPE})
 				if err != nil {
+					fd.DecRef()
 					return nil, err
 				}
-				if stat.Mask&linux.STATX_TYPE != 0 {
-					// This shouldn't happen, but if type can't be retrieved, file can't
-					// be executed.
-					return nil, syserror.EACCES
-				}
-				if t := linux.FileMode(stat.Mode).FileType(); t != linux.ModeRegular {
-					ctx.Infof("%q is not a regular file: %v", pop.Path, t)
+				if stat.Mask&linux.STATX_TYPE == 0 || stat.Mode&linux.S_IFMT != linux.S_IFREG {
+					fd.DecRef()
 					return nil, syserror.EACCES
 				}
 			}
