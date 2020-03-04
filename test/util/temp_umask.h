@@ -12,35 +12,28 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include <errno.h>
-#include <time.h>
+#ifndef GVISOR_TEST_UTIL_TEMP_UMASK_H_
+#define GVISOR_TEST_UTIL_TEMP_UMASK_H_
 
-#include "gtest/gtest.h"
-#include "test/util/proc_util.h"
-#include "test/util/test_util.h"
+#include <sys/stat.h>
+#include <sys/types.h>
 
 namespace gvisor {
 namespace testing {
 
-namespace {
+class TempUmask {
+ public:
+  // Sets the process umask to `mask`.
+  explicit TempUmask(mode_t mask) : old_mask_(umask(mask)) {}
 
-#if defined(__x86_64__) || defined(__i386__)
-time_t vsyscall_time(time_t* t) {
-  constexpr uint64_t kVsyscallTimeEntry = 0xffffffffff600400;
-  return reinterpret_cast<time_t (*)(time_t*)>(kVsyscallTimeEntry)(t);
-}
+  // Sets the process umask to its previous value.
+  ~TempUmask() { umask(old_mask_); }
 
-TEST(VsyscallTest, VsyscallAlwaysAvailableOnGvisor) {
-  SKIP_IF(!IsRunningOnGvisor());
-  // Vsyscall is always advertised by gvisor.
-  EXPECT_TRUE(ASSERT_NO_ERRNO_AND_VALUE(IsVsyscallEnabled()));
-  // Vsyscall should always works on gvisor.
-  time_t t;
-  EXPECT_THAT(vsyscall_time(&t), SyscallSucceeds());
-}
-#endif
-
-}  // namespace
+ private:
+  mode_t old_mask_;
+};
 
 }  // namespace testing
 }  // namespace gvisor
+
+#endif  // GVISOR_TEST_UTIL_TEMP_UMASK_H_

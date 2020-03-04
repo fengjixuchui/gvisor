@@ -798,7 +798,21 @@ func (e *endpoint) Abort() {
 	// If the endpoint disconnected after the check, nothing needs to be
 	// done, so sending a notification which will potentially be ignored is
 	// fine.
-	if e.EndpointState().connected() {
+	//
+	// If the endpoint connecting finishes after the check, the endpoint
+	// is either in a connected state (where we would notifyAbort anyway),
+	// SYN-RECV (where we would also notifyAbort anyway), or in an error
+	// state where nothing is required and the notification can be safely
+	// ignored.
+	//
+	// Endpoints where a Close during connecting or SYN-RECV state would be
+	// problematic are set to state connecting before being registered (and
+	// thus possible to be Aborted). They are never available in initial
+	// state.
+	//
+	// Endpoints transitioning from initial to connecting state may be
+	// safely either closed or sent notifyAbort.
+	if s := e.EndpointState(); s == StateConnecting || s == StateSynRecv || s.connected() {
 		e.notifyProtocolGoroutine(notifyAbort)
 		return
 	}
@@ -945,15 +959,18 @@ func (e *endpoint) initialReceiveWindow() int {
 // ModerateRecvBuf adjusts the receive buffer and the advertised window
 // based on the number of bytes copied to user space.
 func (e *endpoint) ModerateRecvBuf(copied int) {
+	e.mu.RLock()
 	e.rcvListMu.Lock()
 	if e.rcvAutoParams.disabled {
 		e.rcvListMu.Unlock()
+		e.mu.RUnlock()
 		return
 	}
 	now := time.Now()
 	if rtt := e.rcvAutoParams.rtt; rtt == 0 || now.Sub(e.rcvAutoParams.measureTime) < rtt {
 		e.rcvAutoParams.copied += copied
 		e.rcvListMu.Unlock()
+		e.mu.RUnlock()
 		return
 	}
 	prevRTTCopied := e.rcvAutoParams.copied + copied
@@ -994,7 +1011,7 @@ func (e *endpoint) ModerateRecvBuf(copied int) {
 			e.rcvBufSize = rcvWnd
 			availAfter := e.receiveBufferAvailableLocked()
 			mask := uint32(notifyReceiveWindowChanged)
-			if crossed, above := e.windowCrossedACKThreshold(availAfter - availBefore); crossed && above {
+			if crossed, above := e.windowCrossedACKThresholdLocked(availAfter - availBefore); crossed && above {
 				mask |= notifyNonZeroReceiveWindow
 			}
 			e.notifyProtocolGoroutine(mask)
@@ -1009,6 +1026,7 @@ func (e *endpoint) ModerateRecvBuf(copied int) {
 	e.rcvAutoParams.measureTime = now
 	e.rcvAutoParams.copied = 0
 	e.rcvListMu.Unlock()
+	e.mu.RUnlock()
 }
 
 // IPTables implements tcpip.Endpoint.IPTables.
@@ -1038,7 +1056,6 @@ func (e *endpoint) Read(*tcpip.FullAddress) (buffer.View, tcpip.ControlMessages,
 
 	v, err := e.readLocked()
 	e.rcvListMu.Unlock()
-
 	e.mu.RUnlock()
 
 	if err == tcpip.ErrClosedForReceive {
@@ -1071,7 +1088,7 @@ func (e *endpoint) readLocked() (buffer.View, *tcpip.Error) {
 	// enough buffer space, to either fit an aMSS or half a receive buffer
 	// (whichever smaller), then notify the protocol goroutine to send a
 	// window update.
-	if crossed, above := e.windowCrossedACKThreshold(len(v)); crossed && above {
+	if crossed, above := e.windowCrossedACKThresholdLocked(len(v)); crossed && above {
 		e.notifyProtocolGoroutine(notifyNonZeroReceiveWindow)
 	}
 
@@ -1289,9 +1306,9 @@ func (e *endpoint) Peek(vec [][]byte) (int64, tcpip.ControlMessages, *tcpip.Erro
 	return num, tcpip.ControlMessages{}, nil
 }
 
-// windowCrossedACKThreshold checks if the receive window to be announced now
-// would be under aMSS or under half receive buffer, whichever smaller. This is
-// useful as a receive side silly window syndrome prevention mechanism. If
+// windowCrossedACKThresholdLocked checks if the receive window to be announced
+// now would be under aMSS or under half receive buffer, whichever smaller. This
+// is useful as a receive side silly window syndrome prevention mechanism. If
 // window grows to reasonable value, we should send ACK to the sender to inform
 // the rx space is now large. We also want ensure a series of small read()'s
 // won't trigger a flood of spurious tiny ACK's.
@@ -1302,7 +1319,9 @@ func (e *endpoint) Peek(vec [][]byte) (int64, tcpip.ControlMessages, *tcpip.Erro
 // crossed will be true if the window size crossed the ACK threshold.
 // above will be true if the new window is >= ACK threshold and false
 // otherwise.
-func (e *endpoint) windowCrossedACKThreshold(deltaBefore int) (crossed bool, above bool) {
+//
+// Precondition: e.mu and e.rcvListMu must be held.
+func (e *endpoint) windowCrossedACKThresholdLocked(deltaBefore int) (crossed bool, above bool) {
 	newAvail := e.receiveBufferAvailableLocked()
 	oldAvail := newAvail - deltaBefore
 	if oldAvail < 0 {
@@ -1365,6 +1384,7 @@ func (e *endpoint) SetSockOptInt(opt tcpip.SockOptInt, v int) *tcpip.Error {
 
 		mask := uint32(notifyReceiveWindowChanged)
 
+		e.mu.RLock()
 		e.rcvListMu.Lock()
 
 		// Make sure the receive buffer size allows us to send a
@@ -1391,11 +1411,11 @@ func (e *endpoint) SetSockOptInt(opt tcpip.SockOptInt, v int) *tcpip.Error {
 		// Immediately send an ACK to uncork the sender silly window
 		// syndrome prevetion, when our available space grows above aMSS
 		// or half receive buffer, whichever smaller.
-		if crossed, above := e.windowCrossedACKThreshold(availAfter - availBefore); crossed && above {
+		if crossed, above := e.windowCrossedACKThresholdLocked(availAfter - availBefore); crossed && above {
 			mask |= notifyNonZeroReceiveWindow
 		}
 		e.rcvListMu.Unlock()
-
+		e.mu.RUnlock()
 		e.notifyProtocolGoroutine(mask)
 		return nil
 
@@ -1854,13 +1874,14 @@ func (e *endpoint) GetSockOpt(opt interface{}) *tcpip.Error {
 	}
 }
 
-func (e *endpoint) checkV4Mapped(addr *tcpip.FullAddress) (tcpip.NetworkProtocolNumber, *tcpip.Error) {
-	unwrapped, netProto, err := e.TransportEndpointInfo.AddrNetProto(*addr, e.v6only)
+// checkV4MappedLocked determines the effective network protocol and converts
+// addr to its canonical form.
+func (e *endpoint) checkV4MappedLocked(addr tcpip.FullAddress) (tcpip.FullAddress, tcpip.NetworkProtocolNumber, *tcpip.Error) {
+	unwrapped, netProto, err := e.TransportEndpointInfo.AddrNetProtoLocked(addr, e.v6only)
 	if err != nil {
-		return 0, err
+		return tcpip.FullAddress{}, 0, err
 	}
-	*addr = unwrapped
-	return netProto, nil
+	return unwrapped, netProto, nil
 }
 
 // Disconnect implements tcpip.Endpoint.Disconnect.
@@ -1890,7 +1911,7 @@ func (e *endpoint) connect(addr tcpip.FullAddress, handshake bool, run bool) *tc
 
 	connectingAddr := addr.Addr
 
-	netProto, err := e.checkV4Mapped(&addr)
+	addr, netProto, err := e.checkV4MappedLocked(addr)
 	if err != nil {
 		return err
 	}
@@ -2256,7 +2277,7 @@ func (e *endpoint) bindLocked(addr tcpip.FullAddress) (err *tcpip.Error) {
 	}
 
 	e.BindAddr = addr.Addr
-	netProto, err := e.checkV4Mapped(&addr)
+	addr, netProto, err := e.checkV4MappedLocked(addr)
 	if err != nil {
 		return err
 	}
@@ -2400,13 +2421,14 @@ func (e *endpoint) updateSndBufferUsage(v int) {
 // to be read, or when the connection is closed for receiving (in which case
 // s will be nil).
 func (e *endpoint) readyToRead(s *segment) {
+	e.mu.RLock()
 	e.rcvListMu.Lock()
 	if s != nil {
 		s.incRef()
 		e.rcvBufUsed += s.data.Size()
 		// Increase counter if the receive window falls down below MSS
 		// or half receive buffer size, whichever smaller.
-		if crossed, above := e.windowCrossedACKThreshold(-s.data.Size()); crossed && !above {
+		if crossed, above := e.windowCrossedACKThresholdLocked(-s.data.Size()); crossed && !above {
 			e.stats.ReceiveErrors.ZeroRcvWindowState.Increment()
 		}
 		e.rcvList.PushBack(s)
@@ -2414,7 +2436,7 @@ func (e *endpoint) readyToRead(s *segment) {
 		e.rcvClosed = true
 	}
 	e.rcvListMu.Unlock()
-
+	e.mu.RUnlock()
 	e.waiterQueue.Notify(waiter.EventIn)
 }
 

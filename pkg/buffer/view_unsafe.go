@@ -1,4 +1,4 @@
-// Copyright 2018 The gVisor Authors.
+// Copyright 2020 The gVisor Authors.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,28 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#ifndef GVISOR_TEST_SYSCALLS_TEMP_UMASK_H_
-#define GVISOR_TEST_SYSCALLS_TEMP_UMASK_H_
+package buffer
 
-#include <sys/stat.h>
-#include <sys/types.h>
+import (
+	"unsafe"
+)
 
-namespace gvisor {
-namespace testing {
-
-class TempUmask {
- public:
-  // Sets the process umask to `mask`.
-  explicit TempUmask(mode_t mask) : old_mask_(umask(mask)) {}
-
-  // Sets the process umask to its previous value.
-  ~TempUmask() { umask(old_mask_); }
-
- private:
-  mode_t old_mask_;
-};
-
-}  // namespace testing
-}  // namespace gvisor
-
-#endif  // GVISOR_TEST_SYSCALLS_TEMP_UMASK_H_
+// minBatch is the smallest Read or Write operation that the
+// WriteFromReader and ReadToWriter functions will use.
+//
+// This is defined as the size of a native pointer.
+const minBatch = int(unsafe.Sizeof(uintptr(0)))
