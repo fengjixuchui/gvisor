@@ -174,6 +174,23 @@ type PathOperation struct {
 	FollowFinalSymlink bool
 }
 
+// AccessAt checks whether a user with creds has access to the file at
+// the given path.
+func (vfs *VirtualFilesystem) AccessAt(ctx context.Context, creds *auth.Credentials, ats AccessTypes, pop *PathOperation) error {
+	rp := vfs.getResolvingPath(creds, pop)
+	for {
+		err := rp.mount.fs.impl.AccessAt(ctx, rp, creds, ats)
+		if err == nil {
+			vfs.putResolvingPath(rp)
+			return nil
+		}
+		if !rp.handleError(err) {
+			vfs.putResolvingPath(rp)
+			return err
+		}
+	}
+}
+
 // GetDentryAt returns a VirtualDentry representing the given path, at which a
 // file must exist. A reference is taken on the returned VirtualDentry.
 func (vfs *VirtualFilesystem) GetDentryAt(ctx context.Context, creds *auth.Credentials, pop *PathOperation, opts *GetDentryOptions) (VirtualDentry, error) {
@@ -388,6 +405,11 @@ func (vfs *VirtualFilesystem) OpenAt(ctx context.Context, creds *auth.Credential
 			// TODO(gvisor.dev/issue/1193): Move inside fsimpl to avoid another call
 			// to FileDescription.Stat().
 			if opts.FileExec {
+				if fd.Mount().flags.NoExec {
+					fd.DecRef()
+					return nil, syserror.EACCES
+				}
+
 				// Only a regular file can be executed.
 				stat, err := fd.Stat(ctx, StatOptions{Mask: linux.STATX_TYPE})
 				if err != nil {
