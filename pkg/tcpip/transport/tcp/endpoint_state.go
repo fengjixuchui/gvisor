@@ -162,8 +162,8 @@ func (e *endpoint) loadState(state EndpointState) {
 		connectingLoading.Add(1)
 	}
 	// Directly update the state here rather than using e.setEndpointState
-	// as the endpoint is still being loaded and the stack reference to increment
-	// metrics is not yet initialized.
+	// as the endpoint is still being loaded and the stack reference is not
+	// yet initialized.
 	atomic.StoreUint32((*uint32)(&e.state), uint32(state))
 }
 
@@ -173,6 +173,9 @@ func (e *endpoint) afterLoad() {
 	// Restore the endpoint to InitialState as it will be moved to
 	// its origEndpointState during Resume.
 	e.state = StateInitial
+	// Condition variables and mutexs are not S/R'ed so reinitialize
+	// acceptCond with e.acceptMu.
+	e.acceptCond = sync.NewCond(&e.acceptMu)
 	stack.StackFromEnv.RegisterRestoredEndpoint(e)
 }
 
@@ -180,7 +183,6 @@ func (e *endpoint) afterLoad() {
 func (e *endpoint) Resume(s *stack.Stack) {
 	e.stack = s
 	e.segmentQueue.setLimit(MaxUnprocessedSegments)
-	e.workMu.Init()
 	state := e.origEndpointState
 	switch state {
 	case StateInitial, StateBound, StateListen, StateConnecting, StateEstablished:

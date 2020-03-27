@@ -95,7 +95,7 @@ const (
 )
 
 type protocol struct {
-	mu                         sync.Mutex
+	mu                         sync.RWMutex
 	sackEnabled                bool
 	delayEnabled               bool
 	sendBufferSize             SendBufferSizeOption
@@ -140,7 +140,7 @@ func (*protocol) ParsePorts(v buffer.View) (src, dst uint16, err *tcpip.Error) {
 // to a specific processing queue. Each queue is serviced by its own processor
 // goroutine which is responsible for dequeuing and doing full TCP dispatch of
 // the packet.
-func (p *protocol) QueuePacket(r *stack.Route, ep stack.TransportEndpoint, id stack.TransportEndpointID, pkt tcpip.PacketBuffer) {
+func (p *protocol) QueuePacket(r *stack.Route, ep stack.TransportEndpoint, id stack.TransportEndpointID, pkt stack.PacketBuffer) {
 	p.dispatcher.queuePacket(r, ep, id, pkt)
 }
 
@@ -151,7 +151,7 @@ func (p *protocol) QueuePacket(r *stack.Route, ep stack.TransportEndpoint, id st
 // a reset is sent in response to any incoming segment except another reset. In
 // particular, SYNs addressed to a non-existent connection are rejected by this
 // means."
-func (*protocol) HandleUnknownDestinationPacket(r *stack.Route, id stack.TransportEndpointID, pkt tcpip.PacketBuffer) bool {
+func (*protocol) HandleUnknownDestinationPacket(r *stack.Route, id stack.TransportEndpointID, pkt stack.PacketBuffer) bool {
 	s := newSegment(r, id, pkt)
 	defer s.decRef()
 
@@ -191,7 +191,15 @@ func replyWithReset(s *segment) {
 		flags |= header.TCPFlagAck
 		ack = s.sequenceNumber.Add(s.logicalLen())
 	}
-	sendTCP(&s.route, s.id, buffer.VectorisedView{}, s.route.DefaultTTL(), stack.DefaultTOS, flags, seq, ack, 0 /* rcvWnd */, nil /* options */, nil /* gso */)
+	sendTCP(&s.route, tcpFields{
+		id:     s.id,
+		ttl:    s.route.DefaultTTL(),
+		tos:    stack.DefaultTOS,
+		flags:  flags,
+		seq:    seq,
+		ack:    ack,
+		rcvWnd: 0,
+	}, buffer.VectorisedView{}, nil /* gso */, nil /* PacketOwner */)
 }
 
 // SetOption implements stack.TransportProtocol.SetOption.
@@ -273,57 +281,57 @@ func (p *protocol) SetOption(option interface{}) *tcpip.Error {
 func (p *protocol) Option(option interface{}) *tcpip.Error {
 	switch v := option.(type) {
 	case *SACKEnabled:
-		p.mu.Lock()
+		p.mu.RLock()
 		*v = SACKEnabled(p.sackEnabled)
-		p.mu.Unlock()
+		p.mu.RUnlock()
 		return nil
 
 	case *DelayEnabled:
-		p.mu.Lock()
+		p.mu.RLock()
 		*v = DelayEnabled(p.delayEnabled)
-		p.mu.Unlock()
+		p.mu.RUnlock()
 		return nil
 
 	case *SendBufferSizeOption:
-		p.mu.Lock()
+		p.mu.RLock()
 		*v = p.sendBufferSize
-		p.mu.Unlock()
+		p.mu.RUnlock()
 		return nil
 
 	case *ReceiveBufferSizeOption:
-		p.mu.Lock()
+		p.mu.RLock()
 		*v = p.recvBufferSize
-		p.mu.Unlock()
+		p.mu.RUnlock()
 		return nil
 
 	case *tcpip.CongestionControlOption:
-		p.mu.Lock()
+		p.mu.RLock()
 		*v = tcpip.CongestionControlOption(p.congestionControl)
-		p.mu.Unlock()
+		p.mu.RUnlock()
 		return nil
 
 	case *tcpip.AvailableCongestionControlOption:
-		p.mu.Lock()
+		p.mu.RLock()
 		*v = tcpip.AvailableCongestionControlOption(strings.Join(p.availableCongestionControl, " "))
-		p.mu.Unlock()
+		p.mu.RUnlock()
 		return nil
 
 	case *tcpip.ModerateReceiveBufferOption:
-		p.mu.Lock()
+		p.mu.RLock()
 		*v = tcpip.ModerateReceiveBufferOption(p.moderateReceiveBuffer)
-		p.mu.Unlock()
+		p.mu.RUnlock()
 		return nil
 
 	case *tcpip.TCPLingerTimeoutOption:
-		p.mu.Lock()
+		p.mu.RLock()
 		*v = tcpip.TCPLingerTimeoutOption(p.tcpLingerTimeout)
-		p.mu.Unlock()
+		p.mu.RUnlock()
 		return nil
 
 	case *tcpip.TCPTimeWaitTimeoutOption:
-		p.mu.Lock()
+		p.mu.RLock()
 		*v = tcpip.TCPTimeWaitTimeoutOption(p.tcpTimeWaitTimeout)
-		p.mu.Unlock()
+		p.mu.RUnlock()
 		return nil
 
 	default:

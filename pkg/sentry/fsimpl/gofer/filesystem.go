@@ -22,6 +22,7 @@ import (
 	"gvisor.dev/gvisor/pkg/fspath"
 	"gvisor.dev/gvisor/pkg/p9"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
+	"gvisor.dev/gvisor/pkg/sentry/socket/unix/transport"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
 	"gvisor.dev/gvisor/pkg/syserror"
 )
@@ -119,7 +120,7 @@ func (fs *filesystem) stepLocked(ctx context.Context, rp *vfs.ResolvingPath, d *
 	if !d.isDir() {
 		return nil, syserror.ENOTDIR
 	}
-	if err := d.checkPermissions(rp.Credentials(), vfs.MayExec, true); err != nil {
+	if err := d.checkPermissions(rp.Credentials(), vfs.MayExec); err != nil {
 		return nil, err
 	}
 afterSymlink:
@@ -314,7 +315,7 @@ func (fs *filesystem) doCreateAt(ctx context.Context, rp *vfs.ResolvingPath, dir
 	if err != nil {
 		return err
 	}
-	if err := parent.checkPermissions(rp.Credentials(), vfs.MayWrite|vfs.MayExec, true); err != nil {
+	if err := parent.checkPermissions(rp.Credentials(), vfs.MayWrite|vfs.MayExec); err != nil {
 		return err
 	}
 	if parent.isDeleted() {
@@ -378,7 +379,7 @@ func (fs *filesystem) unlinkAt(ctx context.Context, rp *vfs.ResolvingPath, dir b
 	if err != nil {
 		return err
 	}
-	if err := parent.checkPermissions(rp.Credentials(), vfs.MayWrite|vfs.MayExec, true); err != nil {
+	if err := parent.checkPermissions(rp.Credentials(), vfs.MayWrite|vfs.MayExec); err != nil {
 		return err
 	}
 	if err := rp.Mount().CheckBeginWrite(); err != nil {
@@ -454,6 +455,9 @@ func (fs *filesystem) unlinkAt(ctx context.Context, rp *vfs.ResolvingPath, dir b
 	}
 	if fs.opts.interop != InteropModeShared {
 		parent.touchCMtime(ctx)
+		if dir {
+			parent.decLinks()
+		}
 		parent.cacheNegativeChildLocked(name)
 		parent.dirents = nil
 	}
@@ -509,7 +513,7 @@ func (fs *filesystem) AccessAt(ctx context.Context, rp *vfs.ResolvingPath, creds
 	if err != nil {
 		return err
 	}
-	return d.checkPermissions(creds, ats, d.isDir())
+	return d.checkPermissions(creds, ats)
 }
 
 // GetDentryAt implements vfs.FilesystemImpl.GetDentryAt.
@@ -525,7 +529,7 @@ func (fs *filesystem) GetDentryAt(ctx context.Context, rp *vfs.ResolvingPath, op
 		if !d.isDir() {
 			return nil, syserror.ENOTDIR
 		}
-		if err := d.checkPermissions(rp.Credentials(), vfs.MayExec, true); err != nil {
+		if err := d.checkPermissions(rp.Credentials(), vfs.MayExec); err != nil {
 			return nil, err
 		}
 	}
@@ -569,8 +573,13 @@ func (fs *filesystem) LinkAt(ctx context.Context, rp *vfs.ResolvingPath, vd vfs.
 func (fs *filesystem) MkdirAt(ctx context.Context, rp *vfs.ResolvingPath, opts vfs.MkdirOptions) error {
 	return fs.doCreateAt(ctx, rp, true /* dir */, func(parent *dentry, name string) error {
 		creds := rp.Credentials()
-		_, err := parent.file.mkdir(ctx, name, (p9.FileMode)(opts.Mode), (p9.UID)(creds.EffectiveKUID), (p9.GID)(creds.EffectiveKGID))
-		return err
+		if _, err := parent.file.mkdir(ctx, name, (p9.FileMode)(opts.Mode), (p9.UID)(creds.EffectiveKUID), (p9.GID)(creds.EffectiveKGID)); err != nil {
+			return err
+		}
+		if fs.opts.interop != InteropModeShared {
+			parent.incLinks()
+		}
+		return nil
 	})
 }
 
@@ -616,7 +625,7 @@ afterTrailingSymlink:
 		return nil, err
 	}
 	// Check for search permission in the parent directory.
-	if err := parent.checkPermissions(rp.Credentials(), vfs.MayExec, true); err != nil {
+	if err := parent.checkPermissions(rp.Credentials(), vfs.MayExec); err != nil {
 		return nil, err
 	}
 	// Determine whether or not we need to create a file.
@@ -653,7 +662,7 @@ afterTrailingSymlink:
 // Preconditions: fs.renameMu must be locked.
 func (d *dentry) openLocked(ctx context.Context, rp *vfs.ResolvingPath, opts *vfs.OpenOptions) (*vfs.FileDescription, error) {
 	ats := vfs.AccessTypesForOpenFlags(opts)
-	if err := d.checkPermissions(rp.Credentials(), ats, d.isDir()); err != nil {
+	if err := d.checkPermissions(rp.Credentials(), ats); err != nil {
 		return nil, err
 	}
 	mnt := rp.Mount()
@@ -714,7 +723,7 @@ func (d *dentry) openLocked(ctx context.Context, rp *vfs.ResolvingPath, opts *vf
 
 // Preconditions: d.fs.renameMu must be locked. d.dirMu must be locked.
 func (d *dentry) createAndOpenChildLocked(ctx context.Context, rp *vfs.ResolvingPath, opts *vfs.OpenOptions) (*vfs.FileDescription, error) {
-	if err := d.checkPermissions(rp.Credentials(), vfs.MayWrite, true); err != nil {
+	if err := d.checkPermissions(rp.Credentials(), vfs.MayWrite); err != nil {
 		return nil, err
 	}
 	if d.isDeleted() {
@@ -876,7 +885,7 @@ func (fs *filesystem) RenameAt(ctx context.Context, rp *vfs.ResolvingPath, oldPa
 			return err
 		}
 	}
-	if err := oldParent.checkPermissions(rp.Credentials(), vfs.MayWrite|vfs.MayExec, true); err != nil {
+	if err := oldParent.checkPermissions(rp.Credentials(), vfs.MayWrite|vfs.MayExec); err != nil {
 		return err
 	}
 	vfsObj := rp.VirtualFilesystem()
@@ -896,7 +905,7 @@ func (fs *filesystem) RenameAt(ctx context.Context, rp *vfs.ResolvingPath, oldPa
 			return syserror.EINVAL
 		}
 		if oldParent != newParent {
-			if err := renamed.checkPermissions(rp.Credentials(), vfs.MayWrite, true); err != nil {
+			if err := renamed.checkPermissions(rp.Credentials(), vfs.MayWrite); err != nil {
 				return err
 			}
 		}
@@ -907,7 +916,7 @@ func (fs *filesystem) RenameAt(ctx context.Context, rp *vfs.ResolvingPath, oldPa
 	}
 
 	if oldParent != newParent {
-		if err := newParent.checkPermissions(rp.Credentials(), vfs.MayWrite|vfs.MayExec, true); err != nil {
+		if err := newParent.checkPermissions(rp.Credentials(), vfs.MayWrite|vfs.MayExec); err != nil {
 			return err
 		}
 		newParent.dirMu.Lock()
@@ -962,6 +971,10 @@ func (fs *filesystem) RenameAt(ctx context.Context, rp *vfs.ResolvingPath, oldPa
 		oldParent.dirents = nil
 		delete(newParent.negativeChildren, newName)
 		newParent.dirents = nil
+		if renamed.isDir() {
+			oldParent.decLinks()
+			newParent.incLinks()
+		}
 	}
 	vfsObj.CommitRenameReplaceDentry(&renamed.vfsd, &newParent.vfsd, newName, replacedVFSD)
 	return nil
@@ -1045,6 +1058,13 @@ func (fs *filesystem) SymlinkAt(ctx context.Context, rp *vfs.ResolvingPath, targ
 // UnlinkAt implements vfs.FilesystemImpl.UnlinkAt.
 func (fs *filesystem) UnlinkAt(ctx context.Context, rp *vfs.ResolvingPath) error {
 	return fs.unlinkAt(ctx, rp, false /* dir */)
+}
+
+// BoundEndpointAt implements FilesystemImpl.BoundEndpointAt.
+//
+// TODO(gvisor.dev/issue/1476): Implement BoundEndpointAt.
+func (fs *filesystem) BoundEndpointAt(ctx context.Context, rp *vfs.ResolvingPath) (transport.BoundEndpoint, error) {
+	return nil, syserror.ECONNREFUSED
 }
 
 // ListxattrAt implements vfs.FilesystemImpl.ListxattrAt.

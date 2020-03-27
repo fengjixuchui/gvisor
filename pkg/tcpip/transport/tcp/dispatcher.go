@@ -18,7 +18,6 @@ import (
 	"gvisor.dev/gvisor/pkg/rand"
 	"gvisor.dev/gvisor/pkg/sleep"
 	"gvisor.dev/gvisor/pkg/sync"
-	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/hash/jenkins"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
@@ -128,7 +127,7 @@ func (p *processor) handleSegments() {
 				continue
 			}
 
-			if !ep.workMu.TryLock() {
+			if !ep.mu.TryLock() {
 				ep.newSegmentWaker.Assert()
 				continue
 			}
@@ -138,12 +137,10 @@ func (p *processor) handleSegments() {
 			if err := ep.handleSegments(true /* fastPath */); err != nil || ep.EndpointState() == StateClose {
 				// Send any active resets if required.
 				if err != nil {
-					ep.mu.Lock()
 					ep.resetConnectionLocked(err)
-					ep.mu.Unlock()
 				}
 				ep.notifyProtocolGoroutine(notifyTickleWorker)
-				ep.workMu.Unlock()
+				ep.mu.Unlock()
 				continue
 			}
 
@@ -151,7 +148,7 @@ func (p *processor) handleSegments() {
 				p.epQ.enqueue(ep)
 			}
 
-			ep.workMu.Unlock()
+			ep.mu.Unlock()
 		}
 	}
 }
@@ -189,7 +186,7 @@ func (d *dispatcher) wait() {
 	}
 }
 
-func (d *dispatcher) queuePacket(r *stack.Route, stackEP stack.TransportEndpoint, id stack.TransportEndpointID, pkt tcpip.PacketBuffer) {
+func (d *dispatcher) queuePacket(r *stack.Route, stackEP stack.TransportEndpoint, id stack.TransportEndpointID, pkt stack.PacketBuffer) {
 	ep := stackEP.(*endpoint)
 	s := newSegment(r, id, pkt)
 	if !s.parse() {

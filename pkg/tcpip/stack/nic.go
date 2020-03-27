@@ -16,7 +16,6 @@ package stack
 
 import (
 	"fmt"
-	"log"
 	"reflect"
 	"sort"
 	"strings"
@@ -26,7 +25,6 @@ import (
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/buffer"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
-	"gvisor.dev/gvisor/pkg/tcpip/iptables"
 )
 
 var ipv4BroadcastAddr = tcpip.ProtocolAddress{
@@ -481,7 +479,7 @@ func (n *NIC) primaryIPv6Endpoint(remoteAddr tcpip.Address) *referencedNetworkEn
 			// Should never happen as we got r from the primary IPv6 endpoint list and
 			// ScopeForIPv6Address only returns an error if addr is not an IPv6
 			// address.
-			log.Fatalf("header.ScopeForIPv6Address(%s): %s", addr, err)
+			panic(fmt.Sprintf("header.ScopeForIPv6Address(%s): %s", addr, err))
 		}
 
 		cs = append(cs, ipv6AddrCandidate{
@@ -493,7 +491,7 @@ func (n *NIC) primaryIPv6Endpoint(remoteAddr tcpip.Address) *referencedNetworkEn
 	remoteScope, err := header.ScopeForIPv6Address(remoteAddr)
 	if err != nil {
 		// primaryIPv6Endpoint should never be called with an invalid IPv6 address.
-		log.Fatalf("header.ScopeForIPv6Address(%s): %s", remoteAddr, err)
+		panic(fmt.Sprintf("header.ScopeForIPv6Address(%s): %s", remoteAddr, err))
 	}
 
 	// Sort the addresses as per RFC 6724 section 5 rules 1-3.
@@ -1144,7 +1142,7 @@ func (n *NIC) isInGroup(addr tcpip.Address) bool {
 	return joins != 0
 }
 
-func handlePacket(protocol tcpip.NetworkProtocolNumber, dst, src tcpip.Address, localLinkAddr, remotelinkAddr tcpip.LinkAddress, ref *referencedNetworkEndpoint, pkt tcpip.PacketBuffer) {
+func handlePacket(protocol tcpip.NetworkProtocolNumber, dst, src tcpip.Address, localLinkAddr, remotelinkAddr tcpip.LinkAddress, ref *referencedNetworkEndpoint, pkt PacketBuffer) {
 	r := makeRoute(protocol, dst, src, localLinkAddr, ref, false /* handleLocal */, false /* multicastLoop */)
 	r.RemoteLinkAddress = remotelinkAddr
 
@@ -1158,7 +1156,7 @@ func handlePacket(protocol tcpip.NetworkProtocolNumber, dst, src tcpip.Address, 
 // Note that the ownership of the slice backing vv is retained by the caller.
 // This rule applies only to the slice itself, not to the items of the slice;
 // the ownership of the items is not retained by the caller.
-func (n *NIC) DeliverNetworkPacket(linkEP LinkEndpoint, remote, local tcpip.LinkAddress, protocol tcpip.NetworkProtocolNumber, pkt tcpip.PacketBuffer) {
+func (n *NIC) DeliverNetworkPacket(linkEP LinkEndpoint, remote, local tcpip.LinkAddress, protocol tcpip.NetworkProtocolNumber, pkt PacketBuffer) {
 	n.mu.RLock()
 	enabled := n.mu.enabled
 	// If the NIC is not yet enabled, don't receive any packets.
@@ -1222,7 +1220,7 @@ func (n *NIC) DeliverNetworkPacket(linkEP LinkEndpoint, remote, local tcpip.Link
 	// TODO(gvisor.dev/issue/170): Not supporting iptables for IPv6 yet.
 	if protocol == header.IPv4ProtocolNumber {
 		ipt := n.stack.IPTables()
-		if ok := ipt.Check(iptables.Prerouting, pkt); !ok {
+		if ok := ipt.Check(Prerouting, pkt); !ok {
 			// iptables is telling us to drop the packet.
 			return
 		}
@@ -1287,7 +1285,7 @@ func (n *NIC) DeliverNetworkPacket(linkEP LinkEndpoint, remote, local tcpip.Link
 	}
 }
 
-func (n *NIC) forwardPacket(r *Route, protocol tcpip.NetworkProtocolNumber, pkt tcpip.PacketBuffer) {
+func (n *NIC) forwardPacket(r *Route, protocol tcpip.NetworkProtocolNumber, pkt PacketBuffer) {
 	// TODO(b/143425874) Decrease the TTL field in forwarded packets.
 
 	firstData := pkt.Data.First()
@@ -1318,7 +1316,7 @@ func (n *NIC) forwardPacket(r *Route, protocol tcpip.NetworkProtocolNumber, pkt 
 
 // DeliverTransportPacket delivers the packets to the appropriate transport
 // protocol endpoint.
-func (n *NIC) DeliverTransportPacket(r *Route, protocol tcpip.TransportProtocolNumber, pkt tcpip.PacketBuffer) {
+func (n *NIC) DeliverTransportPacket(r *Route, protocol tcpip.TransportProtocolNumber, pkt PacketBuffer) {
 	state, ok := n.stack.transportProtocols[protocol]
 	if !ok {
 		n.stack.stats.UnknownProtocolRcvdPackets.Increment()
@@ -1364,7 +1362,7 @@ func (n *NIC) DeliverTransportPacket(r *Route, protocol tcpip.TransportProtocolN
 
 // DeliverTransportControlPacket delivers control packets to the appropriate
 // transport protocol endpoint.
-func (n *NIC) DeliverTransportControlPacket(local, remote tcpip.Address, net tcpip.NetworkProtocolNumber, trans tcpip.TransportProtocolNumber, typ ControlType, extra uint32, pkt tcpip.PacketBuffer) {
+func (n *NIC) DeliverTransportControlPacket(local, remote tcpip.Address, net tcpip.NetworkProtocolNumber, trans tcpip.TransportProtocolNumber, typ ControlType, extra uint32, pkt PacketBuffer) {
 	state, ok := n.stack.transportProtocols[trans]
 	if !ok {
 		return

@@ -7,6 +7,7 @@ go_library(
     srcs = [
         "extensions.go",
         "netfilter.go",
+        "owner_matcher.go",
         "targets.go",
         "tcp_matcher.go",
         "udp_matcher.go",
@@ -22,7 +23,6 @@ go_library(
         "//pkg/syserr",
         "//pkg/tcpip",
         "//pkg/tcpip/header",
-        "//pkg/tcpip/iptables",
         "//pkg/tcpip/stack",
         "//pkg/usermem",
     ],

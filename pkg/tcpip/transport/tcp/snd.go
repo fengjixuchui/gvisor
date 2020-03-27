@@ -126,10 +126,6 @@ type sender struct {
 	// sndNxt is the sequence number of the next segment to be sent.
 	sndNxt seqnum.Value
 
-	// sndNxtList is the sequence number of the next segment to be added to
-	// the send list.
-	sndNxtList seqnum.Value
-
 	// rttMeasureSeqNum is the sequence number being used for the latest RTT
 	// measurement.
 	rttMeasureSeqNum seqnum.Value
@@ -229,7 +225,6 @@ func newSender(ep *endpoint, iss, irs seqnum.Value, sndWnd seqnum.Size, mss uint
 		sndWnd:           sndWnd,
 		sndUna:           iss + 1,
 		sndNxt:           iss + 1,
-		sndNxtList:       iss + 1,
 		rto:              1 * time.Second,
 		rttMeasureSeqNum: iss + 1,
 		lastSendTime:     time.Now(),
@@ -455,9 +450,7 @@ func (s *sender) retransmitTimerExpired() bool {
 	// Give up if we've waited more than a minute since the last resend or
 	// if a user time out is set and we have exceeded the user specified
 	// timeout since the first retransmission.
-	s.ep.mu.RLock()
 	uto := s.ep.userTimeout
-	s.ep.mu.RUnlock()
 
 	if s.firstRetransmittedSegXmitTime.IsZero() {
 		// We store the original xmitTime of the segment that we are
@@ -713,7 +706,6 @@ func (s *sender) maybeSendSegment(seg *segment, limit int, end seqnum.Value) (se
 		default:
 			s.ep.setEndpointState(StateFinWait1)
 		}
-
 	} else {
 		// We're sending a non-FIN segment.
 		if seg.flags&header.TCPFlagFin != 0 {
