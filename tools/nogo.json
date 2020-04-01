@@ -35,7 +35,9 @@
       "/com_github_vishvananda_netlink/route_linux.go": "allowed: false positive",
       "/external/bazel_gazelle/cmd/gazelle/.*": "allowed: false positive",
       "/org_golang_x_tools/go/packages/golist.go": "allowed: runtime internals",
-      "/pkg/sentry/platform/kvm/kvm_test.go": "allowed: intentional"
+      "/pkg/sentry/platform/kvm/kvm_test.go": "allowed: intentional",
+      "/tools/bigquery/bigquery.go": "allowed: false positive",
+      "/external/io_opencensus_go/tag/map_codec.go": "allowed: false positive"
     }
   },
   "printf": {
@@ -81,6 +83,7 @@
       "/pkg/gohacks/gohacks_unsafe.go": "allowed: special case",
       "/pkg/sentry/fs/fsutil/host_file_mapper_unsafe.go": "allowed: special case",
       "/pkg/sentry/platform/kvm/(bluepill|machine)_unsafe.go": "allowed: special case",
+      "/pkg/sentry/platform/kvm/machine_arm64_unsafe.go": "fix: gvisor.dev/issue/22464",
       "/pkg/sentry/platform/ring0/pagetables/allocator_unsafe.go": "allowed: special case",
       "/pkg/sentry/platform/safecopy/safecopy_unsafe.go": "allowed: special case",
       "/pkg/sentry/vfs/mount_unsafe.go": "allowed: special case"
