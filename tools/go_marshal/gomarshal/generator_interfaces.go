@@ -15,8 +15,10 @@
 package gomarshal
 
 import (
+	"fmt"
 	"go/ast"
 	"go/token"
+	"strings"
 )
 
 // interfaceGenerator generates marshalling interfaces for a single type.
@@ -72,7 +74,6 @@ func (g *interfaceGenerator) recordUsedMarshallable(m string) {
 
 func (g *interfaceGenerator) recordUsedImport(i string) {
 	g.is[i] = struct{}{}
-
 }
 
 func (g *interfaceGenerator) recordPotentiallyNonPackedField(fieldName string) {
@@ -162,4 +163,114 @@ func (g *interfaceGenerator) unmarshalScalar(accessor, typ, bufVar string) {
 		g.shiftDynamic(bufVar, accessor)
 		g.recordPotentiallyNonPackedField(accessor)
 	}
+}
+
+// emitCastToByteSlice unsafely casts an arbitrary type's underlying memory to a
+// byte slice, bypassing escape analysis. The caller is responsible for ensuring
+// srcPtr lives until they're done with dstVar, the runtime does not consider
+// dstVar dependent on srcPtr due to the escape analysis bypass.
+//
+// srcPtr must be a pointer.
+//
+// This function uses internally uses the identifier "hdr", and cannot be used
+// in a context where it is already bound.
+func (g *interfaceGenerator) emitCastToByteSlice(srcPtr, dstVar, lenExpr string) {
+	g.recordUsedImport("gohacks")
+	g.emit("// Construct a slice backed by dst's underlying memory.\n")
+	g.emit("var %s []byte\n", dstVar)
+	g.emit("hdr := (*reflect.SliceHeader)(unsafe.Pointer(&%s))\n", dstVar)
+	g.emit("hdr.Data = uintptr(gohacks.Noescape(unsafe.Pointer(%s)))\n", srcPtr)
+	g.emit("hdr.Len = %s\n", lenExpr)
+	g.emit("hdr.Cap = %s\n\n", lenExpr)
+}
+
+// emitCastToByteSlice unsafely casts a slice with elements of an abitrary type
+// to a byte slice. As part of the cast, the byte slice is made to look
+// independent of the src slice by bypassing escape analysis. This means the
+// byte slice can be used without causing the source to escape. The caller is
+// responsible for ensuring srcPtr lives until they're done with dstVar, as the
+// runtime no longer considers dstVar dependent on srcPtr and is free to GC it.
+//
+// srcPtr must be a pointer.
+//
+// This function uses internally uses the identifiers "ptr", "val" and "hdr",
+// and cannot be used in a context where these identifiers are already bound.
+func (g *interfaceGenerator) emitCastSliceToByteSlice(srcPtr, dstVar, lenExpr string) {
+	g.emitNoEscapeSliceDataPointer(srcPtr, "val")
+
+	g.emit("// Construct a slice backed by dst's underlying memory.\n")
+	g.emit("var %s []byte\n", dstVar)
+	g.emit("hdr := (*reflect.SliceHeader)(unsafe.Pointer(&%s))\n", dstVar)
+	g.emit("hdr.Data = uintptr(val)\n")
+	g.emit("hdr.Len = %s\n", lenExpr)
+	g.emit("hdr.Cap = %s\n\n", lenExpr)
+}
+
+// emitNoEscapeSliceDataPointer unsafely casts a slice's data pointer to an
+// unsafe.Pointer, bypassing escape analysis. The caller is responsible for
+// ensuring srcPtr lives until they're done with dstVar, as the runtime no
+// longer considers dstVar dependent on srcPtr and is free to GC it.
+//
+// srcPtr must be a pointer.
+//
+// This function uses internally uses the identifier "ptr" cannot be used in a
+// context where this identifier is already bound.
+func (g *interfaceGenerator) emitNoEscapeSliceDataPointer(srcPtr, dstVar string) {
+	g.recordUsedImport("gohacks")
+	g.emit("ptr := unsafe.Pointer(%s)\n", srcPtr)
+	g.emit("%s := gohacks.Noescape(unsafe.Pointer((*reflect.SliceHeader)(ptr).Data))\n\n", dstVar)
+}
+
+func (g *interfaceGenerator) emitKeepAlive(ptrVar string) {
+	g.emit("// Since we bypassed the compiler's escape analysis, indicate that %s\n", ptrVar)
+	g.emit("// must live until the use above.\n")
+	g.emit("runtime.KeepAlive(%s)\n", ptrVar)
+}
+
+func (g *interfaceGenerator) expandBinaryExpr(b *strings.Builder, e *ast.BinaryExpr) {
+	switch x := e.X.(type) {
+	case *ast.BinaryExpr:
+		// Recursively expand sub-expression.
+		g.expandBinaryExpr(b, x)
+	case *ast.Ident:
+		fmt.Fprintf(b, "%s", x.Name)
+	case *ast.BasicLit:
+		fmt.Fprintf(b, "%s", x.Value)
+	default:
+		g.abortAt(e.Pos(), "Cannot convert binary expression to output code. Go-marshal currently only handles simple expressions of literals, constants and basic identifiers")
+	}
+
+	fmt.Fprintf(b, "%s", e.Op)
+
+	switch y := e.Y.(type) {
+	case *ast.BinaryExpr:
+		// Recursively expand sub-expression.
+		g.expandBinaryExpr(b, y)
+	case *ast.Ident:
+		fmt.Fprintf(b, "%s", y.Name)
+	case *ast.BasicLit:
+		fmt.Fprintf(b, "%s", y.Value)
+	default:
+		g.abortAt(e.Pos(), "Cannot convert binary expression to output code. Go-marshal currently only handles simple expressions of literals, constants and basic identifiers")
+	}
+}
+
+// arrayLenExpr returns a string containing a valid golang expression
+// representing the length of array a. The returned expression should be treated
+// as a single value, and will be already parenthesized as required.
+func (g *interfaceGenerator) arrayLenExpr(a *ast.ArrayType) string {
+	var b strings.Builder
+
+	switch l := a.Len.(type) {
+	case *ast.Ident:
+		fmt.Fprintf(&b, "%s", l.Name)
+	case *ast.BasicLit:
+		fmt.Fprintf(&b, "%s", l.Value)
+	case *ast.BinaryExpr:
+		g.expandBinaryExpr(&b, l)
+		return fmt.Sprintf("(%s)", b.String())
+	default:
+		g.abortAt(l.Pos(), "Cannot convert this array len expression to output code. Go-marshal currently only handles simple expressions of literals, constants and basic identifiers")
+	}
+	return b.String()
 }
