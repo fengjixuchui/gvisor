@@ -62,7 +62,7 @@ func (e *endpoint) handleControl(typ stack.ControlType, extra uint32, pkt stack.
 	e.dispatcher.DeliverTransportControlPacket(e.id.LocalAddress, h.DestinationAddress(), ProtocolNumber, p, typ, extra, pkt)
 }
 
-func (e *endpoint) handleICMP(r *stack.Route, netHeader buffer.View, pkt stack.PacketBuffer) {
+func (e *endpoint) handleICMP(r *stack.Route, netHeader buffer.View, pkt stack.PacketBuffer, hasFragmentHeader bool) {
 	stats := r.Stats().ICMP
 	sent := stats.V6PacketsSent
 	received := stats.V6PacketsReceived
@@ -86,25 +86,15 @@ func (e *endpoint) handleICMP(r *stack.Route, netHeader buffer.View, pkt stack.P
 		return
 	}
 
-	// As per RFC 4861 sections 4.1 - 4.5, 6.1.1, 6.1.2, 7.1.1, 7.1.2 and
-	// 8.1, nodes MUST silently drop NDP packets where the Hop Limit field
-	// in the IPv6 header is not set to 255, or the ICMPv6 Code field is not
-	// set to 0.
-	switch h.Type() {
-	case header.ICMPv6NeighborSolicit,
-		header.ICMPv6NeighborAdvert,
-		header.ICMPv6RouterSolicit,
-		header.ICMPv6RouterAdvert,
-		header.ICMPv6RedirectMsg:
-		if iph.HopLimit() != header.NDPHopLimit {
-			received.Invalid.Increment()
-			return
-		}
-
-		if h.Code() != 0 {
-			received.Invalid.Increment()
-			return
-		}
+	isNDPValid := func() bool {
+		// As per RFC 4861 sections 4.1 - 4.5, 6.1.1, 6.1.2, 7.1.1, 7.1.2 and
+		// 8.1, nodes MUST silently drop NDP packets where the Hop Limit field
+		// in the IPv6 header is not set to 255, or the ICMPv6 Code field is not
+		// set to 0.
+		//
+		// As per RFC 6980 section 5, nodes MUST silently drop NDP messages if the
+		// packet includes a fragmentation header.
+		return !hasFragmentHeader && iph.HopLimit() == header.NDPHopLimit && h.Code() == 0
 	}
 
 	// TODO(b/112892170): Meaningfully handle all ICMP types.
@@ -133,7 +123,7 @@ func (e *endpoint) handleICMP(r *stack.Route, netHeader buffer.View, pkt stack.P
 
 	case header.ICMPv6NeighborSolicit:
 		received.NeighborSolicit.Increment()
-		if len(v) < header.ICMPv6NeighborSolicitMinimumSize {
+		if len(v) < header.ICMPv6NeighborSolicitMinimumSize || !isNDPValid() {
 			received.Invalid.Increment()
 			return
 		}
@@ -253,7 +243,7 @@ func (e *endpoint) handleICMP(r *stack.Route, netHeader buffer.View, pkt stack.P
 
 	case header.ICMPv6NeighborAdvert:
 		received.NeighborAdvert.Increment()
-		if len(v) < header.ICMPv6NeighborAdvertSize {
+		if len(v) < header.ICMPv6NeighborAdvertSize || !isNDPValid() {
 			received.Invalid.Increment()
 			return
 		}
@@ -355,8 +345,20 @@ func (e *endpoint) handleICMP(r *stack.Route, netHeader buffer.View, pkt stack.P
 
 	case header.ICMPv6RouterSolicit:
 		received.RouterSolicit.Increment()
+		if !isNDPValid() {
+			received.Invalid.Increment()
+			return
+		}
 
 	case header.ICMPv6RouterAdvert:
+		received.RouterAdvert.Increment()
+
+		p := h.NDPPayload()
+		if len(p) < header.NDPRAMinimumSize || !isNDPValid() {
+			received.Invalid.Increment()
+			return
+		}
+
 		routerAddr := iph.SourceAddress()
 
 		//
@@ -365,16 +367,6 @@ func (e *endpoint) handleICMP(r *stack.Route, netHeader buffer.View, pkt stack.P
 
 		// Is the IP Source Address a link-local address?
 		if !header.IsV6LinkLocalAddress(routerAddr) {
-			// ...No, silently drop the packet.
-			received.Invalid.Increment()
-			return
-		}
-
-		p := h.NDPPayload()
-
-		// Is the NDP payload of sufficient size to hold a Router
-		// Advertisement?
-		if len(p) < header.NDPRAMinimumSize {
 			// ...No, silently drop the packet.
 			received.Invalid.Increment()
 			return
@@ -395,8 +387,6 @@ func (e *endpoint) handleICMP(r *stack.Route, netHeader buffer.View, pkt stack.P
 		// as RFC 4861 section 6.1.2 is concerned.
 		//
 
-		received.RouterAdvert.Increment()
-
 		// Tell the NIC to handle the RA.
 		stack := r.Stack()
 		rxNICID := r.NICID()
@@ -404,6 +394,10 @@ func (e *endpoint) handleICMP(r *stack.Route, netHeader buffer.View, pkt stack.P
 
 	case header.ICMPv6RedirectMsg:
 		received.RedirectMsg.Increment()
+		if !isNDPValid() {
+			received.Invalid.Increment()
+			return
+		}
 
 	default:
 		received.Invalid.Increment()
