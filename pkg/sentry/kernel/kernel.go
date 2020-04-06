@@ -564,15 +564,25 @@ func (ts *TaskSet) unregisterEpollWaiters() {
 
 	ts.mu.RLock()
 	defer ts.mu.RUnlock()
+
+	// Tasks that belong to the same process could potentially point to the
+	// same FDTable. So we retain a map of processed ones to avoid
+	// processing the same FDTable multiple times.
+	processed := make(map[*FDTable]struct{})
 	for t := range ts.Root.tids {
 		// We can skip locking Task.mu here since the kernel is paused.
-		if t.fdTable != nil {
-			t.fdTable.forEach(func(_ int32, file *fs.File, _ *vfs.FileDescription, _ FDFlags) {
-				if e, ok := file.FileOperations.(*epoll.EventPoll); ok {
-					e.UnregisterEpollWaiters()
-				}
-			})
+		if t.fdTable == nil {
+			continue
 		}
+		if _, ok := processed[t.fdTable]; ok {
+			continue
+		}
+		t.fdTable.forEach(func(_ int32, file *fs.File, _ *vfs.FileDescription, _ FDFlags) {
+			if e, ok := file.FileOperations.(*epoll.EventPoll); ok {
+				e.UnregisterEpollWaiters()
+			}
+		})
+		processed[t.fdTable] = struct{}{}
 	}
 }
 
@@ -1435,9 +1445,10 @@ func (k *Kernel) SupervisorContext() context.Context {
 // +stateify savable
 type SocketEntry struct {
 	socketEntry
-	k    *Kernel
-	Sock *refs.WeakRef
-	ID   uint64 // Socket table entry number.
+	k        *Kernel
+	Sock     *refs.WeakRef
+	SockVFS2 *vfs.FileDescription
+	ID       uint64 // Socket table entry number.
 }
 
 // WeakRefGone implements refs.WeakRefUser.WeakRefGone.
@@ -1460,7 +1471,30 @@ func (k *Kernel) RecordSocket(sock *fs.File) {
 	k.extMu.Unlock()
 }
 
+// RecordSocketVFS2 adds a VFS2 socket to the system-wide socket table for
+// tracking.
+//
+// Precondition: Caller must hold a reference to sock.
+//
+// Note that the socket table will not hold a reference on the
+// vfs.FileDescription, because we do not support weak refs on VFS2 files.
+func (k *Kernel) RecordSocketVFS2(sock *vfs.FileDescription) {
+	k.extMu.Lock()
+	id := k.nextSocketEntry
+	k.nextSocketEntry++
+	s := &SocketEntry{
+		k:        k,
+		ID:       id,
+		SockVFS2: sock,
+	}
+	k.sockets.PushBack(s)
+	k.extMu.Unlock()
+}
+
 // ListSockets returns a snapshot of all sockets.
+//
+// Callers of ListSockets() in VFS2 should use SocketEntry.SockVFS2.TryIncRef()
+// to get a reference on a socket in the table.
 func (k *Kernel) ListSockets() []*SocketEntry {
 	k.extMu.Lock()
 	var socks []*SocketEntry
