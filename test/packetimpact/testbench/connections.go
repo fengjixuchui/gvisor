@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"math/rand"
 	"net"
+	"strings"
 	"testing"
 	"time"
 
@@ -187,9 +188,19 @@ func (conn *TCPIPv4) Send(tcp TCP, additionalLayers ...Layer) {
 	conn.SendFrame(conn.CreateFrame(tcp, additionalLayers...))
 }
 
-// Recv gets a packet from the sniffer within the timeout provided. If no packet
-// arrives before the timeout, it returns nil.
+// Recv gets a packet from the sniffer within the timeout provided.
+// If no packet arrives before the timeout, it returns nil.
 func (conn *TCPIPv4) Recv(timeout time.Duration) *TCP {
+	layers := conn.RecvFrame(timeout)
+	if tcpLayerIndex < len(layers) {
+		return layers[tcpLayerIndex].(*TCP)
+	}
+	return nil
+}
+
+// RecvFrame gets a frame (of type Layers) within the timeout provided.
+// If no frame arrives before the timeout, it returns nil.
+func (conn *TCPIPv4) RecvFrame(timeout time.Duration) Layers {
 	deadline := time.Now().Add(timeout)
 	for {
 		timeout = time.Until(deadline)
@@ -216,27 +227,59 @@ func (conn *TCPIPv4) Recv(timeout time.Duration) *TCP {
 		for i := tcpLayerIndex + 1; i < len(layers); i++ {
 			conn.RemoteSeqNum.UpdateForward(seqnum.Size(layers[i].length()))
 		}
-		return tcpHeader
+		return layers
 	}
 	return nil
 }
 
 // Expect a packet that matches the provided tcp within the timeout specified.
-// If it doesn't arrive in time, the test fails.
-func (conn *TCPIPv4) Expect(tcp TCP, timeout time.Duration) *TCP {
+// If it doesn't arrive in time, it returns nil.
+func (conn *TCPIPv4) Expect(tcp TCP, timeout time.Duration) (*TCP, error) {
+	// We cannot implement this directly using ExpectFrame as we cannot specify
+	// the Payload part.
+	deadline := time.Now().Add(timeout)
+	var allTCP []string
+	for {
+		var gotTCP *TCP
+		if timeout = time.Until(deadline); timeout > 0 {
+			gotTCP = conn.Recv(timeout)
+		}
+		if gotTCP == nil {
+			return nil, fmt.Errorf("got %d packets:\n%s", len(allTCP), strings.Join(allTCP, "\n"))
+		}
+		if tcp.match(gotTCP) {
+			return gotTCP, nil
+		}
+		allTCP = append(allTCP, gotTCP.String())
+	}
+}
+
+// ExpectFrame expects a frame that matches the specified layers within the
+// timeout specified. If it doesn't arrive in time, it returns nil.
+func (conn *TCPIPv4) ExpectFrame(layers Layers, timeout time.Duration) Layers {
 	deadline := time.Now().Add(timeout)
 	for {
 		timeout = time.Until(deadline)
 		if timeout <= 0 {
 			return nil
 		}
-		gotTCP := conn.Recv(timeout)
-		if gotTCP == nil {
-			return nil
+		gotLayers := conn.RecvFrame(timeout)
+		if layers.match(gotLayers) {
+			return gotLayers
 		}
-		if tcp.match(gotTCP) {
-			return gotTCP
-		}
+	}
+}
+
+// ExpectData is a convenient method that expects a TCP packet along with
+// the payload to arrive within the timeout specified. If it doesn't arrive
+// in time, it causes a fatal test failure.
+func (conn *TCPIPv4) ExpectData(tcp TCP, data []byte, timeout time.Duration) {
+	expected := []Layer{&Ether{}, &IPv4{}, &tcp}
+	if len(data) > 0 {
+		expected = append(expected, &Payload{Bytes: data})
+	}
+	if conn.ExpectFrame(expected, timeout) == nil {
+		conn.t.Fatalf("expected to get a TCP frame %s with payload %x", &tcp, data)
 	}
 }
 
@@ -246,10 +289,11 @@ func (conn *TCPIPv4) Handshake() {
 	conn.Send(TCP{Flags: Uint8(header.TCPFlagSyn)})
 
 	// Wait for the SYN-ACK.
-	conn.SynAck = conn.Expect(TCP{Flags: Uint8(header.TCPFlagSyn | header.TCPFlagAck)}, time.Second)
-	if conn.SynAck == nil {
-		conn.t.Fatalf("didn't get synack during handshake")
+	synAck, err := conn.Expect(TCP{Flags: Uint8(header.TCPFlagSyn | header.TCPFlagAck)}, time.Second)
+	if synAck == nil {
+		conn.t.Fatalf("didn't get synack during handshake: %s", err)
 	}
+	conn.SynAck = synAck
 
 	// Send an ACK.
 	conn.Send(TCP{Flags: Uint8(header.TCPFlagAck)})
@@ -389,19 +433,20 @@ func (conn *UDPIPv4) Recv(timeout time.Duration) *UDP {
 
 // Expect a packet that matches the provided udp within the timeout specified.
 // If it doesn't arrive in time, the test fails.
-func (conn *UDPIPv4) Expect(udp UDP, timeout time.Duration) *UDP {
+func (conn *UDPIPv4) Expect(udp UDP, timeout time.Duration) (*UDP, error) {
 	deadline := time.Now().Add(timeout)
+	var allUDP []string
 	for {
-		timeout = time.Until(deadline)
-		if timeout <= 0 {
-			return nil
+		var gotUDP *UDP
+		if timeout = time.Until(deadline); timeout > 0 {
+			gotUDP = conn.Recv(timeout)
 		}
-		gotUDP := conn.Recv(timeout)
 		if gotUDP == nil {
-			return nil
+			return nil, fmt.Errorf("got %d packets:\n%s", len(allUDP), strings.Join(allUDP, "\n"))
 		}
 		if udp.match(gotUDP) {
-			return gotUDP
+			return gotUDP, nil
 		}
+		allUDP = append(allUDP, gotUDP.String())
 	}
 }
