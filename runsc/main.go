@@ -291,7 +291,7 @@ func main() {
 		// want with them. Since Docker and Containerd both eat boot's stderr, we
 		// dup our stderr to the provided log FD so that panics will appear in the
 		// logs, rather than just disappear.
-		if err := syscall.Dup3(fd, int(os.Stderr.Fd()), 0); err != nil {
+		if err := syscall.Dup3(fd, int(os.Stderr.Fd()), syscall.O_CLOEXEC); err != nil {
 			cmd.Fatalf("error dup'ing fd %d to stderr: %v", fd, err)
 		}
 	}
@@ -342,11 +342,11 @@ func main() {
 func newEmitter(format string, logFile io.Writer) log.Emitter {
 	switch format {
 	case "text":
-		return &log.GoogleEmitter{log.Writer{Next: logFile}}
+		return log.GoogleEmitter{&log.Writer{Next: logFile}}
 	case "json":
-		return &log.JSONEmitter{log.Writer{Next: logFile}}
+		return log.JSONEmitter{&log.Writer{Next: logFile}}
 	case "json-k8s":
-		return &log.K8sJSONEmitter{log.Writer{Next: logFile}}
+		return log.K8sJSONEmitter{&log.Writer{Next: logFile}}
 	}
 	cmd.Fatalf("invalid log format %q, must be 'text', 'json', or 'json-k8s'", format)
 	panic("unreachable")
