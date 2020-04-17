@@ -1457,13 +1457,11 @@ func (e *endpoint) SetSockOptBool(opt tcpip.SockOptBool, v bool) *tcpip.Error {
 		e.LockUser()
 		e.reuseAddr = v
 		e.UnlockUser()
-		return nil
 
 	case tcpip.ReusePortOption:
 		e.LockUser()
 		e.reusePort = v
 		e.UnlockUser()
-		return nil
 
 	case tcpip.V6OnlyOption:
 		// We only recognize this option on v6 endpoints.
@@ -1494,7 +1492,7 @@ func (e *endpoint) SetSockOptInt(opt tcpip.SockOptInt, v int) *tcpip.Error {
 	switch opt {
 	case tcpip.KeepaliveCountOption:
 		e.keepalive.Lock()
-		e.keepalive.count = int(v)
+		e.keepalive.count = v
 		e.keepalive.Unlock()
 		e.notifyProtocolGoroutine(notifyKeepaliveChanged)
 
@@ -1526,13 +1524,12 @@ func (e *endpoint) SetSockOptInt(opt tcpip.SockOptInt, v int) *tcpip.Error {
 		// Make sure the receive buffer size is within the min and max
 		// allowed.
 		var rs ReceiveBufferSizeOption
-		size := int(v)
 		if err := e.stack.TransportProtocolOption(ProtocolNumber, &rs); err == nil {
-			if size < rs.Min {
-				size = rs.Min
+			if v < rs.Min {
+				v = rs.Min
 			}
-			if size > rs.Max {
-				size = rs.Max
+			if v > rs.Max {
+				v = rs.Max
 			}
 		}
 
@@ -1547,17 +1544,17 @@ func (e *endpoint) SetSockOptInt(opt tcpip.SockOptInt, v int) *tcpip.Error {
 		if e.rcv != nil {
 			scale = e.rcv.rcvWndScale
 		}
-		if size>>scale == 0 {
-			size = 1 << scale
+		if v>>scale == 0 {
+			v = 1 << scale
 		}
 
 		// Make sure 2*size doesn't overflow.
-		if size > math.MaxInt32/2 {
-			size = math.MaxInt32 / 2
+		if v > math.MaxInt32/2 {
+			v = math.MaxInt32 / 2
 		}
 
 		availBefore := e.receiveBufferAvailableLocked()
-		e.rcvBufSize = size
+		e.rcvBufSize = v
 		availAfter := e.receiveBufferAvailableLocked()
 
 		e.rcvAutoParams.disabled = true
@@ -1576,19 +1573,18 @@ func (e *endpoint) SetSockOptInt(opt tcpip.SockOptInt, v int) *tcpip.Error {
 	case tcpip.SendBufferSizeOption:
 		// Make sure the send buffer size is within the min and max
 		// allowed.
-		size := int(v)
 		var ss SendBufferSizeOption
 		if err := e.stack.TransportProtocolOption(ProtocolNumber, &ss); err == nil {
-			if size < ss.Min {
-				size = ss.Min
+			if v < ss.Min {
+				v = ss.Min
 			}
-			if size > ss.Max {
-				size = ss.Max
+			if v > ss.Max {
+				v = ss.Max
 			}
 		}
 
 		e.sndBufMu.Lock()
-		e.sndBufSize = size
+		e.sndBufSize = v
 		e.sndBufMu.Unlock()
 
 	case tcpip.TTLOption:
@@ -2105,7 +2101,7 @@ func (e *endpoint) shutdownLocked(flags tcpip.ShutdownFlags) *tcpip.Error {
 	switch {
 	case e.EndpointState().connected():
 		// Close for read.
-		if (e.shutdownFlags & tcpip.ShutdownRead) != 0 {
+		if e.shutdownFlags&tcpip.ShutdownRead != 0 {
 			// Mark read side as closed.
 			e.rcvListMu.Lock()
 			e.rcvClosed = true
@@ -2114,7 +2110,7 @@ func (e *endpoint) shutdownLocked(flags tcpip.ShutdownFlags) *tcpip.Error {
 
 			// If we're fully closed and we have unread data we need to abort
 			// the connection with a RST.
-			if (e.shutdownFlags&tcpip.ShutdownWrite) != 0 && rcvBufUsed > 0 {
+			if e.shutdownFlags&tcpip.ShutdownWrite != 0 && rcvBufUsed > 0 {
 				e.resetConnectionLocked(tcpip.ErrConnectionAborted)
 				// Wake up worker to terminate loop.
 				e.notifyProtocolGoroutine(notifyTickleWorker)
@@ -2123,7 +2119,7 @@ func (e *endpoint) shutdownLocked(flags tcpip.ShutdownFlags) *tcpip.Error {
 		}
 
 		// Close for write.
-		if (e.shutdownFlags & tcpip.ShutdownWrite) != 0 {
+		if e.shutdownFlags&tcpip.ShutdownWrite != 0 {
 			e.sndBufMu.Lock()
 			if e.sndClosed {
 				// Already closed.
@@ -2146,12 +2142,23 @@ func (e *endpoint) shutdownLocked(flags tcpip.ShutdownFlags) *tcpip.Error {
 
 		return nil
 	case e.EndpointState() == StateListen:
-		// Tell protocolListenLoop to stop.
-		if flags&tcpip.ShutdownRead != 0 {
-			e.notifyProtocolGoroutine(notifyClose)
+		if e.shutdownFlags&tcpip.ShutdownRead != 0 {
+			// Reset all connections from the accept queue and keep the
+			// worker running so that it can continue handling incoming
+			// segments by replying with RST.
+			//
+			// By not removing this endpoint from the demuxer mapping, we
+			// ensure that any other bind to the same port fails, as on Linux.
+			// TODO(gvisor.dev/issue/2468): We need to enable applications to
+			// start listening on this endpoint again similar to Linux.
+			e.rcvListMu.Lock()
+			e.rcvClosed = true
+			e.rcvListMu.Unlock()
+			e.closePendingAcceptableConnectionsLocked()
+			// Notify waiters that the endpoint is shutdown.
+			e.waiterQueue.Notify(waiter.EventIn | waiter.EventOut | waiter.EventHUp | waiter.EventErr)
 		}
 		return nil
-
 	default:
 		return tcpip.ErrNotConnected
 	}
@@ -2255,8 +2262,11 @@ func (e *endpoint) Accept() (tcpip.Endpoint, *waiter.Queue, *tcpip.Error) {
 	e.LockUser()
 	defer e.UnlockUser()
 
+	e.rcvListMu.Lock()
+	rcvClosed := e.rcvClosed
+	e.rcvListMu.Unlock()
 	// Endpoint must be in listen state before it can accept connections.
-	if e.EndpointState() != StateListen {
+	if rcvClosed || e.EndpointState() != StateListen {
 		return nil, nil, tcpip.ErrInvalidEndpointState
 	}
 
