@@ -43,8 +43,6 @@ packetimpact_go_test(
 packetimpact_go_test(
     name = "tcp_outside_the_window",
     srcs = ["tcp_outside_the_window_test.go"],
-    # TODO(eyalsoha): Fix #1607 then remove the line below.
-    netstack = False,
     deps = [
         "//pkg/tcpip/header",
         "//pkg/tcpip/seqnum",
@@ -83,6 +81,16 @@ packetimpact_go_test(
     deps = [
         "//pkg/tcpip/header",
         "//pkg/tcpip/seqnum",
+        "//test/packetimpact/testbench",
+        "@org_golang_x_sys//unix:go_default_library",
+    ],
+)
+
+packetimpact_go_test(
+    name = "tcp_user_timeout",
+    srcs = ["tcp_user_timeout_test.go"],
+    deps = [
+        "//pkg/tcpip/header",
         "//test/packetimpact/testbench",
         "@org_golang_x_sys//unix:go_default_library",
     ],

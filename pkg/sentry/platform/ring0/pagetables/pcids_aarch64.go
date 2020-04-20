@@ -1,4 +1,4 @@
-// Copyright 2019 The gVisor Authors.
+// Copyright 2020 The gVisor Authors.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,13 +14,19 @@
 
 // +build arm64
 
-package boot
+package pagetables
 
-import (
-	"gvisor.dev/gvisor/pkg/sentry/syscalls/linux"
-)
+// limitPCID is the maximum value of PCIDs.
+//
+// In VMSAv8-64, the PCID(ASID) size is an IMPLEMENTATION DEFINED choice
+// of 8 bits or 16 bits, and ID_AA64MMFR0_EL1.ASIDBits identifies the
+// supported size. When an implementation supports a 16-bit ASID, TCR_ELx.AS
+// selects whether the top 8 bits of the ASID are used.
+var limitPCID uint16
+
+// GetASIDBits return the system ASID bits, 8 or 16 bits.
+func GetASIDBits() uint8
 
 func init() {
-	// Set the global syscall table.
-	syscallTable = linux.ARM64
+	limitPCID = uint16(1)<<GetASIDBits() - 1
 }

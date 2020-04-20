@@ -1,4 +1,4 @@
-// Copyright 2019 The gVisor Authors.
+// Copyright 2020 The gVisor Authors.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,15 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// +build arm64
+// +build i386 amd64
 
-package boot
+package pagetables
 
-import (
-	"gvisor.dev/gvisor/pkg/sentry/syscalls/linux"
-)
-
-func init() {
-	// Set the global syscall table.
-	syscallTable = linux.ARM64
-}
+// limitPCID is the maximum value of valid PCIDs.
+const limitPCID = 4095
