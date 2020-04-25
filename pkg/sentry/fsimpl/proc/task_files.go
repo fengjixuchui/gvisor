@@ -111,17 +111,18 @@ func (d *auxvData) Generate(ctx context.Context, buf *bytes.Buffer) error {
 	}
 	defer m.DecUsers(ctx)
 
-	// Space for buffer with AT_NULL (0) terminator at the end.
 	auxv := m.Auxv()
+	// Space for buffer with AT_NULL (0) terminator at the end.
 	buf.Grow((len(auxv) + 1) * 16)
 	for _, e := range auxv {
-		var tmp [8]byte
-		usermem.ByteOrder.PutUint64(tmp[:], e.Key)
-		buf.Write(tmp[:])
-
-		usermem.ByteOrder.PutUint64(tmp[:], uint64(e.Value))
+		var tmp [16]byte
+		usermem.ByteOrder.PutUint64(tmp[:8], e.Key)
+		usermem.ByteOrder.PutUint64(tmp[8:], uint64(e.Value))
 		buf.Write(tmp[:])
 	}
+	var atNull [16]byte
+	buf.Write(atNull[:])
+
 	return nil
 }
 
@@ -621,7 +622,7 @@ func (s *exeSymlink) Readlink(ctx context.Context) (string, error) {
 }
 
 // Getlink implements kernfs.Inode.Getlink.
-func (s *exeSymlink) Getlink(ctx context.Context) (vfs.VirtualDentry, string, error) {
+func (s *exeSymlink) Getlink(ctx context.Context, _ *vfs.Mount) (vfs.VirtualDentry, string, error) {
 	if !kernel.ContextCanTrace(ctx, s.task, false) {
 		return vfs.VirtualDentry{}, "", syserror.EACCES
 	}
@@ -753,9 +754,79 @@ func (s *namespaceSymlink) Readlink(ctx context.Context) (string, error) {
 }
 
 // Getlink implements Inode.Getlink.
-func (s *namespaceSymlink) Getlink(ctx context.Context) (vfs.VirtualDentry, string, error) {
+func (s *namespaceSymlink) Getlink(ctx context.Context, mnt *vfs.Mount) (vfs.VirtualDentry, string, error) {
 	if err := checkTaskState(s.task); err != nil {
 		return vfs.VirtualDentry{}, "", err
 	}
-	return s.StaticSymlink.Getlink(ctx)
+
+	// Create a synthetic inode to represent the namespace.
+	dentry := &kernfs.Dentry{}
+	dentry.Init(&namespaceInode{})
+	vd := vfs.MakeVirtualDentry(mnt, dentry.VFSDentry())
+	vd.IncRef()
+	dentry.DecRef()
+	return vd, "", nil
+}
+
+// namespaceInode is a synthetic inode created to represent a namespace in
+// /proc/[pid]/ns/*.
+type namespaceInode struct {
+	kernfs.InodeAttrs
+	kernfs.InodeNoopRefCount
+	kernfs.InodeNotDirectory
+	kernfs.InodeNotSymlink
+}
+
+var _ kernfs.Inode = (*namespaceInode)(nil)
+
+// Init initializes a namespace inode.
+func (i *namespaceInode) Init(creds *auth.Credentials, ino uint64, perm linux.FileMode) {
+	if perm&^linux.PermissionsMask != 0 {
+		panic(fmt.Sprintf("Only permission mask must be set: %x", perm&linux.PermissionsMask))
+	}
+	i.InodeAttrs.Init(creds, ino, linux.ModeRegular|perm)
+}
+
+// Open implements Inode.Open.
+func (i *namespaceInode) Open(ctx context.Context, rp *vfs.ResolvingPath, vfsd *vfs.Dentry, opts vfs.OpenOptions) (*vfs.FileDescription, error) {
+	fd := &namespaceFD{inode: i}
+	i.IncRef()
+	if err := fd.vfsfd.Init(fd, opts.Flags, rp.Mount(), vfsd, &vfs.FileDescriptionOptions{}); err != nil {
+		return nil, err
+	}
+	return &fd.vfsfd, nil
+}
+
+// namespace FD is a synthetic file that represents a namespace in
+// /proc/[pid]/ns/*.
+type namespaceFD struct {
+	vfs.FileDescriptionDefaultImpl
+
+	vfsfd vfs.FileDescription
+	inode *namespaceInode
+}
+
+var _ vfs.FileDescriptionImpl = (*namespaceFD)(nil)
+
+// Stat implements FileDescriptionImpl.
+func (fd *namespaceFD) Stat(ctx context.Context, opts vfs.StatOptions) (linux.Statx, error) {
+	vfs := fd.vfsfd.VirtualDentry().Mount().Filesystem()
+	return fd.inode.Stat(vfs, opts)
+}
+
+// SetStat implements FileDescriptionImpl.
+func (fd *namespaceFD) SetStat(ctx context.Context, opts vfs.SetStatOptions) error {
+	vfs := fd.vfsfd.VirtualDentry().Mount().Filesystem()
+	creds := auth.CredentialsFromContext(ctx)
+	return fd.inode.SetStat(ctx, vfs, creds, opts)
+}
+
+// Release implements FileDescriptionImpl.
+func (fd *namespaceFD) Release() {
+	fd.inode.DecRef()
+}
+
+// OnClose implements FileDescriptionImpl.
+func (*namespaceFD) OnClose(context.Context) error {
+	return nil
 }

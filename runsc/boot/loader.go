@@ -35,6 +35,8 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/control"
 	"gvisor.dev/gvisor/pkg/sentry/fs"
 	"gvisor.dev/gvisor/pkg/sentry/fs/host"
+	"gvisor.dev/gvisor/pkg/sentry/fs/user"
+	vfs2host "gvisor.dev/gvisor/pkg/sentry/fsimpl/host"
 	"gvisor.dev/gvisor/pkg/sentry/inet"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
@@ -45,6 +47,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/syscalls/linux/vfs2"
 	"gvisor.dev/gvisor/pkg/sentry/time"
 	"gvisor.dev/gvisor/pkg/sentry/usage"
+	"gvisor.dev/gvisor/pkg/sentry/vfs"
 	"gvisor.dev/gvisor/pkg/sentry/watchdog"
 	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/tcpip"
@@ -328,6 +331,17 @@ func New(args Args) (*Loader, error) {
 		return nil, fmt.Errorf("creating pod mount hints: %v", err)
 	}
 
+	if kernel.VFS2Enabled {
+		// Set up host mount that will be used for imported fds.
+		hostFilesystem := vfs2host.NewFilesystem(k.VFS())
+		defer hostFilesystem.DecRef()
+		hostMount, err := k.VFS().NewDisconnectedMount(hostFilesystem, nil, &vfs.MountOptions{})
+		if err != nil {
+			return nil, fmt.Errorf("failed to create hostfs mount: %v", err)
+		}
+		k.SetHostMount(hostMount)
+	}
+
 	// Make host FDs stable between invocations. Host FDs must map to the exact
 	// same number when the sandbox is restored. Otherwise the wrong FD will be
 	// used.
@@ -550,11 +564,11 @@ func (l *Loader) run() error {
 		// Add the HOME enviroment variable if it is not already set.
 		var envv []string
 		if kernel.VFS2Enabled {
-			envv, err = maybeAddExecUserHomeVFS2(ctx, l.rootProcArgs.MountNamespaceVFS2,
+			envv, err = user.MaybeAddExecUserHomeVFS2(ctx, l.rootProcArgs.MountNamespaceVFS2,
 				l.rootProcArgs.Credentials.RealKUID, l.rootProcArgs.Envv)
 
 		} else {
-			envv, err = maybeAddExecUserHome(ctx, l.rootProcArgs.MountNamespace,
+			envv, err = user.MaybeAddExecUserHome(ctx, l.rootProcArgs.MountNamespace,
 				l.rootProcArgs.Credentials.RealKUID, l.rootProcArgs.Envv)
 		}
 		if err != nil {
@@ -611,11 +625,14 @@ func (l *Loader) run() error {
 
 	// l.stdioFDs are derived from dup() in boot.New() and they are now dup()ed again
 	// either in createFDTable() during initial start or in descriptor.initAfterLoad()
-	// during restore, we can release l.stdioFDs now.
-	for _, fd := range l.stdioFDs {
-		err := syscall.Close(fd)
-		if err != nil {
-			return fmt.Errorf("close dup()ed stdioFDs: %v", err)
+	// during restore, we can release l.stdioFDs now. VFS2 takes ownership of the
+	// passed FDs, so only close for VFS1.
+	if !kernel.VFS2Enabled {
+		for _, fd := range l.stdioFDs {
+			err := syscall.Close(fd)
+			if err != nil {
+				return fmt.Errorf("close dup()ed stdioFDs: %v", err)
+			}
 		}
 	}
 
@@ -860,7 +877,7 @@ func (l *Loader) executeAsync(args *control.ExecArgs) (kernel.ThreadID, error) {
 	root := args.MountNamespace.Root()
 	defer root.DecRef()
 	ctx := fs.WithRoot(l.k.SupervisorContext(), root)
-	envv, err := maybeAddExecUserHome(ctx, args.MountNamespace, args.KUID, args.Envv)
+	envv, err := user.MaybeAddExecUserHome(ctx, args.MountNamespace, args.KUID, args.Envv)
 	if err != nil {
 		return 0, err
 	}

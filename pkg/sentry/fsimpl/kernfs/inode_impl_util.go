@@ -182,7 +182,7 @@ func (InodeNotSymlink) Readlink(context.Context) (string, error) {
 }
 
 // Getlink implements Inode.Getlink.
-func (InodeNotSymlink) Getlink(context.Context) (vfs.VirtualDentry, string, error) {
+func (InodeNotSymlink) Getlink(context.Context, *vfs.Mount) (vfs.VirtualDentry, string, error) {
 	return vfs.VirtualDentry{}, "", syserror.EINVAL
 }
 
@@ -214,6 +214,11 @@ func (a *InodeAttrs) Init(creds *auth.Credentials, ino uint64, mode linux.FileMo
 	atomic.StoreUint32(&a.uid, uint32(creds.EffectiveKUID))
 	atomic.StoreUint32(&a.gid, uint32(creds.EffectiveKGID))
 	atomic.StoreUint32(&a.nlink, nlink)
+}
+
+// Ino returns the inode id.
+func (a *InodeAttrs) Ino() uint64 {
+	return atomic.LoadUint64(&a.ino)
 }
 
 // Mode implements Inode.Mode.
@@ -359,8 +364,8 @@ func (o *OrderedChildren) Destroy() {
 // cache. Populate returns the number of directories inserted, which the caller
 // may use to update the link count for the parent directory.
 //
-// Precondition: d.Impl() must be a kernfs Dentry. d must represent a directory
-// inode. children must not contain any conflicting entries already in o.
+// Precondition: d must represent a directory inode. children must not contain
+// any conflicting entries already in o.
 func (o *OrderedChildren) Populate(d *Dentry, children map[string]*Dentry) uint32 {
 	var links uint32
 	for name, child := range children {
@@ -370,7 +375,7 @@ func (o *OrderedChildren) Populate(d *Dentry, children map[string]*Dentry) uint3
 		if err := o.Insert(name, child.VFSDentry()); err != nil {
 			panic(fmt.Sprintf("Collision when attempting to insert child %q (%+v) into %+v", name, child, d))
 		}
-		d.InsertChild(name, child.VFSDentry())
+		d.InsertChild(name, child)
 	}
 	return links
 }
@@ -520,7 +525,7 @@ type InodeSymlink struct {
 }
 
 // Open implements Inode.Open.
-func (InodeSymlink) Open(rp *vfs.ResolvingPath, vfsd *vfs.Dentry, opts vfs.OpenOptions) (*vfs.FileDescription, error) {
+func (InodeSymlink) Open(ctx context.Context, rp *vfs.ResolvingPath, vfsd *vfs.Dentry, opts vfs.OpenOptions) (*vfs.FileDescription, error) {
 	return nil, syserror.ELOOP
 }
 
@@ -562,9 +567,11 @@ func (s *StaticDirectory) Init(creds *auth.Credentials, ino uint64, perm linux.F
 }
 
 // Open implements kernfs.Inode.
-func (s *StaticDirectory) Open(rp *vfs.ResolvingPath, vfsd *vfs.Dentry, opts vfs.OpenOptions) (*vfs.FileDescription, error) {
-	fd := &GenericDirectoryFD{}
-	fd.Init(rp.Mount(), vfsd, &s.OrderedChildren, &opts)
+func (s *StaticDirectory) Open(ctx context.Context, rp *vfs.ResolvingPath, vfsd *vfs.Dentry, opts vfs.OpenOptions) (*vfs.FileDescription, error) {
+	fd, err := NewGenericDirectoryFD(rp.Mount(), vfsd, &s.OrderedChildren, &opts)
+	if err != nil {
+		return nil, err
+	}
 	return fd.VFSFileDescription(), nil
 }
 

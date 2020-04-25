@@ -15,15 +15,26 @@ go_template_instance(
     },
 )
 
+go_template_instance(
+    name = "fstree",
+    out = "fstree.go",
+    package = "gofer",
+    prefix = "generic",
+    template = "//pkg/sentry/vfs/genericfstree:generic_fstree",
+    types = {
+        "Dentry": "dentry",
+    },
+)
+
 go_library(
     name = "gofer",
     srcs = [
         "dentry_list.go",
         "directory.go",
         "filesystem.go",
+        "fstree.go",
         "gofer.go",
         "handle.go",
-        "handle_unsafe.go",
         "p9file.go",
         "pagemath.go",
         "regular_file.go",
@@ -41,6 +52,7 @@ go_library(
         "//pkg/p9",
         "//pkg/safemem",
         "//pkg/sentry/fs/fsutil",
+        "//pkg/sentry/hostfd",
         "//pkg/sentry/kernel/auth",
         "//pkg/sentry/kernel/time",
         "//pkg/sentry/memmap",

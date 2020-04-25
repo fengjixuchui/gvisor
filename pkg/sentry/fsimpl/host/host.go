@@ -25,11 +25,10 @@ import (
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/context"
-	"gvisor.dev/gvisor/pkg/fd"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/refs"
-	"gvisor.dev/gvisor/pkg/safemem"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/kernfs"
+	"gvisor.dev/gvisor/pkg/sentry/hostfd"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
@@ -43,7 +42,7 @@ type filesystemType struct{}
 
 // GetFilesystem implements FilesystemType.GetFilesystem.
 func (filesystemType) GetFilesystem(context.Context, *vfs.VirtualFilesystem, *auth.Credentials, string, vfs.GetFilesystemOptions) (*vfs.Filesystem, *vfs.Dentry, error) {
-	panic("cannot instaniate a host filesystem")
+	panic("host.filesystemType.GetFilesystem should never be called")
 }
 
 // Name implements FilesystemType.Name.
@@ -56,18 +55,18 @@ type filesystem struct {
 	kernfs.Filesystem
 }
 
-// NewMount returns a new disconnected mount in vfsObj that may be passed to ImportFD.
-func NewMount(vfsObj *vfs.VirtualFilesystem) (*vfs.Mount, error) {
+// NewFilesystem sets up and returns a new hostfs filesystem.
+//
+// Note that there should only ever be one instance of host.filesystem,
+// a global mount for host fds.
+func NewFilesystem(vfsObj *vfs.VirtualFilesystem) *vfs.Filesystem {
 	fs := &filesystem{}
-	fs.Init(vfsObj, &filesystemType{})
-	vfsfs := fs.VFSFilesystem()
-	// NewDisconnectedMount will take an additional reference on vfsfs.
-	defer vfsfs.DecRef()
-	return vfsObj.NewDisconnectedMount(vfsfs, nil, &vfs.MountOptions{})
+	fs.Init(vfsObj, filesystemType{})
+	return fs.VFSFilesystem()
 }
 
 // ImportFD sets up and returns a vfs.FileDescription from a donated fd.
-func ImportFD(mnt *vfs.Mount, hostFD int, isTTY bool) (*vfs.FileDescription, error) {
+func ImportFD(ctx context.Context, mnt *vfs.Mount, hostFD int, isTTY bool) (*vfs.FileDescription, error) {
 	fs, ok := mnt.Filesystem().Impl().(*kernfs.Filesystem)
 	if !ok {
 		return nil, fmt.Errorf("can't import host FDs into filesystems of type %T", mnt.Filesystem().Impl())
@@ -94,7 +93,6 @@ func ImportFD(mnt *vfs.Mount, hostFD int, isTTY bool) (*vfs.FileDescription, err
 		isTTY:    isTTY,
 		canMap:   canMap(uint32(fileType)),
 		ino:      fs.NextIno(),
-		mode:     fileMode,
 		// For simplicity, set offset to 0. Technically, we should use the existing
 		// offset on the host if the file is seekable.
 		offset: 0,
@@ -110,7 +108,7 @@ func ImportFD(mnt *vfs.Mount, hostFD int, isTTY bool) (*vfs.FileDescription, err
 	// i.open will take a reference on d.
 	defer d.DecRef()
 
-	return i.open(d.VFSDentry(), mnt)
+	return i.open(ctx, d.VFSDentry(), mnt)
 }
 
 // inode implements kernfs.Inode.
@@ -149,20 +147,6 @@ type inode struct {
 	// This field is initialized at creation time and is immutable.
 	ino uint64
 
-	// modeMu protects mode.
-	modeMu sync.Mutex
-
-	// mode is a cached version of the file mode on the host. Note that it may
-	// become out of date if the mode is changed on the host, e.g. with chmod.
-	//
-	// Generally, it is better to retrieve the mode from the host through an
-	// fstat syscall. We only use this value in inode.Mode(), which cannot
-	// return an error, if the syscall to host fails.
-	//
-	// FIXME(b/152294168): Plumb error into Inode.Mode() return value so we
-	// can get rid of this.
-	mode linux.FileMode
-
 	// offsetMu protects offset.
 	offsetMu sync.Mutex
 
@@ -185,35 +169,22 @@ func fileFlagsFromHostFD(fd int) (int, error) {
 
 // CheckPermissions implements kernfs.Inode.
 func (i *inode) CheckPermissions(ctx context.Context, creds *auth.Credentials, ats vfs.AccessTypes) error {
-	mode, uid, gid, err := i.getPermissions()
-	if err != nil {
+	var s syscall.Stat_t
+	if err := syscall.Fstat(i.hostFD, &s); err != nil {
 		return err
 	}
-	return vfs.GenericCheckPermissions(creds, ats, mode, uid, gid)
+	return vfs.GenericCheckPermissions(creds, ats, linux.FileMode(s.Mode), auth.KUID(s.Uid), auth.KGID(s.Gid))
 }
 
 // Mode implements kernfs.Inode.
 func (i *inode) Mode() linux.FileMode {
-	mode, _, _, err := i.getPermissions()
-	if err != nil {
-		return i.mode
-	}
-
-	return linux.FileMode(mode)
-}
-
-func (i *inode) getPermissions() (linux.FileMode, auth.KUID, auth.KGID, error) {
-	// Retrieve metadata.
 	var s syscall.Stat_t
 	if err := syscall.Fstat(i.hostFD, &s); err != nil {
-		return 0, 0, 0, err
+		// Retrieving the mode from the host fd using fstat(2) should not fail.
+		// If the syscall does not succeed, something is fundamentally wrong.
+		panic(fmt.Sprintf("failed to retrieve mode from host fd %d: %v", i.hostFD, err))
 	}
-
-	// Update cached mode.
-	i.modeMu.Lock()
-	i.mode = linux.FileMode(s.Mode)
-	i.modeMu.Unlock()
-	return linux.FileMode(s.Mode), auth.KUID(s.Uid), auth.KGID(s.Gid), nil
+	return linux.FileMode(s.Mode)
 }
 
 // Stat implements kernfs.Inode.
@@ -292,12 +263,6 @@ func (i *inode) Stat(_ *vfs.Filesystem, opts vfs.StatOptions) (linux.Statx, erro
 		ls.Ino = i.ino
 	}
 
-	// Update cached mode.
-	if (mask&linux.STATX_TYPE != 0) && (mask&linux.STATX_MODE != 0) {
-		i.modeMu.Lock()
-		i.mode = linux.FileMode(s.Mode)
-		i.modeMu.Unlock()
-	}
 	return ls, nil
 }
 
@@ -352,11 +317,11 @@ func (i *inode) SetStat(ctx context.Context, fs *vfs.Filesystem, creds *auth.Cre
 	if m&^(linux.STATX_MODE|linux.STATX_SIZE|linux.STATX_ATIME|linux.STATX_MTIME) != 0 {
 		return syserror.EPERM
 	}
-	mode, uid, gid, err := i.getPermissions()
-	if err != nil {
+	var hostStat syscall.Stat_t
+	if err := syscall.Fstat(i.hostFD, &hostStat); err != nil {
 		return err
 	}
-	if err := vfs.CheckSetStat(ctx, creds, &s, mode.Permissions(), uid, gid); err != nil {
+	if err := vfs.CheckSetStat(ctx, creds, &s, linux.FileMode(hostStat.Mode&linux.PermissionsMask), auth.KUID(hostStat.Uid), auth.KGID(hostStat.Gid)); err != nil {
 		return err
 	}
 
@@ -364,9 +329,6 @@ func (i *inode) SetStat(ctx context.Context, fs *vfs.Filesystem, creds *auth.Cre
 		if err := syscall.Fchmod(i.hostFD, uint32(s.Mode)); err != nil {
 			return err
 		}
-		i.modeMu.Lock()
-		i.mode = linux.FileMode(s.Mode)
-		i.modeMu.Unlock()
 	}
 	if m&linux.STATX_SIZE != 0 {
 		if err := syscall.Ftruncate(i.hostFD, int64(s.Size)); err != nil {
@@ -398,16 +360,16 @@ func (i *inode) Destroy() {
 }
 
 // Open implements kernfs.Inode.
-func (i *inode) Open(rp *vfs.ResolvingPath, vfsd *vfs.Dentry, opts vfs.OpenOptions) (*vfs.FileDescription, error) {
-	return i.open(vfsd, rp.Mount())
+func (i *inode) Open(ctx context.Context, rp *vfs.ResolvingPath, vfsd *vfs.Dentry, opts vfs.OpenOptions) (*vfs.FileDescription, error) {
+	return i.open(ctx, vfsd, rp.Mount())
 }
 
-func (i *inode) open(d *vfs.Dentry, mnt *vfs.Mount) (*vfs.FileDescription, error) {
-	mode, _, _, err := i.getPermissions()
-	if err != nil {
+func (i *inode) open(ctx context.Context, d *vfs.Dentry, mnt *vfs.Mount) (*vfs.FileDescription, error) {
+	var s syscall.Stat_t
+	if err := syscall.Fstat(i.hostFD, &s); err != nil {
 		return nil, err
 	}
-	fileType := mode.FileType()
+	fileType := s.Mode & linux.FileTypeMask
 	if fileType == syscall.S_IFSOCK {
 		if i.isTTY {
 			return nil, errors.New("cannot use host socket as TTY")
@@ -520,19 +482,9 @@ func readFromHostFD(ctx context.Context, hostFD int, dst usermem.IOSequence, off
 	if flags != 0 {
 		return 0, syserror.EOPNOTSUPP
 	}
-
-	var reader safemem.Reader
-	if offset == -1 {
-		reader = safemem.FromIOReader{fd.NewReadWriter(hostFD)}
-	} else {
-		reader = safemem.FromVecReaderFunc{
-			func(srcs [][]byte) (int64, error) {
-				n, err := unix.Preadv(hostFD, srcs, offset)
-				return int64(n), err
-			},
-		}
-	}
+	reader := hostfd.GetReadWriterAt(int32(hostFD), offset, flags)
 	n, err := dst.CopyOutFrom(ctx, reader)
+	hostfd.PutReadWriterAt(reader)
 	return int64(n), err
 }
 
@@ -570,19 +522,9 @@ func writeToHostFD(ctx context.Context, hostFD int, src usermem.IOSequence, offs
 	if flags != 0 {
 		return 0, syserror.EOPNOTSUPP
 	}
-
-	var writer safemem.Writer
-	if offset == -1 {
-		writer = safemem.FromIOWriter{fd.NewReadWriter(hostFD)}
-	} else {
-		writer = safemem.FromVecWriterFunc{
-			func(srcs [][]byte) (int64, error) {
-				n, err := unix.Pwritev(hostFD, srcs, offset)
-				return int64(n), err
-			},
-		}
-	}
+	writer := hostfd.GetReadWriterAt(int32(hostFD), offset, flags)
 	n, err := src.CopyInTo(ctx, writer)
+	hostfd.PutReadWriterAt(writer)
 	return int64(n), err
 }
 

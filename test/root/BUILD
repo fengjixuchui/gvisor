@@ -1,4 +1,5 @@
 load("//tools:defs.bzl", "go_library", "go_test")
+load("//tools/vm:defs.bzl", "vm_test")
 
 package(licenses = ["notice"])
 
@@ -24,23 +25,33 @@ go_test(
     library = ":root",
     tags = [
         # Requires docker and runsc to be configured before the test runs.
-        # Also test only runs as root.
+        # Also, the test needs to be run as root. Note that below, the
+        # root_vm_test relies on the default runtime 'runsc' being installed by
+        # the default installer.
         "manual",
         "local",
     ],
     visibility = ["//:sandbox"],
     deps = [
-        "//runsc/boot",
+        "//pkg/test/criutil",
+        "//pkg/test/dockerutil",
+        "//pkg/test/testutil",
         "//runsc/cgroup",
         "//runsc/container",
-        "//runsc/criutil",
-        "//runsc/dockerutil",
         "//runsc/specutils",
-        "//runsc/testutil",
-        "//test/root/testdata",
         "@com_github_cenkalti_backoff//:go_default_library",
         "@com_github_opencontainers_runtime-spec//specs-go:go_default_library",
         "@com_github_syndtr_gocapability//capability:go_default_library",
         "@org_golang_x_sys//unix:go_default_library",
+    ],
+)
+
+vm_test(
+    name = "root_vm_test",
+    size = "large",
+    shard_count = 1,
+    targets = [
+        "//tools/installers:shim",
+        ":root_test",
     ],
 )

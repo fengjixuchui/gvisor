@@ -15,6 +15,17 @@ go_template_instance(
     },
 )
 
+go_template_instance(
+    name = "fstree",
+    out = "fstree.go",
+    package = "ext",
+    prefix = "generic",
+    template = "//pkg/sentry/vfs/genericfstree:generic_fstree",
+    types = {
+        "Dentry": "dentry",
+    },
+)
+
 go_library(
     name = "ext",
     srcs = [
@@ -26,6 +37,7 @@ go_library(
         "extent_file.go",
         "file_description.go",
         "filesystem.go",
+        "fstree.go",
         "inode.go",
         "regular_file.go",
         "symlink.go",
@@ -81,8 +93,8 @@ go_test(
         "//pkg/sentry/kernel/auth",
         "//pkg/sentry/vfs",
         "//pkg/syserror",
+        "//pkg/test/testutil",
         "//pkg/usermem",
-        "//runsc/testutil",
         "@com_github_google_go-cmp//cmp:go_default_library",
         "@com_github_google_go-cmp//cmp/cmpopts:go_default_library",
     ],

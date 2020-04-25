@@ -17,6 +17,7 @@ package testbench
 import (
 	"testing"
 
+	"github.com/mohae/deepcopy"
 	"gvisor.dev/gvisor/pkg/tcpip"
 )
 
@@ -48,6 +49,114 @@ func TestLayerMatch(t *testing.T) {
 		}
 		if got := tt.b.match(tt.a); got != tt.want {
 			t.Errorf("%s.match(%s) = %t, want %t", tt.b, tt.a, got, tt.want)
+		}
+	}
+}
+
+func TestLayerMergeMismatch(t *testing.T) {
+	tcp := &TCP{}
+	otherTCP := &TCP{}
+	ipv4 := &IPv4{}
+	ether := &Ether{}
+	for _, tt := range []struct {
+		a, b    Layer
+		success bool
+	}{
+		{tcp, tcp, true},
+		{tcp, otherTCP, true},
+		{tcp, ipv4, false},
+		{tcp, ether, false},
+		{tcp, nil, true},
+
+		{otherTCP, otherTCP, true},
+		{otherTCP, ipv4, false},
+		{otherTCP, ether, false},
+		{otherTCP, nil, true},
+
+		{ipv4, ipv4, true},
+		{ipv4, ether, false},
+		{ipv4, nil, true},
+
+		{ether, ether, true},
+		{ether, nil, true},
+	} {
+		if err := tt.a.merge(tt.b); (err == nil) != tt.success {
+			t.Errorf("%s.merge(%s) got %s, wanted the opposite", tt.a, tt.b, err)
+		}
+		if tt.b != nil {
+			if err := tt.b.merge(tt.a); (err == nil) != tt.success {
+				t.Errorf("%s.merge(%s) got %s, wanted the opposite", tt.b, tt.a, err)
+			}
+		}
+	}
+}
+
+func TestLayerMerge(t *testing.T) {
+	zero := Uint32(0)
+	one := Uint32(1)
+	two := Uint32(2)
+	empty := []byte{}
+	foo := []byte("foo")
+	bar := []byte("bar")
+	for _, tt := range []struct {
+		a, b Layer
+		want Layer
+	}{
+		{&TCP{AckNum: nil}, &TCP{AckNum: nil}, &TCP{AckNum: nil}},
+		{&TCP{AckNum: nil}, &TCP{AckNum: zero}, &TCP{AckNum: zero}},
+		{&TCP{AckNum: nil}, &TCP{AckNum: one}, &TCP{AckNum: one}},
+		{&TCP{AckNum: nil}, &TCP{AckNum: two}, &TCP{AckNum: two}},
+		{&TCP{AckNum: nil}, nil, &TCP{AckNum: nil}},
+
+		{&TCP{AckNum: zero}, &TCP{AckNum: nil}, &TCP{AckNum: zero}},
+		{&TCP{AckNum: zero}, &TCP{AckNum: zero}, &TCP{AckNum: zero}},
+		{&TCP{AckNum: zero}, &TCP{AckNum: one}, &TCP{AckNum: one}},
+		{&TCP{AckNum: zero}, &TCP{AckNum: two}, &TCP{AckNum: two}},
+		{&TCP{AckNum: zero}, nil, &TCP{AckNum: zero}},
+
+		{&TCP{AckNum: one}, &TCP{AckNum: nil}, &TCP{AckNum: one}},
+		{&TCP{AckNum: one}, &TCP{AckNum: zero}, &TCP{AckNum: zero}},
+		{&TCP{AckNum: one}, &TCP{AckNum: one}, &TCP{AckNum: one}},
+		{&TCP{AckNum: one}, &TCP{AckNum: two}, &TCP{AckNum: two}},
+		{&TCP{AckNum: one}, nil, &TCP{AckNum: one}},
+
+		{&TCP{AckNum: two}, &TCP{AckNum: nil}, &TCP{AckNum: two}},
+		{&TCP{AckNum: two}, &TCP{AckNum: zero}, &TCP{AckNum: zero}},
+		{&TCP{AckNum: two}, &TCP{AckNum: one}, &TCP{AckNum: one}},
+		{&TCP{AckNum: two}, &TCP{AckNum: two}, &TCP{AckNum: two}},
+		{&TCP{AckNum: two}, nil, &TCP{AckNum: two}},
+
+		{&Payload{Bytes: nil}, &Payload{Bytes: nil}, &Payload{Bytes: nil}},
+		{&Payload{Bytes: nil}, &Payload{Bytes: empty}, &Payload{Bytes: empty}},
+		{&Payload{Bytes: nil}, &Payload{Bytes: foo}, &Payload{Bytes: foo}},
+		{&Payload{Bytes: nil}, &Payload{Bytes: bar}, &Payload{Bytes: bar}},
+		{&Payload{Bytes: nil}, nil, &Payload{Bytes: nil}},
+
+		{&Payload{Bytes: empty}, &Payload{Bytes: nil}, &Payload{Bytes: empty}},
+		{&Payload{Bytes: empty}, &Payload{Bytes: empty}, &Payload{Bytes: empty}},
+		{&Payload{Bytes: empty}, &Payload{Bytes: foo}, &Payload{Bytes: foo}},
+		{&Payload{Bytes: empty}, &Payload{Bytes: bar}, &Payload{Bytes: bar}},
+		{&Payload{Bytes: empty}, nil, &Payload{Bytes: empty}},
+
+		{&Payload{Bytes: foo}, &Payload{Bytes: nil}, &Payload{Bytes: foo}},
+		{&Payload{Bytes: foo}, &Payload{Bytes: empty}, &Payload{Bytes: empty}},
+		{&Payload{Bytes: foo}, &Payload{Bytes: foo}, &Payload{Bytes: foo}},
+		{&Payload{Bytes: foo}, &Payload{Bytes: bar}, &Payload{Bytes: bar}},
+		{&Payload{Bytes: foo}, nil, &Payload{Bytes: foo}},
+
+		{&Payload{Bytes: bar}, &Payload{Bytes: nil}, &Payload{Bytes: bar}},
+		{&Payload{Bytes: bar}, &Payload{Bytes: empty}, &Payload{Bytes: empty}},
+		{&Payload{Bytes: bar}, &Payload{Bytes: foo}, &Payload{Bytes: foo}},
+		{&Payload{Bytes: bar}, &Payload{Bytes: bar}, &Payload{Bytes: bar}},
+		{&Payload{Bytes: bar}, nil, &Payload{Bytes: bar}},
+	} {
+		a := deepcopy.Copy(tt.a).(Layer)
+		if err := a.merge(tt.b); err != nil {
+			t.Errorf("%s.merge(%s) = %s, wanted nil", tt.a, tt.b, err)
+			continue
+		}
+		if a.String() != tt.want.String() {
+			t.Errorf("%s.merge(%s) merge result got %s, want %s", tt.a, tt.b, a, tt.want)
 		}
 	}
 }
@@ -152,5 +261,135 @@ func TestLayerStringFormat(t *testing.T) {
 				t.Errorf("%s.String() = %s, want: %s", tt.name, got, tt.want)
 			}
 		})
+	}
+}
+
+func TestConnectionMatch(t *testing.T) {
+	conn := Connection{
+		layerStates: []layerState{&etherState{}},
+	}
+	protoNum0 := tcpip.NetworkProtocolNumber(0)
+	protoNum1 := tcpip.NetworkProtocolNumber(1)
+	for _, tt := range []struct {
+		description        string
+		override, received Layers
+		wantMatch          bool
+	}{
+		{
+			description: "shorter override",
+			override:    []Layer{&Ether{}},
+			received:    []Layer{&Ether{}, &Payload{Bytes: []byte("hello")}},
+			wantMatch:   true,
+		},
+		{
+			description: "longer override",
+			override:    []Layer{&Ether{}, &Payload{Bytes: []byte("hello")}},
+			received:    []Layer{&Ether{}},
+			wantMatch:   false,
+		},
+		{
+			description: "ether layer mismatch",
+			override:    []Layer{&Ether{Type: &protoNum0}},
+			received:    []Layer{&Ether{Type: &protoNum1}},
+			wantMatch:   false,
+		},
+		{
+			description: "both nil",
+			override:    nil,
+			received:    nil,
+			wantMatch:   false,
+		},
+		{
+			description: "nil override",
+			override:    nil,
+			received:    []Layer{&Ether{}},
+			wantMatch:   true,
+		},
+	} {
+		t.Run(tt.description, func(t *testing.T) {
+			if gotMatch := conn.match(tt.override, tt.received); gotMatch != tt.wantMatch {
+				t.Fatalf("conn.match(%s, %s) = %t, want %t", tt.override, tt.received, gotMatch, tt.wantMatch)
+			}
+		})
+	}
+}
+
+func TestLayersDiff(t *testing.T) {
+	for _, tt := range []struct {
+		x, y Layers
+		want string
+	}{
+		{
+			Layers{&Ether{Type: NetworkProtocolNumber(12)}, &TCP{DataOffset: Uint8(5), SeqNum: Uint32(5)}},
+			Layers{&Ether{Type: NetworkProtocolNumber(13)}, &TCP{DataOffset: Uint8(7), SeqNum: Uint32(6)}},
+			"Ether:       Type: 12 13\n" +
+				"  TCP:     SeqNum:  5  6\n" +
+				"       DataOffset:  5  7\n",
+		},
+		{
+			Layers{&Ether{Type: NetworkProtocolNumber(12)}, &UDP{SrcPort: Uint16(123)}},
+			Layers{&Ether{Type: NetworkProtocolNumber(13)}, &TCP{DataOffset: Uint8(7), SeqNum: Uint32(6)}},
+			"Ether:       Type:  12 13\n" +
+				"(UDP doesn't match TCP)\n" +
+				"  UDP:    SrcPort: 123   \n" +
+				"  TCP:     SeqNum:      6\n" +
+				"       DataOffset:      7\n",
+		},
+		{
+			Layers{&UDP{SrcPort: Uint16(123)}},
+			Layers{&Ether{Type: NetworkProtocolNumber(13)}, &TCP{DataOffset: Uint8(7), SeqNum: Uint32(6)}},
+			"(UDP doesn't match Ether)\n" +
+				"  UDP: SrcPort: 123   \n" +
+				"Ether:    Type:     13\n" +
+				"(missing matches TCP)\n",
+		},
+		{
+			Layers{nil, &UDP{SrcPort: Uint16(123)}},
+			Layers{&Ether{Type: NetworkProtocolNumber(13)}, &TCP{DataOffset: Uint8(7), SeqNum: Uint32(6)}},
+			"(nil matches Ether)\n" +
+				"(UDP doesn't match TCP)\n" +
+				"UDP:    SrcPort: 123  \n" +
+				"TCP:     SeqNum:     6\n" +
+				"     DataOffset:     7\n",
+		},
+		{
+			Layers{&Ether{Type: NetworkProtocolNumber(13)}, &IPv4{IHL: Uint8(4)}, &TCP{DataOffset: Uint8(7), SeqNum: Uint32(6)}},
+			Layers{&Ether{Type: NetworkProtocolNumber(13)}, &IPv4{IHL: Uint8(6)}, &TCP{DataOffset: Uint8(7), SeqNum: Uint32(6)}},
+			"(Ether matches Ether)\n" +
+				"IPv4: IHL: 4 6\n" +
+				"(TCP matches TCP)\n",
+		},
+		{
+			Layers{&Payload{Bytes: []byte("foo")}},
+			Layers{&Payload{Bytes: []byte("bar")}},
+			"Payload: Bytes: [102 111 111] [98 97 114]\n",
+		},
+		{
+			Layers{&Payload{Bytes: []byte("")}},
+			Layers{&Payload{}},
+			"",
+		},
+		{
+			Layers{&Payload{Bytes: []byte("")}},
+			Layers{&Payload{Bytes: []byte("")}},
+			"",
+		},
+		{
+			Layers{&UDP{}},
+			Layers{&TCP{}},
+			"(UDP doesn't match TCP)\n" +
+				"(UDP)\n" +
+				"(TCP)\n",
+		},
+	} {
+		if got := tt.x.diff(tt.y); got != tt.want {
+			t.Errorf("%s.diff(%s) = %q, want %q", tt.x, tt.y, got, tt.want)
+		}
+		if tt.x.match(tt.y) != (tt.x.diff(tt.y) == "") {
+			t.Errorf("match and diff of %s and %s disagree", tt.x, tt.y)
+		}
+		if tt.y.match(tt.x) != (tt.y.diff(tt.x) == "") {
+			t.Errorf("match and diff of %s and %s disagree", tt.y, tt.x)
+		}
 	}
 }

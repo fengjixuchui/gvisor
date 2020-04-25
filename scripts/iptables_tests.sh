@@ -16,15 +16,8 @@
 
 source $(dirname $0)/common.sh
 
+make load-iptables
+
 install_runsc_for_test iptables --net-raw
-
-# Build the docker image for the test.
-run //test/iptables/runner:runner-image --norun
-
-test //test/iptables:iptables_test \
-  "--test_arg=--runtime=runc" \
-  "--test_arg=--image=bazel/test/iptables/runner:runner-image"
-
-test //test/iptables:iptables_test \
-  "--test_arg=--runtime=${RUNTIME}" \
-  "--test_arg=--image=bazel/test/iptables/runner:runner-image"
+test //test/iptables:iptables_test "--test_arg=--runtime=runc"
+test //test/iptables:iptables_test "--test_arg=--runtime=${RUNTIME}"

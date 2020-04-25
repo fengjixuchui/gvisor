@@ -29,7 +29,7 @@ function failure() {
 }
 trap 'failure ${LINENO} "$BASH_COMMAND"' ERR
 
-declare -r LONGOPTS="dut_platform:,posix_server_binary:,testbench_binary:,runtime:,tshark,extra_test_arg:"
+declare -r LONGOPTS="dut_platform:,posix_server_binary:,testbench_binary:,runtime:,tshark,extra_test_arg:,expect_failure"
 
 # Don't use declare below so that the error from getopt will end the script.
 PARSED=$(getopt --options "" --longoptions=$LONGOPTS --name "$0" -- "$@")
@@ -68,6 +68,10 @@ while true; do
       EXTRA_TEST_ARGS+="$2"
       shift 2
       ;;
+    --expect_failure)
+      declare -r EXPECT_FAILURE="1"
+      shift 1
+      ;;
     --)
       shift
       break
@@ -103,21 +107,24 @@ if [[ ! -f "${TESTBENCH_BINARY-}" ]]; then
   exit 2
 fi
 
+function new_net_prefix() {
+  # Class C, 192.0.0.0 to 223.255.255.255, transitionally has mask 24.
+  echo "$(shuf -i 192-223 -n 1).$(shuf -i 0-255 -n 1).$(shuf -i 0-255 -n 1)"
+}
+
 # Variables specific to the control network and interface start with CTRL_.
 # Variables specific to the test network and interface start with TEST_.
 # Variables specific to the DUT start with DUT_.
 # Variables specific to the test bench start with TESTBENCH_.
 # Use random numbers so that test networks don't collide.
-declare -r CTRL_NET="ctrl_net-${RANDOM}${RANDOM}"
-declare -r TEST_NET="test_net-${RANDOM}${RANDOM}"
+declare CTRL_NET="ctrl_net-${RANDOM}${RANDOM}"
+declare CTRL_NET_PREFIX=$(new_net_prefix)
+declare TEST_NET="test_net-${RANDOM}${RANDOM}"
+declare TEST_NET_PREFIX=$(new_net_prefix)
 # On both DUT and test bench, testing packets are on the eth2 interface.
 declare -r TEST_DEVICE="eth2"
 # Number of bits in the *_NET_PREFIX variables.
 declare -r NET_MASK="24"
-function new_net_prefix() {
-  # Class C, 192.0.0.0 to 223.255.255.255, transitionally has mask 24.
-  echo "$(shuf -i 192-223 -n 1).$(shuf -i 0-255 -n 1).$(shuf -i 0-255 -n 1)"
-}
 # Last bits of the DUT's IP address.
 declare -r DUT_NET_SUFFIX=".10"
 # Control port.
@@ -126,6 +133,7 @@ declare -r CTRL_PORT="40000"
 declare -r TESTBENCH_NET_SUFFIX=".20"
 declare -r TIMEOUT="60"
 declare -r IMAGE_TAG="gcr.io/gvisor-presubmit/packetimpact"
+
 # Make sure that docker is installed.
 docker --version
 
@@ -165,25 +173,27 @@ function finish {
 trap finish EXIT
 
 # Subnet for control packets between test bench and DUT.
-declare CTRL_NET_PREFIX=$(new_net_prefix)
 while ! docker network create \
   "--subnet=${CTRL_NET_PREFIX}.0/${NET_MASK}" "${CTRL_NET}"; do
   sleep 0.1
-  declare CTRL_NET_PREFIX=$(new_net_prefix)
+  CTRL_NET_PREFIX=$(new_net_prefix)
+  CTRL_NET="ctrl_net-${RANDOM}${RANDOM}"
 done
 
 # Subnet for the packets that are part of the test.
-declare TEST_NET_PREFIX=$(new_net_prefix)
 while ! docker network create \
   "--subnet=${TEST_NET_PREFIX}.0/${NET_MASK}" "${TEST_NET}"; do
   sleep 0.1
-  declare TEST_NET_PREFIX=$(new_net_prefix)
+  TEST_NET_PREFIX=$(new_net_prefix)
+  TEST_NET="test_net-${RANDOM}${RANDOM}"
 done
 
 docker pull "${IMAGE_TAG}"
 
 # Create the DUT container and connect to network.
 DUT=$(docker create ${RUNTIME_ARG} --privileged --rm \
+  --cap-add NET_ADMIN \
+  --sysctl net.ipv6.conf.all.disable_ipv6=0 \
   --stop-timeout ${TIMEOUT} -it ${IMAGE_TAG})
 docker network connect "${CTRL_NET}" \
   --ip "${CTRL_NET_PREFIX}${DUT_NET_SUFFIX}" "${DUT}" \
@@ -195,6 +205,8 @@ docker start "${DUT}"
 
 # Create the test bench container and connect to network.
 TESTBENCH=$(docker create --privileged --rm \
+  --cap-add NET_ADMIN \
+  --sysctl net.ipv6.conf.all.disable_ipv6=0 \
   --stop-timeout ${TIMEOUT} -it ${IMAGE_TAG})
 docker network connect "${CTRL_NET}" \
   --ip "${CTRL_NET_PREFIX}${TESTBENCH_NET_SUFFIX}" "${TESTBENCH}" \
@@ -229,6 +241,32 @@ declare -r REMOTE_MAC=$(docker exec -t "${DUT}" ip link show \
   "${TEST_DEVICE}" | tail -1 | cut -d' ' -f6)
 declare -r LOCAL_MAC=$(docker exec -t "${TESTBENCH}" ip link show \
   "${TEST_DEVICE}" | tail -1 | cut -d' ' -f6)
+declare REMOTE_IPV6=$(docker exec -t "${DUT}" ip addr show scope link \
+  "${TEST_DEVICE}" | grep inet6 | cut -d' ' -f6 | cut -d'/' -f1)
+declare -r LOCAL_IPV6=$(docker exec -t "${TESTBENCH}" ip addr show scope link \
+  "${TEST_DEVICE}" | grep inet6 | cut -d' ' -f6 | cut -d'/' -f1)
+
+# Netstack as DUT doesn't assign IPv6 addresses automatically so do it if
+# needed.  Convert the MAC address to an IPv6 link local address as described in
+# RFC 4291 page 20: https://tools.ietf.org/html/rfc4291#page-20
+if [[ -z "${REMOTE_IPV6}" ]]; then
+  # Split the octets of the MAC into an array of strings.
+  IFS=":" read -a REMOTE_OCTETS <<< "${REMOTE_MAC}"
+  # Flip the global bit.
+  REMOTE_OCTETS[0]=$(printf '%x' "$((0x${REMOTE_OCTETS[0]} ^ 2))")
+  # Add the IPv6 address.
+  docker exec "${DUT}" \
+    ip addr add $(printf 'fe80::%02x%02x:%02xff:fe%02x:%02x%02x/64' \
+    "0x${REMOTE_OCTETS[0]}" "0x${REMOTE_OCTETS[1]}" "0x${REMOTE_OCTETS[2]}" \
+    "0x${REMOTE_OCTETS[3]}" "0x${REMOTE_OCTETS[4]}" "0x${REMOTE_OCTETS[5]}") \
+    scope link \
+    dev "${TEST_DEVICE}"
+  # Re-extract the IPv6 address.
+  # TODO(eyalsoha): Add "scope link" below when netstack supports correctly
+  # creating link-local IPv6 addresses.
+  REMOTE_IPV6=$(docker exec -t "${DUT}" ip addr show \
+    "${TEST_DEVICE}" | grep inet6 | cut -d' ' -f6 | cut -d'/' -f1)
+fi
 
 declare -r DOCKER_TESTBENCH_BINARY="/$(basename ${TESTBENCH_BINARY})"
 docker cp -L "${TESTBENCH_BINARY}" "${TESTBENCH}:${DOCKER_TESTBENCH_BINARY}"
@@ -237,7 +275,10 @@ if [[ -z "${TSHARK-}" ]]; then
   # Run tcpdump in the test bench unbuffered, without dns resolution, just on
   # the interface with the test packets.
   docker exec -t "${TESTBENCH}" \
-    tcpdump -S -vvv -U -n -i "${TEST_DEVICE}" net "${TEST_NET_PREFIX}/24" &
+    tcpdump -S -vvv -U -n -i "${TEST_DEVICE}" \
+    net "${TEST_NET_PREFIX}/24" or \
+    host "${REMOTE_IPV6}" or \
+    host "${LOCAL_IPV6}" &
 else
   # Run tshark in the test bench unbuffered, without dns resolution, just on the
   # interface with the test packets.
@@ -245,7 +286,9 @@ else
     tshark -V -l -n -i "${TEST_DEVICE}" \
     -o tcp.check_checksum:TRUE \
     -o udp.check_checksum:TRUE \
-    host "${TEST_NET_PREFIX}${TESTBENCH_NET_SUFFIX}" &
+    net "${TEST_NET_PREFIX}/24" or \
+    host "${REMOTE_IPV6}" or \
+    host "${LOCAL_IPV6}" &
 fi
 
 # tcpdump and tshark take time to startup
@@ -254,15 +297,29 @@ sleep 3
 # Start a packetimpact test on the test bench.  The packetimpact test sends and
 # receives packets and also sends POSIX socket commands to the posix_server to
 # be executed on the DUT.
-docker exec -t "${TESTBENCH}" \
+docker exec \
+  -e XML_OUTPUT_FILE="/test.xml" \
+  -e TEST_TARGET \
+  -t "${TESTBENCH}" \
   /bin/bash -c "${DOCKER_TESTBENCH_BINARY} \
   ${EXTRA_TEST_ARGS[@]-} \
   --posix_server_ip=${CTRL_NET_PREFIX}${DUT_NET_SUFFIX} \
   --posix_server_port=${CTRL_PORT} \
   --remote_ipv4=${TEST_NET_PREFIX}${DUT_NET_SUFFIX} \
   --local_ipv4=${TEST_NET_PREFIX}${TESTBENCH_NET_SUFFIX} \
+  --remote_ipv6=${REMOTE_IPV6} \
+  --local_ipv6=${LOCAL_IPV6} \
   --remote_mac=${REMOTE_MAC} \
   --local_mac=${LOCAL_MAC} \
-  --device=${TEST_DEVICE}"
-
+  --device=${TEST_DEVICE}" && true
+declare -r TEST_RESULT="${?}"
+if [[ -z "${EXPECT_FAILURE-}" && "${TEST_RESULT}" != 0 ]]; then
+  echo 'FAIL: This test was expected to pass.'
+  exit ${TEST_RESULT}
+fi
+if [[ ! -z "${EXPECT_FAILURE-}" && "${TEST_RESULT}" == 0 ]]; then
+  echo 'FAIL: This test was expected to fail but passed.  Enable the test and' \
+    'mark the corresponding bug as fixed.'
+  exit 1
+fi
 echo PASS: No errors.
