@@ -131,6 +131,7 @@ func newNIC(stack *Stack, id tcpip.NICID, name string, ep LinkEndpoint, ctx NICC
 		onLinkPrefixes: make(map[tcpip.Subnet]onLinkPrefixState),
 		slaacPrefixes:  make(map[tcpip.Subnet]slaacPrefixState),
 	}
+	nic.mu.ndp.initializeTempAddrState()
 
 	// Register supported packet endpoint protocols.
 	for _, netProto := range header.Ethertypes {
@@ -1014,14 +1015,14 @@ func (n *NIC) removePermanentAddressLocked(addr tcpip.Address) *tcpip.Error {
 
 	switch r.protocol {
 	case header.IPv6ProtocolNumber:
-		return n.removePermanentIPv6EndpointLocked(r, true /* allowSLAAPrefixInvalidation */)
+		return n.removePermanentIPv6EndpointLocked(r, true /* allowSLAACInvalidation */)
 	default:
 		r.expireLocked()
 		return nil
 	}
 }
 
-func (n *NIC) removePermanentIPv6EndpointLocked(r *referencedNetworkEndpoint, allowSLAACPrefixInvalidation bool) *tcpip.Error {
+func (n *NIC) removePermanentIPv6EndpointLocked(r *referencedNetworkEndpoint, allowSLAACInvalidation bool) *tcpip.Error {
 	addr := r.addrWithPrefix()
 
 	isIPv6Unicast := header.IsV6UnicastAddress(addr.Address)
@@ -1031,8 +1032,11 @@ func (n *NIC) removePermanentIPv6EndpointLocked(r *referencedNetworkEndpoint, al
 
 		// If we are removing an address generated via SLAAC, cleanup
 		// its SLAAC resources and notify the integrator.
-		if r.configType == slaac {
-			n.mu.ndp.cleanupSLAACAddrResourcesAndNotify(addr, allowSLAACPrefixInvalidation)
+		switch r.configType {
+		case slaac:
+			n.mu.ndp.cleanupSLAACAddrResourcesAndNotify(addr, allowSLAACInvalidation)
+		case slaacTemp:
+			n.mu.ndp.cleanupTempSLAACAddrResourcesAndNotify(addr, allowSLAACInvalidation)
 		}
 	}
 
@@ -1203,12 +1207,12 @@ func (n *NIC) DeliverNetworkPacket(linkEP LinkEndpoint, remote, local tcpip.Link
 		n.stack.stats.IP.PacketsReceived.Increment()
 	}
 
-	netHeader, ok := pkt.Data.PullUp(netProto.MinimumPacketSize())
-	if !ok {
+	if len(pkt.Data.First()) < netProto.MinimumPacketSize() {
 		n.stack.stats.MalformedRcvdPackets.Increment()
 		return
 	}
-	src, dst := netProto.ParseAddresses(netHeader)
+
+	src, dst := netProto.ParseAddresses(pkt.Data.First())
 
 	if n.stack.handleLocal && !n.isLoopback() && n.getRef(protocol, src) != nil {
 		// The source address is one of our own, so we never should have gotten a
@@ -1289,8 +1293,22 @@ func (n *NIC) DeliverNetworkPacket(linkEP LinkEndpoint, remote, local tcpip.Link
 
 func (n *NIC) forwardPacket(r *Route, protocol tcpip.NetworkProtocolNumber, pkt PacketBuffer) {
 	// TODO(b/143425874) Decrease the TTL field in forwarded packets.
-	if linkHeaderLen := int(n.linkEP.MaxHeaderLength()); linkHeaderLen != 0 {
-		pkt.Header = buffer.NewPrependable(linkHeaderLen)
+
+	firstData := pkt.Data.First()
+	pkt.Data.RemoveFirst()
+
+	if linkHeaderLen := int(n.linkEP.MaxHeaderLength()); linkHeaderLen == 0 {
+		pkt.Header = buffer.NewPrependableFromView(firstData)
+	} else {
+		firstDataLen := len(firstData)
+
+		// pkt.Header should have enough capacity to hold n.linkEP's headers.
+		pkt.Header = buffer.NewPrependable(firstDataLen + linkHeaderLen)
+
+		// TODO(b/151227689): avoid copying the packet when forwarding
+		if n := copy(pkt.Header.Prepend(firstDataLen), firstData); n != firstDataLen {
+			panic(fmt.Sprintf("copied %d bytes, expected %d", n, firstDataLen))
+		}
 	}
 
 	if err := n.linkEP.WritePacket(r, nil /* gso */, protocol, pkt); err != nil {
@@ -1318,13 +1336,12 @@ func (n *NIC) DeliverTransportPacket(r *Route, protocol tcpip.TransportProtocolN
 	// validly formed.
 	n.stack.demux.deliverRawPacket(r, protocol, pkt)
 
-	transHeader, ok := pkt.Data.PullUp(transProto.MinimumPacketSize())
-	if !ok {
+	if len(pkt.Data.First()) < transProto.MinimumPacketSize() {
 		n.stack.stats.MalformedRcvdPackets.Increment()
 		return
 	}
 
-	srcPort, dstPort, err := transProto.ParsePorts(transHeader)
+	srcPort, dstPort, err := transProto.ParsePorts(pkt.Data.First())
 	if err != nil {
 		n.stack.stats.MalformedRcvdPackets.Increment()
 		return
@@ -1362,12 +1379,11 @@ func (n *NIC) DeliverTransportControlPacket(local, remote tcpip.Address, net tcp
 	// ICMPv4 only guarantees that 8 bytes of the transport protocol will
 	// be present in the payload. We know that the ports are within the
 	// first 8 bytes for all known transport protocols.
-	transHeader, ok := pkt.Data.PullUp(8)
-	if !ok {
+	if len(pkt.Data.First()) < 8 {
 		return
 	}
 
-	srcPort, dstPort, err := transProto.ParsePorts(transHeader)
+	srcPort, dstPort, err := transProto.ParsePorts(pkt.Data.First())
 	if err != nil {
 		return
 	}
@@ -1436,12 +1452,19 @@ func (n *NIC) dupTentativeAddrDetected(addr tcpip.Address) *tcpip.Error {
 
 	// If the address is a SLAAC address, do not invalidate its SLAAC prefix as a
 	// new address will be generated for it.
-	if err := n.removePermanentIPv6EndpointLocked(ref, false /* allowSLAACPrefixInvalidation */); err != nil {
+	if err := n.removePermanentIPv6EndpointLocked(ref, false /* allowSLAACInvalidation */); err != nil {
 		return err
 	}
 
-	if ref.configType == slaac {
-		n.mu.ndp.regenerateSLAACAddr(ref.addrWithPrefix().Subnet())
+	prefix := ref.addrWithPrefix().Subnet()
+
+	switch ref.configType {
+	case slaac:
+		n.mu.ndp.regenerateSLAACAddr(prefix)
+	case slaacTemp:
+		// Do not reset the generation attempts counter for the prefix as the
+		// temporary address is being regenerated in response to a DAD conflict.
+		n.mu.ndp.regenerateTempSLAACAddr(prefix, false /* resetGenAttempts */)
 	}
 
 	return nil
@@ -1540,9 +1563,14 @@ const (
 	// multicast group).
 	static networkEndpointConfigType = iota
 
-	// A slaac configured endpoint is an IPv6 endpoint that was
-	// added by SLAAC as per RFC 4862 section 5.5.3.
+	// A SLAAC configured endpoint is an IPv6 endpoint that was added by
+	// SLAAC as per RFC 4862 section 5.5.3.
 	slaac
+
+	// A temporary SLAAC configured endpoint is an IPv6 endpoint that was added by
+	// SLAAC as per RFC 4941. Temporary SLAAC addresses are short-lived and are
+	// not expected to be valid (or preferred) forever; hence the term temporary.
+	slaacTemp
 )
 
 type referencedNetworkEndpoint struct {
