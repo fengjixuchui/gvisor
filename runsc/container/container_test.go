@@ -256,6 +256,8 @@ var (
 func configs(t *testing.T, opts ...configOption) map[string]*boot.Config {
 	// Always load the default config.
 	cs := make(map[string]*boot.Config)
+	cs["default"] = testutil.TestConfig(t)
+
 	for _, o := range opts {
 		switch o {
 		case overlay:
@@ -281,7 +283,7 @@ func configs(t *testing.T, opts ...configOption) map[string]*boot.Config {
 	return cs
 }
 
-func configsWithVFS2(t *testing.T, opts []configOption) map[string]*boot.Config {
+func configsWithVFS2(t *testing.T, opts ...configOption) map[string]*boot.Config {
 	vfs1 := configs(t, opts...)
 	vfs2 := configs(t, opts...)
 
@@ -302,7 +304,7 @@ func TestLifecycle(t *testing.T) {
 	childReaper.Start()
 	defer childReaper.Stop()
 
-	for name, conf := range configsWithVFS2(t, all) {
+	for name, conf := range configsWithVFS2(t, all...) {
 		t.Run(name, func(t *testing.T) {
 			// The container will just sleep for a long time.  We will kill it before
 			// it finishes sleeping.
@@ -476,7 +478,7 @@ func TestExePath(t *testing.T) {
 		t.Fatalf("error making directory: %v", err)
 	}
 
-	for name, conf := range configsWithVFS2(t, []configOption{overlay}) {
+	for name, conf := range configsWithVFS2(t, overlay) {
 		t.Run(name, func(t *testing.T) {
 			for _, test := range []struct {
 				path    string
@@ -1297,7 +1299,7 @@ func TestCapabilities(t *testing.T) {
 // TestRunNonRoot checks that sandbox can be configured when running as
 // non-privileged user.
 func TestRunNonRoot(t *testing.T) {
-	for name, conf := range configs(t, noOverlay...) {
+	for name, conf := range configsWithVFS2(t, noOverlay...) {
 		t.Run(name, func(t *testing.T) {
 			spec := testutil.NewSpecWithArgs("/bin/true")
 
@@ -1341,7 +1343,7 @@ func TestRunNonRoot(t *testing.T) {
 // TestMountNewDir checks that runsc will create destination directory if it
 // doesn't exit.
 func TestMountNewDir(t *testing.T) {
-	for name, conf := range configsWithVFS2(t, []configOption{overlay}) {
+	for name, conf := range configsWithVFS2(t, overlay) {
 		t.Run(name, func(t *testing.T) {
 			root, err := ioutil.TempDir(testutil.TmpDir(), "root")
 			if err != nil {
@@ -1370,7 +1372,7 @@ func TestMountNewDir(t *testing.T) {
 }
 
 func TestReadonlyRoot(t *testing.T) {
-	for name, conf := range configsWithVFS2(t, []configOption{overlay}) {
+	for name, conf := range configsWithVFS2(t, overlay) {
 		t.Run(name, func(t *testing.T) {
 			spec := testutil.NewSpecWithArgs("/bin/touch", "/foo")
 			spec.Root.Readonly = true
@@ -1488,7 +1490,7 @@ func TestUIDMap(t *testing.T) {
 }
 
 func TestReadonlyMount(t *testing.T) {
-	for name, conf := range configsWithVFS2(t, []configOption{overlay}) {
+	for name, conf := range configsWithVFS2(t, overlay) {
 		t.Run(name, func(t *testing.T) {
 			dir, err := ioutil.TempDir(testutil.TmpDir(), "ro-mount")
 			spec := testutil.NewSpecWithArgs("/bin/touch", path.Join(dir, "file"))
@@ -1532,6 +1534,28 @@ func TestReadonlyMount(t *testing.T) {
 				t.Fatalf("container failed, waitStatus: %v", ws)
 			}
 		})
+	}
+}
+
+func TestBindMountByOption(t *testing.T) {
+	for _, conf := range configs(t, overlay) {
+		t.Logf("Running test with conf: %+v", conf)
+
+		dir, err := ioutil.TempDir(testutil.TmpDir(), "bind-mount")
+		spec := testutil.NewSpecWithArgs("/bin/touch", path.Join(dir, "file"))
+		if err != nil {
+			t.Fatalf("ioutil.TempDir() failed: %v", err)
+		}
+		spec.Mounts = append(spec.Mounts, specs.Mount{
+			Destination: dir,
+			Source:      dir,
+			Type:        "none",
+			Options:     []string{"rw", "bind"},
+		})
+
+		if err := run(spec, conf); err != nil {
+			t.Fatalf("error running sandbox: %v", err)
+		}
 	}
 }
 
@@ -1742,7 +1766,7 @@ func TestUserLog(t *testing.T) {
 }
 
 func TestWaitOnExitedSandbox(t *testing.T) {
-	for name, conf := range configsWithVFS2(t, all) {
+	for name, conf := range configsWithVFS2(t, all...) {
 		t.Run(name, func(t *testing.T) {
 			// Run a shell that sleeps for 1 second and then exits with a
 			// non-zero code.
@@ -2167,63 +2191,70 @@ func TestTTYField(t *testing.T) {
 	}
 
 	for _, test := range testCases {
-		t.Run(test.name, func(t *testing.T) {
-			conf := testutil.TestConfig(t)
+		for _, vfs2 := range []bool{false, true} {
+			name := test.name
+			if vfs2 {
+				name += "-vfs2"
+			}
+			t.Run(name, func(t *testing.T) {
+				conf := testutil.TestConfig(t)
+				conf.VFS2 = vfs2
 
-			// We will run /bin/sleep, possibly with an open TTY.
-			cmd := []string{"/bin/sleep", "10000"}
-			if test.useTTY {
-				// Run inside the "pty-runner".
-				cmd = append([]string{testApp, "pty-runner"}, cmd...)
-			}
+				// We will run /bin/sleep, possibly with an open TTY.
+				cmd := []string{"/bin/sleep", "10000"}
+				if test.useTTY {
+					// Run inside the "pty-runner".
+					cmd = append([]string{testApp, "pty-runner"}, cmd...)
+				}
 
-			spec := testutil.NewSpecWithArgs(cmd...)
-			_, bundleDir, cleanup, err := testutil.SetupContainer(spec, conf)
-			if err != nil {
-				t.Fatalf("error setting up container: %v", err)
-			}
-			defer cleanup()
-
-			// Create and start the container.
-			args := Args{
-				ID:        testutil.RandomContainerID(),
-				Spec:      spec,
-				BundleDir: bundleDir,
-			}
-			c, err := New(conf, args)
-			if err != nil {
-				t.Fatalf("error creating container: %v", err)
-			}
-			defer c.Destroy()
-			if err := c.Start(conf); err != nil {
-				t.Fatalf("error starting container: %v", err)
-			}
-
-			// Wait for sleep to be running, and check the TTY
-			// field.
-			var gotTTYField string
-			cb := func() error {
-				ps, err := c.Processes()
+				spec := testutil.NewSpecWithArgs(cmd...)
+				_, bundleDir, cleanup, err := testutil.SetupContainer(spec, conf)
 				if err != nil {
-					err = fmt.Errorf("error getting process data from container: %v", err)
-					return &backoff.PermanentError{Err: err}
+					t.Fatalf("error setting up container: %v", err)
 				}
-				for _, p := range ps {
-					if strings.Contains(p.Cmd, "sleep") {
-						gotTTYField = p.TTY
-						return nil
-					}
-				}
-				return fmt.Errorf("sleep not running")
-			}
-			if err := testutil.Poll(cb, 30*time.Second); err != nil {
-				t.Fatalf("error waiting for sleep process: %v", err)
-			}
+				defer cleanup()
 
-			if gotTTYField != test.wantTTYField {
-				t.Errorf("tty field got %q, want %q", gotTTYField, test.wantTTYField)
-			}
-		})
+				// Create and start the container.
+				args := Args{
+					ID:        testutil.RandomContainerID(),
+					Spec:      spec,
+					BundleDir: bundleDir,
+				}
+				c, err := New(conf, args)
+				if err != nil {
+					t.Fatalf("error creating container: %v", err)
+				}
+				defer c.Destroy()
+				if err := c.Start(conf); err != nil {
+					t.Fatalf("error starting container: %v", err)
+				}
+
+				// Wait for sleep to be running, and check the TTY
+				// field.
+				var gotTTYField string
+				cb := func() error {
+					ps, err := c.Processes()
+					if err != nil {
+						err = fmt.Errorf("error getting process data from container: %v", err)
+						return &backoff.PermanentError{Err: err}
+					}
+					for _, p := range ps {
+						if strings.Contains(p.Cmd, "sleep") {
+							gotTTYField = p.TTY
+							return nil
+						}
+					}
+					return fmt.Errorf("sleep not running")
+				}
+				if err := testutil.Poll(cb, 30*time.Second); err != nil {
+					t.Fatalf("error waiting for sleep process: %v", err)
+				}
+
+				if gotTTYField != test.wantTTYField {
+					t.Errorf("tty field got %q, want %q", gotTTYField, test.wantTTYField)
+				}
+			})
+		}
 	}
 }
 

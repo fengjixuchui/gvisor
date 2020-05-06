@@ -37,7 +37,13 @@ type PacketBuffer struct {
 	Data buffer.VectorisedView
 
 	// Header holds the headers of outbound packets. As a packet is passed
-	// down the stack, each layer adds to Header.
+	// down the stack, each layer adds to Header. Note that forwarded
+	// packets don't populate Headers on their way out -- their headers and
+	// payload are never parsed out and remain in Data.
+	//
+	// TODO(gvisor.dev/issue/170): Forwarded packets don't currently
+	// populate Header, but should. This will be doable once early parsing
+	// (https://github.com/google/gvisor/pull/1995) is supported.
 	Header buffer.Prependable
 
 	// These fields are used by both inbound and outbound packets. They
@@ -60,6 +66,16 @@ type PacketBuffer struct {
 	// Owner is implemented by task to get the uid and gid.
 	// Only set for locally generated packets.
 	Owner tcpip.PacketOwner
+
+	// The following fields are only set by the qdisc layer when the packet
+	// is added to a queue.
+	EgressRoute           *Route
+	GSOOptions            *GSO
+	NetworkProtocolNumber tcpip.NetworkProtocolNumber
+
+	// NatDone indicates if the packet has been manipulated as per NAT
+	// iptables rule.
+	NatDone bool
 }
 
 // Clone makes a copy of pk. It clones the Data field, which creates a new

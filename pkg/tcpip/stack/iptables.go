@@ -17,6 +17,7 @@ package stack
 import (
 	"fmt"
 
+	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
 )
 
@@ -110,6 +111,10 @@ func DefaultTables() IPTables {
 			Prerouting: []string{TablenameMangle, TablenameNat},
 			Output:     []string{TablenameMangle, TablenameNat, TablenameFilter},
 		},
+		connections: ConnTrackTable{
+			CtMap: make(map[uint32]ConnTrackTupleHolder),
+			Seed:  generateRandUint32(),
+		},
 	}
 }
 
@@ -173,12 +178,16 @@ const (
 // dropped.
 //
 // Precondition: pkt.NetworkHeader is set.
-func (it *IPTables) Check(hook Hook, pkt PacketBuffer) bool {
+func (it *IPTables) Check(hook Hook, pkt *PacketBuffer, gso *GSO, r *Route, address tcpip.Address) bool {
+	// Packets are manipulated only if connection and matching
+	// NAT rule exists.
+	it.connections.HandlePacket(pkt, hook, gso, r)
+
 	// Go through each table containing the hook.
 	for _, tablename := range it.Priorities[hook] {
 		table := it.Tables[tablename]
 		ruleIdx := table.BuiltinChains[hook]
-		switch verdict := it.checkChain(hook, pkt, table, ruleIdx); verdict {
+		switch verdict := it.checkChain(hook, pkt, table, ruleIdx, gso, r, address); verdict {
 		// If the table returns Accept, move on to the next table.
 		case chainAccept:
 			continue
@@ -189,7 +198,7 @@ func (it *IPTables) Check(hook Hook, pkt PacketBuffer) bool {
 			// Any Return from a built-in chain means we have to
 			// call the underflow.
 			underflow := table.Rules[table.Underflows[hook]]
-			switch v, _ := underflow.Target.Action(pkt); v {
+			switch v, _ := underflow.Target.Action(pkt, &it.connections, hook, gso, r, address); v {
 			case RuleAccept:
 				continue
 			case RuleDrop:
@@ -212,26 +221,41 @@ func (it *IPTables) Check(hook Hook, pkt PacketBuffer) bool {
 // CheckPackets runs pkts through the rules for hook and returns a map of packets that
 // should not go forward.
 //
+// Precondition: pkt is a IPv4 packet of at least length header.IPv4MinimumSize.
+//
+// TODO(gvisor.dev/issue/170): pk.NetworkHeader will always be set as a
+// precondition.
+//
 // NOTE: unlike the Check API the returned map contains packets that should be
 // dropped.
-func (it *IPTables) CheckPackets(hook Hook, pkts PacketBufferList) (drop map[*PacketBuffer]struct{}) {
+func (it *IPTables) CheckPackets(hook Hook, pkts PacketBufferList, gso *GSO, r *Route) (drop map[*PacketBuffer]struct{}, natPkts map[*PacketBuffer]struct{}) {
 	for pkt := pkts.Front(); pkt != nil; pkt = pkt.Next() {
-		if ok := it.Check(hook, *pkt); !ok {
-			if drop == nil {
-				drop = make(map[*PacketBuffer]struct{})
+		if !pkt.NatDone {
+			if ok := it.Check(hook, pkt, gso, r, ""); !ok {
+				if drop == nil {
+					drop = make(map[*PacketBuffer]struct{})
+				}
+				drop[pkt] = struct{}{}
 			}
-			drop[pkt] = struct{}{}
+			if pkt.NatDone {
+				if natPkts == nil {
+					natPkts = make(map[*PacketBuffer]struct{})
+				}
+				natPkts[pkt] = struct{}{}
+			}
 		}
 	}
-	return drop
+	return drop, natPkts
 }
 
-// Precondition: pkt.NetworkHeader is set.
-func (it *IPTables) checkChain(hook Hook, pkt PacketBuffer, table Table, ruleIdx int) chainVerdict {
+// Precondition: pkt is a IPv4 packet of at least length header.IPv4MinimumSize.
+// TODO(gvisor.dev/issue/170): pkt.NetworkHeader will always be set as a
+// precondition.
+func (it *IPTables) checkChain(hook Hook, pkt *PacketBuffer, table Table, ruleIdx int, gso *GSO, r *Route, address tcpip.Address) chainVerdict {
 	// Start from ruleIdx and walk the list of rules until a rule gives us
 	// a verdict.
 	for ruleIdx < len(table.Rules) {
-		switch verdict, jumpTo := it.checkRule(hook, pkt, table, ruleIdx); verdict {
+		switch verdict, jumpTo := it.checkRule(hook, pkt, table, ruleIdx, gso, r, address); verdict {
 		case RuleAccept:
 			return chainAccept
 
@@ -248,7 +272,7 @@ func (it *IPTables) checkChain(hook Hook, pkt PacketBuffer, table Table, ruleIdx
 				ruleIdx++
 				continue
 			}
-			switch verdict := it.checkChain(hook, pkt, table, jumpTo); verdict {
+			switch verdict := it.checkChain(hook, pkt, table, jumpTo, gso, r, address); verdict {
 			case chainAccept:
 				return chainAccept
 			case chainDrop:
@@ -271,14 +295,21 @@ func (it *IPTables) checkChain(hook Hook, pkt PacketBuffer, table Table, ruleIdx
 	return chainDrop
 }
 
-// Precondition: pk.NetworkHeader is set.
-func (it *IPTables) checkRule(hook Hook, pkt PacketBuffer, table Table, ruleIdx int) (RuleVerdict, int) {
+// Precondition: pkt is a IPv4 packet of at least length header.IPv4MinimumSize.
+// TODO(gvisor.dev/issue/170): pkt.NetworkHeader will always be set as a
+// precondition.
+func (it *IPTables) checkRule(hook Hook, pkt *PacketBuffer, table Table, ruleIdx int, gso *GSO, r *Route, address tcpip.Address) (RuleVerdict, int) {
 	rule := table.Rules[ruleIdx]
 
 	// If pkt.NetworkHeader hasn't been set yet, it will be contained in
-	// pkt.Data.First().
+	// pkt.Data.
 	if pkt.NetworkHeader == nil {
-		pkt.NetworkHeader = pkt.Data.First()
+		var ok bool
+		pkt.NetworkHeader, ok = pkt.Data.PullUp(header.IPv4MinimumSize)
+		if !ok {
+			// Precondition has been violated.
+			panic(fmt.Sprintf("iptables checks require IPv4 headers of at least %d bytes", header.IPv4MinimumSize))
+		}
 	}
 
 	// Check whether the packet matches the IP header filter.
@@ -290,7 +321,7 @@ func (it *IPTables) checkRule(hook Hook, pkt PacketBuffer, table Table, ruleIdx 
 	// Go through each rule matcher. If they all match, run
 	// the rule target.
 	for _, matcher := range rule.Matchers {
-		matches, hotdrop := matcher.Match(hook, pkt, "")
+		matches, hotdrop := matcher.Match(hook, *pkt, "")
 		if hotdrop {
 			return RuleDrop, 0
 		}
@@ -301,7 +332,7 @@ func (it *IPTables) checkRule(hook Hook, pkt PacketBuffer, table Table, ruleIdx 
 	}
 
 	// All the matchers matched, so run the target.
-	return rule.Target.Action(pkt)
+	return rule.Target.Action(pkt, &it.connections, hook, gso, r, address)
 }
 
 func filterMatch(filter IPHeaderFilter, hdr header.IPv4) bool {

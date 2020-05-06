@@ -452,7 +452,7 @@ type ipv6AddrCandidate struct {
 // primaryIPv6Endpoint returns an IPv6 endpoint following Source Address
 // Selection (RFC 6724 section 5).
 //
-// Note, only rules 1-3 are followed.
+// Note, only rules 1-3 and 7 are followed.
 //
 // remoteAddr must be a valid IPv6 address.
 func (n *NIC) primaryIPv6Endpoint(remoteAddr tcpip.Address) *referencedNetworkEndpoint {
@@ -521,6 +521,11 @@ func (n *NIC) primaryIPv6Endpoint(remoteAddr tcpip.Address) *referencedNetworkEn
 		if saDep, sbDep := sa.ref.deprecated, sb.ref.deprecated; saDep != sbDep {
 			// If sa is not deprecated, it is preferred over sb.
 			return sbDep
+		}
+
+		// Prefer temporary addresses as per RFC 6724 section 5 rule 7.
+		if saTemp, sbTemp := sa.ref.configType == slaacTemp, sb.ref.configType == slaacTemp; saTemp != sbTemp {
+			return saTemp
 		}
 
 		// sa and sb are equal, return the endpoint that is closest to the front of
@@ -1207,12 +1212,12 @@ func (n *NIC) DeliverNetworkPacket(linkEP LinkEndpoint, remote, local tcpip.Link
 		n.stack.stats.IP.PacketsReceived.Increment()
 	}
 
-	if len(pkt.Data.First()) < netProto.MinimumPacketSize() {
+	netHeader, ok := pkt.Data.PullUp(netProto.MinimumPacketSize())
+	if !ok {
 		n.stack.stats.MalformedRcvdPackets.Increment()
 		return
 	}
-
-	src, dst := netProto.ParseAddresses(pkt.Data.First())
+	src, dst := netProto.ParseAddresses(netHeader)
 
 	if n.stack.handleLocal && !n.isLoopback() && n.getRef(protocol, src) != nil {
 		// The source address is one of our own, so we never should have gotten a
@@ -1225,8 +1230,10 @@ func (n *NIC) DeliverNetworkPacket(linkEP LinkEndpoint, remote, local tcpip.Link
 
 	// TODO(gvisor.dev/issue/170): Not supporting iptables for IPv6 yet.
 	if protocol == header.IPv4ProtocolNumber {
+		// iptables filtering.
 		ipt := n.stack.IPTables()
-		if ok := ipt.Check(Prerouting, pkt); !ok {
+		address := n.primaryAddress(protocol)
+		if ok := ipt.Check(Prerouting, &pkt, nil, nil, address.Address); !ok {
 			// iptables is telling us to drop the packet.
 			return
 		}
@@ -1293,22 +1300,8 @@ func (n *NIC) DeliverNetworkPacket(linkEP LinkEndpoint, remote, local tcpip.Link
 
 func (n *NIC) forwardPacket(r *Route, protocol tcpip.NetworkProtocolNumber, pkt PacketBuffer) {
 	// TODO(b/143425874) Decrease the TTL field in forwarded packets.
-
-	firstData := pkt.Data.First()
-	pkt.Data.RemoveFirst()
-
-	if linkHeaderLen := int(n.linkEP.MaxHeaderLength()); linkHeaderLen == 0 {
-		pkt.Header = buffer.NewPrependableFromView(firstData)
-	} else {
-		firstDataLen := len(firstData)
-
-		// pkt.Header should have enough capacity to hold n.linkEP's headers.
-		pkt.Header = buffer.NewPrependable(firstDataLen + linkHeaderLen)
-
-		// TODO(b/151227689): avoid copying the packet when forwarding
-		if n := copy(pkt.Header.Prepend(firstDataLen), firstData); n != firstDataLen {
-			panic(fmt.Sprintf("copied %d bytes, expected %d", n, firstDataLen))
-		}
+	if linkHeaderLen := int(n.linkEP.MaxHeaderLength()); linkHeaderLen != 0 {
+		pkt.Header = buffer.NewPrependable(linkHeaderLen)
 	}
 
 	if err := n.linkEP.WritePacket(r, nil /* gso */, protocol, pkt); err != nil {
@@ -1336,12 +1329,13 @@ func (n *NIC) DeliverTransportPacket(r *Route, protocol tcpip.TransportProtocolN
 	// validly formed.
 	n.stack.demux.deliverRawPacket(r, protocol, pkt)
 
-	if len(pkt.Data.First()) < transProto.MinimumPacketSize() {
+	transHeader, ok := pkt.Data.PullUp(transProto.MinimumPacketSize())
+	if !ok {
 		n.stack.stats.MalformedRcvdPackets.Increment()
 		return
 	}
 
-	srcPort, dstPort, err := transProto.ParsePorts(pkt.Data.First())
+	srcPort, dstPort, err := transProto.ParsePorts(transHeader)
 	if err != nil {
 		n.stack.stats.MalformedRcvdPackets.Increment()
 		return
@@ -1379,11 +1373,12 @@ func (n *NIC) DeliverTransportControlPacket(local, remote tcpip.Address, net tcp
 	// ICMPv4 only guarantees that 8 bytes of the transport protocol will
 	// be present in the payload. We know that the ports are within the
 	// first 8 bytes for all known transport protocols.
-	if len(pkt.Data.First()) < 8 {
+	transHeader, ok := pkt.Data.PullUp(8)
+	if !ok {
 		return
 	}
 
-	srcPort, dstPort, err := transProto.ParsePorts(pkt.Data.First())
+	srcPort, dstPort, err := transProto.ParsePorts(transHeader)
 	if err != nil {
 		return
 	}

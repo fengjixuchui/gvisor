@@ -41,26 +41,19 @@ func (filesystemType) Name() string {
 	return "sockfs"
 }
 
-// filesystem implements vfs.FilesystemImpl.
-type filesystem struct {
-	kernfs.Filesystem
-}
-
 // NewFilesystem sets up and returns a new sockfs filesystem.
 //
 // Note that there should only ever be one instance of sockfs.Filesystem,
 // backing a global socket mount.
 func NewFilesystem(vfsObj *vfs.VirtualFilesystem) *vfs.Filesystem {
-	fs := &filesystem{}
-	fs.Init(vfsObj, filesystemType{})
+	fs := &kernfs.Filesystem{}
+	fs.VFSFilesystem().Init(vfsObj, filesystemType{}, fs)
 	return fs.VFSFilesystem()
 }
 
 // inode implements kernfs.Inode.
 //
-// TODO(gvisor.dev/issue/1476): Add device numbers to this inode (which are
-// not included in InodeAttrs) to store the numbers of the appropriate
-// socket device. Override InodeAttrs.Stat() accordingly.
+// TODO(gvisor.dev/issue/1193): Device numbers.
 type inode struct {
 	kernfs.InodeNotDirectory
 	kernfs.InodeNotSymlink

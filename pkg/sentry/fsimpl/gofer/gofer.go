@@ -72,7 +72,8 @@ type filesystem struct {
 	mfp pgalloc.MemoryFileProvider
 
 	// Immutable options.
-	opts filesystemOptions
+	opts  filesystemOptions
+	iopts InternalFilesystemOptions
 
 	// client is the client used by this filesystem. client is immutable.
 	client *p9.Client
@@ -208,6 +209,16 @@ const (
 	// client is undefined.
 	InteropModeShared
 )
+
+// InternalFilesystemOptions may be passed as
+// vfs.GetFilesystemOptions.InternalData to FilesystemType.GetFilesystem.
+type InternalFilesystemOptions struct {
+	// If LeakConnection is true, do not close the connection to the server
+	// when the Filesystem is released. This is necessary for deployments in
+	// which servers can handle only a single client and report failure if that
+	// client disconnects.
+	LeakConnection bool
+}
 
 // Name implements vfs.FilesystemType.Name.
 func (FilesystemType) Name() string {
@@ -347,6 +358,14 @@ func (fstype FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 		return nil, nil, syserror.EINVAL
 	}
 
+	// Handle internal options.
+	iopts, ok := opts.InternalData.(InternalFilesystemOptions)
+	if opts.InternalData != nil && !ok {
+		ctx.Warningf("gofer.FilesystemType.GetFilesystem: GetFilesystemOptions.InternalData has type %T, wanted gofer.InternalFilesystemOptions", opts.InternalData)
+		return nil, nil, syserror.EINVAL
+	}
+	// If !ok, iopts being the zero value is correct.
+
 	// Establish a connection with the server.
 	conn, err := unet.NewSocket(fsopts.fd)
 	if err != nil {
@@ -383,6 +402,7 @@ func (fstype FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 	fs := &filesystem{
 		mfp:              mfp,
 		opts:             fsopts,
+		iopts:            iopts,
 		uid:              creds.EffectiveKUID,
 		gid:              creds.EffectiveKGID,
 		client:           client,
@@ -440,8 +460,10 @@ func (fs *filesystem) Release() {
 	// fs.
 	fs.syncMu.Unlock()
 
-	// Close the connection to the server. This implicitly clunks all fids.
-	fs.client.Close()
+	if !fs.iopts.LeakConnection {
+		// Close the connection to the server. This implicitly clunks all fids.
+		fs.client.Close()
+	}
 }
 
 // dentry implements vfs.DentryImpl.
@@ -474,10 +496,8 @@ type dentry struct {
 	// file is the unopened p9.File that backs this dentry. file is immutable.
 	//
 	// If file.isNil(), this dentry represents a synthetic file, i.e. a file
-	// that does not exist on the remote filesystem. As of this writing, this
-	// is only possible for a directory created with
-	// MkdirOptions.ForSyntheticMountpoint == true.
-	// TODO(gvisor.dev/issue/1476): Support synthetic sockets (and pipes).
+	// that does not exist on the remote filesystem. As of this writing, the
+	// only files that can be synthetic are sockets, pipes, and directories.
 	file p9file
 
 	// If deleted is non-zero, the file represented by this dentry has been
@@ -641,11 +661,11 @@ func (fs *filesystem) newDentry(ctx context.Context, file p9file, qid p9.QID, ma
 		},
 	}
 	d.pf.dentry = d
-	if mask.UID && attr.UID != auth.NoID {
-		d.uid = uint32(attr.UID)
+	if mask.UID {
+		d.uid = dentryUIDFromP9UID(attr.UID)
 	}
-	if mask.GID && attr.GID != auth.NoID {
-		d.gid = uint32(attr.GID)
+	if mask.GID {
+		d.gid = dentryGIDFromP9GID(attr.GID)
 	}
 	if mask.Size {
 		d.size = attr.Size
@@ -696,10 +716,10 @@ func (d *dentry) updateFromP9Attrs(mask p9.AttrMask, attr *p9.Attr) {
 		atomic.StoreUint32(&d.mode, uint32(attr.Mode))
 	}
 	if mask.UID {
-		atomic.StoreUint32(&d.uid, uint32(attr.UID))
+		atomic.StoreUint32(&d.uid, dentryUIDFromP9UID(attr.UID))
 	}
 	if mask.GID {
-		atomic.StoreUint32(&d.gid, uint32(attr.GID))
+		atomic.StoreUint32(&d.gid, dentryGIDFromP9GID(attr.GID))
 	}
 	// There is no P9_GETATTR_* bit for I/O block size.
 	if attr.BlockSize != 0 {
@@ -915,6 +935,20 @@ func (d *dentry) setStat(ctx context.Context, creds *auth.Credentials, stat *lin
 
 func (d *dentry) checkPermissions(creds *auth.Credentials, ats vfs.AccessTypes) error {
 	return vfs.GenericCheckPermissions(creds, ats, linux.FileMode(atomic.LoadUint32(&d.mode)), auth.KUID(atomic.LoadUint32(&d.uid)), auth.KGID(atomic.LoadUint32(&d.gid)))
+}
+
+func dentryUIDFromP9UID(uid p9.UID) uint32 {
+	if !uid.Ok() {
+		return uint32(auth.OverflowUID)
+	}
+	return uint32(uid)
+}
+
+func dentryGIDFromP9GID(gid p9.GID) uint32 {
+	if !gid.Ok() {
+		return uint32(auth.OverflowGID)
+	}
+	return uint32(gid)
 }
 
 // IncRef implements vfs.DentryImpl.IncRef.

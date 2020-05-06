@@ -42,6 +42,7 @@ const (
 
 // endpoint implements stack.NetworkEndpoint.
 type endpoint struct {
+	protocol      *protocol
 	nicID         tcpip.NICID
 	linkEP        stack.LinkEndpoint
 	linkAddrCache stack.LinkAddressCache
@@ -83,6 +84,11 @@ func (e *endpoint) WritePacket(*stack.Route, *stack.GSO, stack.NetworkHeaderPara
 	return tcpip.ErrNotSupported
 }
 
+// NetworkProtocolNumber implements stack.NetworkEndpoint.NetworkProtocolNumber.
+func (e *endpoint) NetworkProtocolNumber() tcpip.NetworkProtocolNumber {
+	return e.protocol.Number()
+}
+
 // WritePackets implements stack.NetworkEndpoint.WritePackets.
 func (e *endpoint) WritePackets(*stack.Route, *stack.GSO, stack.PacketBufferList, stack.NetworkHeaderParams) (int, *tcpip.Error) {
 	return 0, tcpip.ErrNotSupported
@@ -93,7 +99,10 @@ func (e *endpoint) WriteHeaderIncludedPacket(r *stack.Route, pkt stack.PacketBuf
 }
 
 func (e *endpoint) HandlePacket(r *stack.Route, pkt stack.PacketBuffer) {
-	v := pkt.Data.First()
+	v, ok := pkt.Data.PullUp(header.ARPSize)
+	if !ok {
+		return
+	}
 	h := header.ARP(v)
 	if !h.IsValid() {
 		return
@@ -142,6 +151,7 @@ func (p *protocol) NewEndpoint(nicID tcpip.NICID, addrWithPrefix tcpip.AddressWi
 		return nil, tcpip.ErrBadLocalAddress
 	}
 	return &endpoint{
+		protocol:      p,
 		nicID:         nicID,
 		linkEP:        sender,
 		linkAddrCache: linkAddrCache,
