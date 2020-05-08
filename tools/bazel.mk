@@ -21,7 +21,7 @@ BRANCH_NAME := $(shell (git branch --show-current 2>/dev/null || \
 
 # Bazel container configuration (see below).
 USER ?= gvisor
-DOCKER_NAME ?= gvisor-bazel
+DOCKER_NAME ?= gvisor-bazel-$(shell readlink -m $(CURDIR) | md5sum | cut -c1-8)
 DOCKER_RUN_OPTIONS ?= --privileged
 BAZEL_CACHE := $(shell readlink -m ~/.cache/bazel/)
 GCLOUD_CONFIG := $(shell readlink -m ~/.config/gcloud/)
@@ -34,6 +34,7 @@ FULL_DOCKER_RUN_OPTIONS := $(DOCKER_RUN_OPTIONS)
 FULL_DOCKER_RUN_OPTIONS += -v "$(BAZEL_CACHE):$(BAZEL_CACHE)"
 FULL_DOCKER_RUN_OPTIONS += -v "$(GCLOUD_CONFIG):$(GCLOUD_CONFIG)"
 FULL_DOCKER_RUN_OPTIONS += -v "$(DOCKER_SOCKET):$(DOCKER_SOCKET)"
+SHELL=/bin/bash -o pipefail
 
 ##
 ## Bazel helpers.
@@ -50,6 +51,7 @@ FULL_DOCKER_RUN_OPTIONS += -v "$(DOCKER_SOCKET):$(DOCKER_SOCKET)"
 ##
 bazel-server-start: load-default ## Starts the bazel server.
 	docker run -d --rm \
+		--init \
 	        --name $(DOCKER_NAME) \
 		--user 0:0 \
 		-v "$(CURDIR):$(CURDIR)" \
@@ -61,7 +63,7 @@ bazel-server-start: load-default ## Starts the bazel server.
 		sh -c "groupadd --gid $(GID) --non-unique $(USER) && \
 		       useradd --uid $(UID) --non-unique --no-create-home --gid $(GID) -d $(HOME) $(USER) && \
 	               bazel version && \
-		       while :; do sleep 3600; done"
+		       exec tail --pid=\$$(bazel info server_pid) -f /dev/null"
 	@while :; do if docker logs $(DOCKER_NAME) 2>/dev/null | grep "Build label:" >/dev/null; then break; fi; sleep 1; done
 .PHONY: bazel-server-start
 
@@ -77,7 +79,7 @@ bazel-server: ## Ensures that the server exists. Used as an internal target.
 	@docker exec $(DOCKER_NAME) true || $(MAKE) bazel-server-start
 .PHONY: bazel-server
 
-build_paths = docker exec --user $(UID):$(GID) -i $(DOCKER_NAME) sh -c 'bazel build $(OPTIONS) $(TARGETS) 2>&1 \
+build_paths = docker exec --user $(UID):$(GID) -i $(DOCKER_NAME) sh -o pipefail -c 'bazel build $(OPTIONS) $(TARGETS) 2>&1 \
 		| tee /dev/fd/2 \
 		| grep -E "^  bazel-bin/" \
 		| awk "{print $$1;}"' \

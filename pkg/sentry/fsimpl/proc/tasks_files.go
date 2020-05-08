@@ -41,9 +41,9 @@ type selfSymlink struct {
 
 var _ kernfs.Inode = (*selfSymlink)(nil)
 
-func newSelfSymlink(creds *auth.Credentials, ino uint64, pidns *kernel.PIDNamespace) *kernfs.Dentry {
+func (fs *filesystem) newSelfSymlink(creds *auth.Credentials, ino uint64, pidns *kernel.PIDNamespace) *kernfs.Dentry {
 	inode := &selfSymlink{pidns: pidns}
-	inode.Init(creds, ino, linux.ModeSymlink|0777)
+	inode.Init(creds, linux.UNNAMED_MAJOR, fs.devMinor, ino, linux.ModeSymlink|0777)
 
 	d := &kernfs.Dentry{}
 	d.Init(inode)
@@ -83,9 +83,9 @@ type threadSelfSymlink struct {
 
 var _ kernfs.Inode = (*threadSelfSymlink)(nil)
 
-func newThreadSelfSymlink(creds *auth.Credentials, ino uint64, pidns *kernel.PIDNamespace) *kernfs.Dentry {
+func (fs *filesystem) newThreadSelfSymlink(creds *auth.Credentials, ino uint64, pidns *kernel.PIDNamespace) *kernfs.Dentry {
 	inode := &threadSelfSymlink{pidns: pidns}
-	inode.Init(creds, ino, linux.ModeSymlink|0777)
+	inode.Init(creds, linux.UNNAMED_MAJOR, fs.devMinor, ino, linux.ModeSymlink|0777)
 
 	d := &kernfs.Dentry{}
 	d.Init(inode)
@@ -272,12 +272,16 @@ func (*meminfoData) Generate(ctx context.Context, buf *bytes.Buffer) error {
 	inactiveFile := file - activeFile
 
 	fmt.Fprintf(buf, "MemTotal:       %8d kB\n", totalSize/1024)
-	memFree := (totalSize - totalUsage) / 1024
+	memFree := totalSize - totalUsage
+	if memFree > totalSize {
+		// Underflow.
+		memFree = 0
+	}
 	// We use MemFree as MemAvailable because we don't swap.
 	// TODO(rahat): When reclaim is implemented the value of MemAvailable
 	// should change.
-	fmt.Fprintf(buf, "MemFree:        %8d kB\n", memFree)
-	fmt.Fprintf(buf, "MemAvailable:   %8d kB\n", memFree)
+	fmt.Fprintf(buf, "MemFree:        %8d kB\n", memFree/1024)
+	fmt.Fprintf(buf, "MemAvailable:   %8d kB\n", memFree/1024)
 	fmt.Fprintf(buf, "Buffers:               0 kB\n") // memory usage by block devices
 	fmt.Fprintf(buf, "Cached:         %8d kB\n", (file+snapshot.Tmpfs)/1024)
 	// Emulate a system with no swap, which disables inactivation of anon pages.

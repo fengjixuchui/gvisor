@@ -48,10 +48,11 @@ import (
 	"gvisor.dev/gvisor/pkg/refs"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
 	"gvisor.dev/gvisor/pkg/sentry/fs"
-	"gvisor.dev/gvisor/pkg/sentry/fs/timerfd"
+	oldtimerfd "gvisor.dev/gvisor/pkg/sentry/fs/timerfd"
 	"gvisor.dev/gvisor/pkg/sentry/fsbridge"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/pipefs"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/sockfs"
+	"gvisor.dev/gvisor/pkg/sentry/fsimpl/timerfd"
 	"gvisor.dev/gvisor/pkg/sentry/hostcpu"
 	"gvisor.dev/gvisor/pkg/sentry/inet"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
@@ -372,7 +373,10 @@ func (k *Kernel) Init(args InitKernelArgs) error {
 			return fmt.Errorf("failed to initialize VFS: %v", err)
 		}
 
-		pipeFilesystem := pipefs.NewFilesystem(&k.vfs)
+		pipeFilesystem, err := pipefs.NewFilesystem(&k.vfs)
+		if err != nil {
+			return fmt.Errorf("failed to create pipefs filesystem: %v", err)
+		}
 		defer pipeFilesystem.DecRef()
 		pipeMount, err := k.vfs.NewDisconnectedMount(pipeFilesystem, nil, &vfs.MountOptions{})
 		if err != nil {
@@ -380,7 +384,10 @@ func (k *Kernel) Init(args InitKernelArgs) error {
 		}
 		k.pipeMount = pipeMount
 
-		socketFilesystem := sockfs.NewFilesystem(&k.vfs)
+		socketFilesystem, err := sockfs.NewFilesystem(&k.vfs)
+		if err != nil {
+			return fmt.Errorf("failed to create sockfs filesystem: %v", err)
+		}
 		defer socketFilesystem.DecRef()
 		socketMount, err := k.vfs.NewDisconnectedMount(socketFilesystem, nil, &vfs.MountOptions{})
 		if err != nil {
@@ -1068,11 +1075,11 @@ func (k *Kernel) pauseTimeLocked() {
 		if t.fdTable != nil {
 			t.fdTable.forEach(func(_ int32, file *fs.File, fd *vfs.FileDescription, _ FDFlags) {
 				if VFS2Enabled {
-					if tfd, ok := fd.Impl().(*vfs.TimerFileDescription); ok {
+					if tfd, ok := fd.Impl().(*timerfd.TimerFileDescription); ok {
 						tfd.PauseTimer()
 					}
 				} else {
-					if tfd, ok := file.FileOperations.(*timerfd.TimerOperations); ok {
+					if tfd, ok := file.FileOperations.(*oldtimerfd.TimerOperations); ok {
 						tfd.PauseTimer()
 					}
 				}
@@ -1104,11 +1111,11 @@ func (k *Kernel) resumeTimeLocked() {
 		if t.fdTable != nil {
 			t.fdTable.forEach(func(_ int32, file *fs.File, fd *vfs.FileDescription, _ FDFlags) {
 				if VFS2Enabled {
-					if tfd, ok := fd.Impl().(*vfs.TimerFileDescription); ok {
+					if tfd, ok := fd.Impl().(*timerfd.TimerFileDescription); ok {
 						tfd.ResumeTimer()
 					}
 				} else {
-					if tfd, ok := file.FileOperations.(*timerfd.TimerOperations); ok {
+					if tfd, ok := file.FileOperations.(*oldtimerfd.TimerOperations); ok {
 						tfd.ResumeTimer()
 					}
 				}

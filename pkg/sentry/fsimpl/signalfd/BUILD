@@ -1,21 +1,20 @@
 load("//tools:defs.bzl", "go_library")
 
-licenses(["notice"])
+package(licenses = ["notice"])
 
 go_library(
-    name = "pipefs",
-    srcs = ["pipefs.go"],
+    name = "signalfd",
+    srcs = ["signalfd.go"],
     visibility = ["//pkg/sentry:internal"],
     deps = [
         "//pkg/abi/linux",
+        "//pkg/binary",
         "//pkg/context",
-        "//pkg/fspath",
-        "//pkg/sentry/fsimpl/kernfs",
-        "//pkg/sentry/kernel/auth",
-        "//pkg/sentry/kernel/pipe",
-        "//pkg/sentry/kernel/time",
+        "//pkg/sentry/kernel",
         "//pkg/sentry/vfs",
+        "//pkg/sync",
         "//pkg/syserror",
         "//pkg/usermem",
+        "//pkg/waiter",
     ],
 )
