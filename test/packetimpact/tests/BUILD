@@ -117,8 +117,6 @@ packetimpact_go_test(
 packetimpact_go_test(
     name = "tcp_close_wait_ack",
     srcs = ["tcp_close_wait_ack_test.go"],
-    # TODO(b/153574037): Fix netstack then remove the line below.
-    netstack = False,
     deps = [
         "//pkg/tcpip/header",
         "//pkg/tcpip/seqnum",
@@ -145,6 +143,15 @@ packetimpact_go_test(
     deps = [
         "//pkg/tcpip",
         "//pkg/tcpip/header",
+        "//test/packetimpact/testbench",
+        "@org_golang_x_sys//unix:go_default_library",
+    ],
+)
+
+packetimpact_go_test(
+    name = "udp_send_recv_dgram",
+    srcs = ["udp_send_recv_dgram_test.go"],
+    deps = [
         "//test/packetimpact/testbench",
         "@org_golang_x_sys//unix:go_default_library",
     ],
