@@ -622,6 +622,19 @@ const (
 	//
 	// A zero value indicates the default.
 	TTLOption
+
+	// TCPSynCountOption is used by SetSockOpt/GetSockOpt to specify the number of
+	// SYN retransmits that TCP should send before aborting the attempt to
+	// connect. It cannot exceed 255.
+	//
+	// NOTE: This option is currently only stubbed out and is no-op.
+	TCPSynCountOption
+
+	// TCPWindowClampOption is used by SetSockOpt/GetSockOpt to bound the size
+	// of the advertised window to this value.
+	//
+	// NOTE: This option is currently only stubed out and is a no-op
+	TCPWindowClampOption
 )
 
 // ErrorOption is used in GetSockOpt to specify that the last error reported by
@@ -685,10 +698,22 @@ type TCPDeferAcceptOption time.Duration
 // default MinRTO used by the Stack.
 type TCPMinRTOOption time.Duration
 
+// TCPMaxRTOOption is use by SetSockOpt/GetSockOpt to allow overriding
+// default MaxRTO used by the Stack.
+type TCPMaxRTOOption time.Duration
+
+// TCPMaxRetriesOption is used by SetSockOpt/GetSockOpt to set/get the
+// maximum number of retransmits after which we time out the connection.
+type TCPMaxRetriesOption uint64
+
 // TCPSynRcvdCountThresholdOption is used by SetSockOpt/GetSockOpt to specify
 // the number of endpoints that can be in SYN-RCVD state before the stack
 // switches to using SYN cookies.
 type TCPSynRcvdCountThresholdOption uint64
+
+// TCPSynRetriesOption is used by SetSockOpt/GetSockOpt to specify stack-wide
+// default for number of times SYN is retransmitted before aborting a connect.
+type TCPSynRetriesOption uint8
 
 // MulticastInterfaceOption is used by SetSockOpt/GetSockOpt to specify a
 // default interface for multicast.

@@ -21,6 +21,8 @@ import (
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/fspath"
 	"gvisor.dev/gvisor/pkg/p9"
+	"gvisor.dev/gvisor/pkg/sentry/fsimpl/host"
+	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/pipe"
 	"gvisor.dev/gvisor/pkg/sentry/socket/unix/transport"
@@ -835,6 +837,9 @@ func (d *dentry) openLocked(ctx context.Context, rp *vfs.ResolvingPath, opts *vf
 		if d.isSynthetic() {
 			return nil, syserror.ENXIO
 		}
+		if d.fs.iopts.OpenSocketsByConnecting {
+			return d.connectSocketLocked(ctx, opts)
+		}
 	case linux.S_IFIFO:
 		if d.isSynthetic() {
 			return d.pipe.Open(ctx, mnt, &d.vfsd, opts.Flags)
@@ -843,10 +848,28 @@ func (d *dentry) openLocked(ctx context.Context, rp *vfs.ResolvingPath, opts *vf
 	return d.openSpecialFileLocked(ctx, mnt, opts)
 }
 
+func (d *dentry) connectSocketLocked(ctx context.Context, opts *vfs.OpenOptions) (*vfs.FileDescription, error) {
+	if opts.Flags&linux.O_DIRECT != 0 {
+		return nil, syserror.EINVAL
+	}
+	fdObj, err := d.file.connect(ctx, p9.AnonymousSocket)
+	if err != nil {
+		return nil, err
+	}
+	fd, err := host.NewFD(ctx, kernel.KernelFromContext(ctx).HostMount(), fdObj.FD(), &host.NewFDOptions{
+		HaveFlags: true,
+		Flags:     opts.Flags,
+	})
+	if err != nil {
+		fdObj.Close()
+		return nil, err
+	}
+	fdObj.Release()
+	return fd, nil
+}
+
 func (d *dentry) openSpecialFileLocked(ctx context.Context, mnt *vfs.Mount, opts *vfs.OpenOptions) (*vfs.FileDescription, error) {
 	ats := vfs.AccessTypesForOpenFlags(opts)
-	// Treat as a special file. This is done for non-synthetic pipes as well as
-	// regular files when d.fs.opts.regularFilesUseSpecialFileFD is true.
 	if opts.Flags&linux.O_DIRECT != 0 {
 		return nil, syserror.EINVAL
 	}
@@ -854,10 +877,15 @@ func (d *dentry) openSpecialFileLocked(ctx context.Context, mnt *vfs.Mount, opts
 	if err != nil {
 		return nil, err
 	}
+	seekable := d.fileType() == linux.S_IFREG
 	fd := &specialFileFD{
-		handle: h,
+		handle:   h,
+		seekable: seekable,
 	}
-	if err := fd.vfsfd.Init(fd, opts.Flags, mnt, &d.vfsd, &vfs.FileDescriptionOptions{}); err != nil {
+	if err := fd.vfsfd.Init(fd, opts.Flags, mnt, &d.vfsd, &vfs.FileDescriptionOptions{
+		DenyPRead:  !seekable,
+		DenyPWrite: !seekable,
+	}); err != nil {
 		h.close(ctx)
 		return nil, err
 	}
@@ -888,7 +916,11 @@ func (d *dentry) createAndOpenChildLocked(ctx context.Context, rp *vfs.Resolving
 	}
 	creds := rp.Credentials()
 	name := rp.Component()
-	fdobj, openFile, createQID, _, err := dirfile.create(ctx, name, (p9.OpenFlags)(opts.Flags), (p9.FileMode)(opts.Mode), (p9.UID)(creds.EffectiveKUID), (p9.GID)(creds.EffectiveKGID))
+	// Filter file creation flags and O_LARGEFILE out; the create RPC already
+	// has the semantics of O_CREAT|O_EXCL, while some servers will choke on
+	// O_LARGEFILE.
+	createFlags := p9.OpenFlags(opts.Flags &^ (linux.O_CREAT | linux.O_EXCL | linux.O_NOCTTY | linux.O_TRUNC | linux.O_LARGEFILE))
+	fdobj, openFile, createQID, _, err := dirfile.create(ctx, name, createFlags, (p9.FileMode)(opts.Mode), (p9.UID)(creds.EffectiveKUID), (p9.GID)(creds.EffectiveKGID))
 	if err != nil {
 		dirfile.close(ctx)
 		return nil, err
@@ -896,24 +928,13 @@ func (d *dentry) createAndOpenChildLocked(ctx context.Context, rp *vfs.Resolving
 	// Then we need to walk to the file we just created to get a non-open fid
 	// representing it, and to get its metadata. This must use d.file since, as
 	// explained above, dirfile was invalidated by dirfile.Create().
-	walkQID, nonOpenFile, attrMask, attr, err := d.file.walkGetAttrOne(ctx, name)
+	_, nonOpenFile, attrMask, attr, err := d.file.walkGetAttrOne(ctx, name)
 	if err != nil {
 		openFile.close(ctx)
 		if fdobj != nil {
 			fdobj.Close()
 		}
 		return nil, err
-	}
-	// Sanity-check that we walked to the file we created.
-	if createQID.Path != walkQID.Path {
-		// Probably due to concurrent remote filesystem mutation?
-		ctx.Warningf("gofer.dentry.createAndOpenChildLocked: created file has QID %v before walk, QID %v after (interop=%v)", createQID, walkQID, d.fs.opts.interop)
-		nonOpenFile.close(ctx)
-		openFile.close(ctx)
-		if fdobj != nil {
-			fdobj.Close()
-		}
-		return nil, syserror.EAGAIN
 	}
 
 	// Construct the new dentry.
@@ -960,16 +981,21 @@ func (d *dentry) createAndOpenChildLocked(ctx context.Context, rp *vfs.Resolving
 		}
 		childVFSFD = &fd.vfsfd
 	} else {
+		seekable := child.fileType() == linux.S_IFREG
 		fd := &specialFileFD{
 			handle: handle{
 				file: openFile,
 				fd:   -1,
 			},
+			seekable: seekable,
 		}
 		if fdobj != nil {
 			fd.handle.fd = int32(fdobj.Release())
 		}
-		if err := fd.vfsfd.Init(fd, opts.Flags, mnt, &child.vfsd, &vfs.FileDescriptionOptions{}); err != nil {
+		if err := fd.vfsfd.Init(fd, opts.Flags, mnt, &child.vfsd, &vfs.FileDescriptionOptions{
+			DenyPRead:  !seekable,
+			DenyPWrite: !seekable,
+		}); err != nil {
 			fd.handle.close(ctx)
 			return nil, err
 		}

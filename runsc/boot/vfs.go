@@ -18,7 +18,6 @@ import (
 	"fmt"
 	"path"
 	"sort"
-	"strconv"
 	"strings"
 
 	specs "github.com/opencontainers/runtime-spec/specs-go"
@@ -26,12 +25,12 @@ import (
 	"gvisor.dev/gvisor/pkg/fspath"
 	"gvisor.dev/gvisor/pkg/sentry/devices/memdev"
 	"gvisor.dev/gvisor/pkg/sentry/fs"
-	devpts2 "gvisor.dev/gvisor/pkg/sentry/fsimpl/devpts"
-	devtmpfsimpl "gvisor.dev/gvisor/pkg/sentry/fsimpl/devtmpfs"
-	goferimpl "gvisor.dev/gvisor/pkg/sentry/fsimpl/gofer"
-	procimpl "gvisor.dev/gvisor/pkg/sentry/fsimpl/proc"
-	sysimpl "gvisor.dev/gvisor/pkg/sentry/fsimpl/sys"
-	tmpfsimpl "gvisor.dev/gvisor/pkg/sentry/fsimpl/tmpfs"
+	"gvisor.dev/gvisor/pkg/sentry/fsimpl/devpts"
+	"gvisor.dev/gvisor/pkg/sentry/fsimpl/devtmpfs"
+	"gvisor.dev/gvisor/pkg/sentry/fsimpl/gofer"
+	"gvisor.dev/gvisor/pkg/sentry/fsimpl/proc"
+	"gvisor.dev/gvisor/pkg/sentry/fsimpl/sys"
+	"gvisor.dev/gvisor/pkg/sentry/fsimpl/tmpfs"
 	"gvisor.dev/gvisor/pkg/syserror"
 
 	"gvisor.dev/gvisor/pkg/context"
@@ -42,28 +41,28 @@ import (
 )
 
 func registerFilesystems(ctx context.Context, vfsObj *vfs.VirtualFilesystem, creds *auth.Credentials) error {
-	vfsObj.MustRegisterFilesystemType(devpts2.Name, &devpts2.FilesystemType{}, &vfs.RegisterFilesystemTypeOptions{
+	vfsObj.MustRegisterFilesystemType(devpts.Name, &devpts.FilesystemType{}, &vfs.RegisterFilesystemTypeOptions{
 		AllowUserList: true,
 		// TODO(b/29356795): Users may mount this once the terminals are in a
 		//  usable state.
 		AllowUserMount: false,
 	})
-	vfsObj.MustRegisterFilesystemType(devtmpfsimpl.Name, &devtmpfsimpl.FilesystemType{}, &vfs.RegisterFilesystemTypeOptions{
+	vfsObj.MustRegisterFilesystemType(devtmpfs.Name, &devtmpfs.FilesystemType{}, &vfs.RegisterFilesystemTypeOptions{
 		AllowUserMount: true,
 		AllowUserList:  true,
 	})
-	vfsObj.MustRegisterFilesystemType(goferimpl.Name, &goferimpl.FilesystemType{}, &vfs.RegisterFilesystemTypeOptions{
+	vfsObj.MustRegisterFilesystemType(gofer.Name, &gofer.FilesystemType{}, &vfs.RegisterFilesystemTypeOptions{
 		AllowUserList: true,
 	})
-	vfsObj.MustRegisterFilesystemType(procimpl.Name, &procimpl.FilesystemType{}, &vfs.RegisterFilesystemTypeOptions{
+	vfsObj.MustRegisterFilesystemType(proc.Name, &proc.FilesystemType{}, &vfs.RegisterFilesystemTypeOptions{
 		AllowUserMount: true,
 		AllowUserList:  true,
 	})
-	vfsObj.MustRegisterFilesystemType(sysimpl.Name, &sysimpl.FilesystemType{}, &vfs.RegisterFilesystemTypeOptions{
+	vfsObj.MustRegisterFilesystemType(sys.Name, &sys.FilesystemType{}, &vfs.RegisterFilesystemTypeOptions{
 		AllowUserMount: true,
 		AllowUserList:  true,
 	})
-	vfsObj.MustRegisterFilesystemType(tmpfsimpl.Name, &tmpfsimpl.FilesystemType{}, &vfs.RegisterFilesystemTypeOptions{
+	vfsObj.MustRegisterFilesystemType(tmpfs.Name, &tmpfs.FilesystemType{}, &vfs.RegisterFilesystemTypeOptions{
 		AllowUserMount: true,
 		AllowUserList:  true,
 	})
@@ -72,7 +71,7 @@ func registerFilesystems(ctx context.Context, vfsObj *vfs.VirtualFilesystem, cre
 	if err := memdev.Register(vfsObj); err != nil {
 		return fmt.Errorf("registering memdev: %w", err)
 	}
-	a, err := devtmpfsimpl.NewAccessor(ctx, vfsObj, creds, devtmpfsimpl.Name)
+	a, err := devtmpfs.NewAccessor(ctx, vfsObj, creds, devtmpfs.Name)
 	if err != nil {
 		return fmt.Errorf("creating devtmpfs accessor: %w", err)
 	}
@@ -193,10 +192,10 @@ func (c *containerMounter) setupVFS2(ctx context.Context, conf *Config, procArgs
 
 func (c *containerMounter) createMountNamespaceVFS2(ctx context.Context, conf *Config, creds *auth.Credentials) (*vfs.MountNamespace, error) {
 	fd := c.fds.remove()
-	opts := strings.Join(p9MountOptionsVFS2(fd, conf.FileAccess), ",")
+	opts := strings.Join(p9MountOptions(fd, conf.FileAccess, true /* vfs2 */), ",")
 
 	log.Infof("Mounting root over 9P, ioFD: %d", fd)
-	mns, err := c.k.VFS().NewMountNamespace(ctx, creds, "", rootFsName, &vfs.GetFilesystemOptions{Data: opts})
+	mns, err := c.k.VFS().NewMountNamespace(ctx, creds, "", gofer.Name, &vfs.GetFilesystemOptions{Data: opts})
 	if err != nil {
 		return nil, fmt.Errorf("setting up mount namespace: %w", err)
 	}
@@ -204,27 +203,61 @@ func (c *containerMounter) createMountNamespaceVFS2(ctx context.Context, conf *C
 }
 
 func (c *containerMounter) mountSubmountsVFS2(ctx context.Context, conf *Config, mns *vfs.MountNamespace, creds *auth.Credentials) error {
-	c.prepareMountsVFS2()
+	mounts, err := c.prepareMountsVFS2()
+	if err != nil {
+		return err
+	}
 
-	for _, submount := range c.mounts {
+	for i := range mounts {
+		submount := &mounts[i]
 		log.Debugf("Mounting %q to %q, type: %s, options: %s", submount.Source, submount.Destination, submount.Type, submount.Options)
-		if err := c.mountSubmountVFS2(ctx, conf, mns, creds, &submount); err != nil {
+		if err := c.mountSubmountVFS2(ctx, conf, mns, creds, submount); err != nil {
 			return err
 		}
 	}
 
 	// TODO(gvisor.dev/issue/1487): implement mountTmp from fs.go.
 
-	return c.checkDispenser()
+	return nil
 }
 
-func (c *containerMounter) prepareMountsVFS2() {
+type mountAndFD struct {
+	specs.Mount
+	fd int
+}
+
+func (c *containerMounter) prepareMountsVFS2() ([]mountAndFD, error) {
+	// Associate bind mounts with their FDs before sorting since there is an
+	// undocumented assumption that FDs are dispensed in the order in which
+	// they are required by mounts.
+	var mounts []mountAndFD
+	for _, m := range c.mounts {
+		fd := -1
+		// Only bind mounts use host FDs; see
+		// containerMounter.getMountNameAndOptionsVFS2.
+		if m.Type == bind || isBindMount(m) {
+			fd = c.fds.remove()
+		}
+		mounts = append(mounts, mountAndFD{
+			Mount: m,
+			fd:    fd,
+		})
+	}
+	if err := c.checkDispenser(); err != nil {
+		return nil, err
+	}
+
 	// Sort the mounts so that we don't place children before parents.
-	sort.Slice(c.mounts, func(i, j int) bool { return len(c.mounts[i].Destination) < len(c.mounts[j].Destination) })
+	sort.Slice(mounts, func(i, j int) bool {
+		return len(mounts[i].Destination) < len(mounts[j].Destination)
+	})
+
+	return mounts, nil
 }
 
-// TODO(gvisor.dev/issue/1487): Implement submount options similar to the VFS1 version.
-func (c *containerMounter) mountSubmountVFS2(ctx context.Context, conf *Config, mns *vfs.MountNamespace, creds *auth.Credentials, submount *specs.Mount) error {
+// TODO(gvisor.dev/issue/1487): Implement submount options similar to the VFS1
+// version.
+func (c *containerMounter) mountSubmountVFS2(ctx context.Context, conf *Config, mns *vfs.MountNamespace, creds *auth.Credentials, submount *mountAndFD) error {
 	root := mns.Root()
 	defer root.DecRef()
 	target := &vfs.PathOperation{
@@ -233,7 +266,7 @@ func (c *containerMounter) mountSubmountVFS2(ctx context.Context, conf *Config, 
 		Path:  fspath.Parse(submount.Destination),
 	}
 
-	fsName, options, useOverlay, err := c.getMountNameAndOptionsVFS2(conf, *submount)
+	fsName, options, useOverlay, err := c.getMountNameAndOptionsVFS2(conf, submount)
 	if err != nil {
 		return fmt.Errorf("mountOptions failed: %w", err)
 	}
@@ -245,7 +278,6 @@ func (c *containerMounter) mountSubmountVFS2(ctx context.Context, conf *Config, 
 	if err := c.makeSyntheticMount(ctx, submount.Destination, root, creds); err != nil {
 		return err
 	}
-	log.Debugf("directory exists or made directory for submount: %s", submount.Destination)
 
 	opts := &vfs.MountOptions{
 		GetFilesystemOptions: vfs.GetFilesystemOptions{
@@ -260,25 +292,29 @@ func (c *containerMounter) mountSubmountVFS2(ctx context.Context, conf *Config, 
 	if err := c.k.VFS().MountAt(ctx, creds, "", target, fsName, opts); err != nil {
 		return fmt.Errorf("failed to mount %q (type: %s): %w, opts: %v", submount.Destination, submount.Type, err, opts)
 	}
-	log.Infof("Mounted %q to %q type: %s, internal-options: %q", submount.Source, submount.Destination, submount.Type, opts)
+	log.Infof("Mounted %q to %q type: %s, internal-options: %q", submount.Source, submount.Destination, submount.Type, opts.GetFilesystemOptions.Data)
 	return nil
 }
 
 // getMountNameAndOptionsVFS2 retrieves the fsName, opts, and useOverlay values
 // used for mounts.
-func (c *containerMounter) getMountNameAndOptionsVFS2(conf *Config, m specs.Mount) (string, []string, bool, error) {
+func (c *containerMounter) getMountNameAndOptionsVFS2(conf *Config, m *mountAndFD) (string, []string, bool, error) {
 	var (
 		fsName     string
 		opts       []string
 		useOverlay bool
 	)
 
+	if isBindMount(m.Mount) {
+		m.Type = bind
+	}
+
 	switch m.Type {
-	case devpts, devtmpfs, proc, sysfs:
+	case devpts.Name, devtmpfs.Name, proc.Name, sys.Name:
 		fsName = m.Type
 	case nonefs:
-		fsName = sysfs
-	case tmpfs:
+		fsName = sys.Name
+	case tmpfs.Name:
 		fsName = m.Type
 
 		var err error
@@ -288,9 +324,8 @@ func (c *containerMounter) getMountNameAndOptionsVFS2(conf *Config, m specs.Moun
 		}
 
 	case bind:
-		fd := c.fds.remove()
-		fsName = "9p"
-		opts = p9MountOptionsVFS2(fd, c.getMountAccessType(m))
+		fsName = gofer.Name
+		opts = p9MountOptions(m.fd, c.getMountAccessType(m.Mount), true /* vfs2 */)
 		// If configured, add overlay to all writable mounts.
 		useOverlay = conf.Overlay && !mountFlags(m.Options).ReadOnly
 
@@ -300,44 +335,29 @@ func (c *containerMounter) getMountNameAndOptionsVFS2(conf *Config, m specs.Moun
 	return fsName, opts, useOverlay, nil
 }
 
-// p9MountOptions creates a slice of options for a p9 mount.
-// TODO(gvisor.dev/issue/1624): Remove this version once privateunixsocket is
-// deleted, along with the rest of VFS1.
-func p9MountOptionsVFS2(fd int, fa FileAccessType) []string {
-	opts := []string{
-		"trans=fd",
-		"rfdno=" + strconv.Itoa(fd),
-		"wfdno=" + strconv.Itoa(fd),
-	}
-	if fa == FileAccessShared {
-		opts = append(opts, "cache=remote_revalidating")
-	}
-	return opts
-}
-
 func (c *containerMounter) makeSyntheticMount(ctx context.Context, currentPath string, root vfs.VirtualDentry, creds *auth.Credentials) error {
 	target := &vfs.PathOperation{
 		Root:  root,
 		Start: root,
 		Path:  fspath.Parse(currentPath),
 	}
-
 	_, err := c.k.VFS().StatAt(ctx, creds, target, &vfs.StatOptions{})
-	switch {
-	case err == syserror.ENOENT:
-		if err := c.makeSyntheticMount(ctx, path.Dir(currentPath), root, creds); err != nil {
-			return err
-		}
-		mkdirOpts := &vfs.MkdirOptions{Mode: 0777, ForSyntheticMountpoint: true}
-		if err := c.k.VFS().MkdirAt(ctx, creds, target, mkdirOpts); err != nil {
-			return fmt.Errorf("failed to makedir for mount %+v: %w", target, err)
-		}
-		return nil
-
-	case err != nil:
-		return fmt.Errorf("stat failed for mount %+v: %w", target, err)
-
-	default:
+	if err == nil {
+		// Mount point exists, nothing else to do.
 		return nil
 	}
+	if err != syserror.ENOENT {
+		return fmt.Errorf("stat failed for %q during mount point creation: %w", currentPath, err)
+	}
+
+	// Recurse to ensure parent is created and then create the mount point.
+	if err := c.makeSyntheticMount(ctx, path.Dir(currentPath), root, creds); err != nil {
+		return err
+	}
+	log.Debugf("Creating dir %q for mount point", currentPath)
+	mkdirOpts := &vfs.MkdirOptions{Mode: 0777, ForSyntheticMountpoint: true}
+	if err := c.k.VFS().MkdirAt(ctx, creds, target, mkdirOpts); err != nil {
+		return fmt.Errorf("failed to create directory %q for mount: %w", currentPath, err)
+	}
+	return nil
 }

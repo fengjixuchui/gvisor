@@ -835,10 +835,7 @@ cc_binary(
 cc_binary(
     name = "fpsig_fork_test",
     testonly = 1,
-    srcs = select_arch(
-        amd64 = ["fpsig_fork.cc"],
-        arm64 = [],
-    ),
+    srcs = ["fpsig_fork.cc"],
     linkstatic = 1,
     deps = [
         gtest,
@@ -2620,6 +2617,7 @@ cc_binary(
         ":socket_bind_to_device_util",
         ":socket_test_util",
         "//test/util:capability_util",
+        "@com_google_absl//absl/container:node_hash_map",
         gtest,
         "//test/util:test_main",
         "//test/util:test_util",
@@ -3287,6 +3285,7 @@ cc_binary(
         "//test/util:capability_util",
         "//test/util:file_descriptor",
         "//test/util:fs_util",
+        "@com_google_absl//absl/time",
         gtest,
         "//test/util:temp_path",
         "//test/util:test_main",

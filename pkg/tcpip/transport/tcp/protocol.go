@@ -64,6 +64,10 @@ const (
 	// DefaultTCPTimeWaitTimeout is the amount of time that sockets linger
 	// in TIME_WAIT state before being marked closed.
 	DefaultTCPTimeWaitTimeout = 60 * time.Second
+
+	// DefaultSynRetries is the default value for the number of SYN retransmits
+	// before a connect is aborted.
+	DefaultSynRetries = 6
 )
 
 // SACKEnabled option can be used to enable SACK support in the TCP
@@ -163,7 +167,10 @@ type protocol struct {
 	tcpLingerTimeout           time.Duration
 	tcpTimeWaitTimeout         time.Duration
 	minRTO                     time.Duration
+	maxRTO                     time.Duration
+	maxRetries                 uint32
 	synRcvdCount               synRcvdCounter
+	synRetries                 uint8
 	dispatcher                 *dispatcher
 }
 
@@ -340,9 +347,33 @@ func (p *protocol) SetOption(option interface{}) *tcpip.Error {
 		p.mu.Unlock()
 		return nil
 
+	case tcpip.TCPMaxRTOOption:
+		if v < 0 {
+			v = tcpip.TCPMaxRTOOption(MaxRTO)
+		}
+		p.mu.Lock()
+		p.maxRTO = time.Duration(v)
+		p.mu.Unlock()
+		return nil
+
+	case tcpip.TCPMaxRetriesOption:
+		p.mu.Lock()
+		p.maxRetries = uint32(v)
+		p.mu.Unlock()
+		return nil
+
 	case tcpip.TCPSynRcvdCountThresholdOption:
 		p.mu.Lock()
 		p.synRcvdCount.SetThreshold(uint64(v))
+		p.mu.Unlock()
+		return nil
+
+	case tcpip.TCPSynRetriesOption:
+		if v < 1 || v > 255 {
+			return tcpip.ErrInvalidOptionValue
+		}
+		p.mu.Lock()
+		p.synRetries = uint8(v)
 		p.mu.Unlock()
 		return nil
 
@@ -414,9 +445,27 @@ func (p *protocol) Option(option interface{}) *tcpip.Error {
 		p.mu.RUnlock()
 		return nil
 
+	case *tcpip.TCPMaxRTOOption:
+		p.mu.RLock()
+		*v = tcpip.TCPMaxRTOOption(p.maxRTO)
+		p.mu.RUnlock()
+		return nil
+
+	case *tcpip.TCPMaxRetriesOption:
+		p.mu.RLock()
+		*v = tcpip.TCPMaxRetriesOption(p.maxRetries)
+		p.mu.RUnlock()
+		return nil
+
 	case *tcpip.TCPSynRcvdCountThresholdOption:
 		p.mu.RLock()
 		*v = tcpip.TCPSynRcvdCountThresholdOption(p.synRcvdCount.Threshold())
+		p.mu.RUnlock()
+		return nil
+
+	case *tcpip.TCPSynRetriesOption:
+		p.mu.RLock()
+		*v = tcpip.TCPSynRetriesOption(p.synRetries)
 		p.mu.RUnlock()
 		return nil
 
@@ -452,6 +501,9 @@ func NewProtocol() stack.TransportProtocol {
 		tcpTimeWaitTimeout:         DefaultTCPTimeWaitTimeout,
 		synRcvdCount:               synRcvdCounter{threshold: SynRcvdCountThreshold},
 		dispatcher:                 newDispatcher(runtime.GOMAXPROCS(0)),
+		synRetries:                 DefaultSynRetries,
 		minRTO:                     MinRTO,
+		maxRTO:                     MaxRTO,
+		maxRetries:                 MaxRetries,
 	}
 }

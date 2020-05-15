@@ -34,6 +34,7 @@ import (
 	"time"
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
+	"gvisor.dev/gvisor/pkg/amutex"
 	"gvisor.dev/gvisor/pkg/binary"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/log"
@@ -553,11 +554,9 @@ func (s *SocketOperations) Write(ctx context.Context, _ *fs.File, src usermem.IO
 	}
 
 	if resCh != nil {
-		t := kernel.TaskFromContext(ctx)
-		if err := t.Block(resCh); err != nil {
-			return 0, syserr.FromError(err).ToError()
+		if err := amutex.Block(ctx, resCh); err != nil {
+			return 0, err
 		}
-
 		n, _, err = s.Endpoint.Write(f, tcpip.WriteOptions{})
 	}
 
@@ -626,11 +625,9 @@ func (s *SocketOperations) ReadFrom(ctx context.Context, _ *fs.File, r io.Reader
 	}
 
 	if resCh != nil {
-		t := kernel.TaskFromContext(ctx)
-		if err := t.Block(resCh); err != nil {
-			return 0, syserr.FromError(err).ToError()
+		if err := amutex.Block(ctx, resCh); err != nil {
+			return 0, err
 		}
-
 		n, _, err = s.Endpoint.Write(f, tcpip.WriteOptions{
 			Atomic: true, // See above.
 		})
@@ -1324,6 +1321,29 @@ func getSockOptTCP(t *kernel.Task, ep commonEndpoint, name, outLen int) (interfa
 
 		return int32(time.Duration(v) / time.Second), nil
 
+	case linux.TCP_SYNCNT:
+		if outLen < sizeOfInt32 {
+			return nil, syserr.ErrInvalidArgument
+		}
+
+		v, err := ep.GetSockOptInt(tcpip.TCPSynCountOption)
+		if err != nil {
+			return nil, syserr.TranslateNetstackError(err)
+		}
+
+		return int32(v), nil
+
+	case linux.TCP_WINDOW_CLAMP:
+		if outLen < sizeOfInt32 {
+			return nil, syserr.ErrInvalidArgument
+		}
+
+		v, err := ep.GetSockOptInt(tcpip.TCPWindowClampOption)
+		if err != nil {
+			return nil, syserr.TranslateNetstackError(err)
+		}
+
+		return int32(v), nil
 	default:
 		emitUnimplementedEventTCP(t, name)
 	}
@@ -1792,6 +1812,22 @@ func setSockOptTCP(t *kernel.Task, ep commonEndpoint, name int, optVal []byte) *
 			v = 0
 		}
 		return syserr.TranslateNetstackError(ep.SetSockOpt(tcpip.TCPDeferAcceptOption(time.Second * time.Duration(v))))
+
+	case linux.TCP_SYNCNT:
+		if len(optVal) < sizeOfInt32 {
+			return syserr.ErrInvalidArgument
+		}
+		v := usermem.ByteOrder.Uint32(optVal)
+
+		return syserr.TranslateNetstackError(ep.SetSockOptInt(tcpip.TCPSynCountOption, int(v)))
+
+	case linux.TCP_WINDOW_CLAMP:
+		if len(optVal) < sizeOfInt32 {
+			return syserr.ErrInvalidArgument
+		}
+		v := usermem.ByteOrder.Uint32(optVal)
+
+		return syserr.TranslateNetstackError(ep.SetSockOptInt(tcpip.TCPWindowClampOption, int(v)))
 
 	case linux.TCP_REPAIR_OPTIONS:
 		t.Kernel().EmitUnimplementedEvent(t)
