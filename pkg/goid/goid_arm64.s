@@ -1,4 +1,4 @@
-// Copyright 2019 The gVisor Authors.
+// Copyright 2020 The gVisor Authors.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,20 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package gofer
+#include "textflag.h"
 
-import (
-	"gvisor.dev/gvisor/pkg/usermem"
-)
-
-// This are equivalent to usermem.Addr.RoundDown/Up, but without the
-// potentially truncating conversion to usermem.Addr. This is necessary because
-// there is no way to define generic "PageRoundDown/Up" functions in Go.
-
-func pageRoundDown(x uint64) uint64 {
-	return x &^ (usermem.PageSize - 1)
-}
-
-func pageRoundUp(x uint64) uint64 {
-	return pageRoundDown(x + usermem.PageSize - 1)
-}
+// func getg() *g
+TEXT ·getg(SB),NOSPLIT,$0-8
+        MOVD g, R0      // g
+        MOVD R0, ret+0(FP)
+        RET

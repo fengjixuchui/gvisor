@@ -64,14 +64,14 @@ function cleanup {
 trap cleanup EXIT
 
 # Wait for the instance to become available (up to 5 minutes).
-echo -n "Waiting for ${INSTANCE_NAME}"
+echo -n "Waiting for ${INSTANCE_NAME}" >&2
 declare timeout=300
 declare success=0
 declare internal=""
 declare -r start=$(date +%s)
 declare -r end=$((${start}+${timeout}))
 while [[ "$(date +%s)" -lt "${end}" ]] && [[ "${success}" -lt 3 ]]; do
-  echo -n "."
+  echo -n "." >&2
   if gcloud compute ssh --zone "${ZONE}" "${USERNAME}"@"${INSTANCE_NAME}" -- true 2>/dev/null; then
     success=$((${success}+1))
   elif gcloud compute ssh --internal-ip --zone "${ZONE}" "${USERNAME}"@"${INSTANCE_NAME}" -- true 2>/dev/null; then
@@ -81,10 +81,10 @@ while [[ "$(date +%s)" -lt "${end}" ]] && [[ "${success}" -lt 3 ]]; do
 done
 
 if [[ "${success}" -eq "0" ]]; then
-  echo "connect timed out after ${timeout} seconds."
+  echo "connect timed out after ${timeout} seconds." >&2
   exit 1
 else
-  echo "done."
+  echo "done." >&2
 fi
 
 # Run the install scripts provided.

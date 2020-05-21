@@ -31,8 +31,6 @@ packetimpact_go_test(
 packetimpact_go_test(
     name = "udp_icmp_error_propagation",
     srcs = ["udp_icmp_error_propagation_test.go"],
-    # TODO(b/153926291): Fix netstack then remove the line below.
-    expect_netstack_failure = True,
     deps = [
         "//pkg/tcpip",
         "//pkg/tcpip/header",
@@ -127,6 +125,19 @@ packetimpact_go_test(
 packetimpact_go_test(
     name = "tcp_close_wait_ack",
     srcs = ["tcp_close_wait_ack_test.go"],
+    deps = [
+        "//pkg/tcpip/header",
+        "//pkg/tcpip/seqnum",
+        "//test/packetimpact/testbench",
+        "@org_golang_x_sys//unix:go_default_library",
+    ],
+)
+
+packetimpact_go_test(
+    name = "tcp_paws_mechanism",
+    srcs = ["tcp_paws_mechanism_test.go"],
+    # TODO(b/156682000): Fix netstack then remove the line below.
+    expect_netstack_failure = True,
     deps = [
         "//pkg/tcpip/header",
         "//pkg/tcpip/seqnum",

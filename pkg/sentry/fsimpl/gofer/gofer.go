@@ -869,8 +869,8 @@ func (d *dentry) setStat(ctx context.Context, creds *auth.Credentials, stat *lin
 				Size:               stat.Mask&linux.STATX_SIZE != 0,
 				ATime:              stat.Mask&linux.STATX_ATIME != 0,
 				MTime:              stat.Mask&linux.STATX_MTIME != 0,
-				ATimeNotSystemTime: stat.Atime.Nsec != linux.UTIME_NOW,
-				MTimeNotSystemTime: stat.Mtime.Nsec != linux.UTIME_NOW,
+				ATimeNotSystemTime: stat.Mask&linux.STATX_ATIME != 0 && stat.Atime.Nsec != linux.UTIME_NOW,
+				MTimeNotSystemTime: stat.Mask&linux.STATX_MTIME != 0 && stat.Mtime.Nsec != linux.UTIME_NOW,
 			}, p9.SetAttr{
 				Permissions:      p9.FileMode(stat.Mode),
 				UID:              p9.UID(stat.UID),
@@ -928,8 +928,8 @@ func (d *dentry) setStat(ctx context.Context, creds *auth.Credentials, stat *lin
 		// so we can't race with Write or another truncate.)
 		d.dataMu.Unlock()
 		if d.size < oldSize {
-			oldpgend := pageRoundUp(oldSize)
-			newpgend := pageRoundUp(d.size)
+			oldpgend, _ := usermem.PageRoundUp(oldSize)
+			newpgend, _ := usermem.PageRoundUp(d.size)
 			if oldpgend != newpgend {
 				d.mapsMu.Lock()
 				d.mappings.Invalidate(memmap.MappableRange{newpgend, oldpgend}, memmap.InvalidateOpts{
