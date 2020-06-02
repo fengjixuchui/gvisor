@@ -37,6 +37,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/fs"
 	"gvisor.dev/gvisor/pkg/sentry/fs/gofer"
 	"gvisor.dev/gvisor/pkg/sentry/fs/ramfs"
+	"gvisor.dev/gvisor/pkg/sentry/fs/user"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/devpts"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/devtmpfs"
 	gofervfs2 "gvisor.dev/gvisor/pkg/sentry/fsimpl/gofer"
@@ -221,9 +222,6 @@ func mountFlags(opts []string) fs.MountSourceFlags {
 			mf.NoAtime = true
 		case "noexec":
 			mf.NoExec = true
-		case "bind", "rbind":
-			// When options include either "bind" or "rbind",
-			// it's converted to a 9P mount.
 		default:
 			log.Warningf("ignoring unknown mount option %q", o)
 		}
@@ -294,17 +292,10 @@ func setupContainerFS(ctx context.Context, conf *Config, mntr *containerMounter,
 	// Set namespace here so that it can be found in ctx.
 	procArgs.MountNamespace = mns
 
-	return setExecutablePath(ctx, procArgs)
-}
-
-// setExecutablePath sets the procArgs.Filename by searching the PATH for an
-// executable matching the procArgs.Argv[0].
-func setExecutablePath(ctx context.Context, procArgs *kernel.CreateProcessArgs) error {
-	paths := fs.GetPath(procArgs.Envv)
-	exe := procArgs.Argv[0]
-	f, err := procArgs.MountNamespace.ResolveExecutablePath(ctx, procArgs.WorkingDirectory, exe, paths)
+	// Resolve the executable path from working dir and environment.
+	f, err := user.ResolveExecutablePath(ctx, procArgs.Credentials, procArgs.MountNamespace, procArgs.Envv, procArgs.WorkingDirectory, procArgs.Argv[0])
 	if err != nil {
-		return fmt.Errorf("searching for executable %q, cwd: %q, $PATH=%q: %v", exe, procArgs.WorkingDirectory, strings.Join(paths, ":"), err)
+		return fmt.Errorf("searching for executable %q, cwd: %q, envv: %q: %v", procArgs.Argv[0], procArgs.WorkingDirectory, procArgs.Envv, err)
 	}
 	procArgs.Filename = f
 	return nil
@@ -770,10 +761,6 @@ func (c *containerMounter) getMountNameAndOptions(conf *Config, m specs.Mount) (
 		useOverlay bool
 	)
 
-	if isBindMount(m) {
-		m.Type = bind
-	}
-
 	switch m.Type {
 	case devpts.Name, devtmpfs.Name, procvfs2.Name, sysvfs2.Name:
 		fsName = m.Type
@@ -799,18 +786,6 @@ func (c *containerMounter) getMountNameAndOptions(conf *Config, m specs.Mount) (
 		log.Warningf("ignoring unknown filesystem type %q", m.Type)
 	}
 	return fsName, opts, useOverlay, nil
-}
-
-func isBindMount(m specs.Mount) bool {
-	for _, opt := range m.Options {
-		// When options include either "bind" or "rbind", this behaves as
-		// bind mount even if the mount type is equal to a filesystem supported
-		// on runsc.
-		if opt == "bind" || opt == "rbind" {
-			return true
-		}
-	}
-	return false
 }
 
 func (c *containerMounter) getMountAccessType(mount specs.Mount) FileAccessType {

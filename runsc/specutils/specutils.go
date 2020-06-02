@@ -311,19 +311,7 @@ func capsFromNames(names []string, skipSet map[linux.Capability]struct{}) (auth.
 
 // Is9PMount returns true if the given mount can be mounted as an external gofer.
 func Is9PMount(m specs.Mount) bool {
-	var isBind bool
-	switch m.Type {
-	case "bind":
-		isBind = true
-	default:
-		for _, opt := range m.Options {
-			if opt == "bind" || opt == "rbind" {
-				isBind = true
-				break
-			}
-		}
-	}
-	return isBind && m.Source != "" && IsSupportedDevMount(m)
+	return m.Type == "bind" && m.Source != "" && IsSupportedDevMount(m)
 }
 
 // IsSupportedDevMount returns true if the mount is a supported /dev mount.
@@ -454,36 +442,6 @@ func ContainsStr(strs []string, str string) bool {
 		}
 	}
 	return false
-}
-
-// Cleanup allows defers to be aborted when cleanup needs to happen
-// conditionally. Usage:
-// c := MakeCleanup(func() { f.Close() })
-// defer c.Clean() // any failure before release is called will close the file.
-// ...
-// c.Release() // on success, aborts closing the file and return it.
-// return f
-type Cleanup struct {
-	clean func()
-}
-
-// MakeCleanup creates a new Cleanup object.
-func MakeCleanup(f func()) Cleanup {
-	return Cleanup{clean: f}
-}
-
-// Clean calls the cleanup function.
-func (c *Cleanup) Clean() {
-	if c.clean != nil {
-		c.clean()
-		c.clean = nil
-	}
-}
-
-// Release releases the cleanup from its duties, i.e. cleanup function is not
-// called after this point.
-func (c *Cleanup) Release() {
-	c.clean = nil
 }
 
 // RetryEintr retries the function until an error different than EINTR is

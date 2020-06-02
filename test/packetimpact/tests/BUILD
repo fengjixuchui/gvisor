@@ -16,6 +16,19 @@ packetimpact_go_test(
 )
 
 packetimpact_go_test(
+    name = "ipv4_id_uniqueness",
+    srcs = ["ipv4_id_uniqueness_test.go"],
+    # TODO(b/157506701) Fix netstack then remove the line below.
+    expect_netstack_failure = True,
+    deps = [
+        "//pkg/abi/linux",
+        "//pkg/tcpip/header",
+        "//test/packetimpact/testbench",
+        "@org_golang_x_sys//unix:go_default_library",
+    ],
+)
+
+packetimpact_go_test(
     name = "udp_recv_multicast",
     srcs = ["udp_recv_multicast_test.go"],
     # TODO(b/152813495): Fix netstack then remove the line below.
@@ -149,6 +162,38 @@ packetimpact_go_test(
 packetimpact_go_test(
     name = "tcp_user_timeout",
     srcs = ["tcp_user_timeout_test.go"],
+    deps = [
+        "//pkg/tcpip/header",
+        "//test/packetimpact/testbench",
+        "@org_golang_x_sys//unix:go_default_library",
+    ],
+)
+
+packetimpact_go_test(
+    name = "tcp_queue_receive_in_syn_sent",
+    srcs = ["tcp_queue_receive_in_syn_sent_test.go"],
+    # TODO(b/157658105): Fix netstack then remove the line below.
+    expect_netstack_failure = True,
+    deps = [
+        "//pkg/tcpip/header",
+        "//test/packetimpact/testbench",
+        "@org_golang_x_sys//unix:go_default_library",
+    ],
+)
+
+packetimpact_go_test(
+    name = "tcp_synsent_reset",
+    srcs = ["tcp_synsent_reset_test.go"],
+    deps = [
+        "//pkg/tcpip/header",
+        "//test/packetimpact/testbench",
+        "@org_golang_x_sys//unix:go_default_library",
+    ],
+)
+
+packetimpact_go_test(
+    name = "tcp_synrcvd_reset",
+    srcs = ["tcp_synrcvd_reset_test.go"],
     deps = [
         "//pkg/tcpip/header",
         "//test/packetimpact/testbench",
