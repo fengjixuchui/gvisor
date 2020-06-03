@@ -16,6 +16,7 @@
 
 # Described below.
 OPTIONS :=
+STARTUP_OPTIONS :=
 TARGETS := //runsc
 ARGS    :=
 
@@ -24,7 +25,7 @@ default: runsc
 
 ## usage: make <target>
 ##         or
-##        make <build|test|copy|run|sudo> OPTIONS="..." TARGETS="..." ARGS="..."
+##        make <build|test|copy|run|sudo> STARTUP_OPTIONS="..." OPTIONS="..." TARGETS="..." ARGS="..."
 ##
 ## Basic targets.
 ##
@@ -33,6 +34,7 @@ default: runsc
 ##   requirements.
 ##
 ##   There are common arguments that may be passed to targets. These are:
+##     STARTUP_OPTIONS - Bazel startup options.
 ##     OPTIONS - Build or test options.
 ##     TARGETS - The bazel targets.
 ##     ARGS    - Arguments for run or sudo.
@@ -217,6 +219,7 @@ dev: ## Installs a set of local runtimes. Requires sudo.
 	@$(MAKE) configure RUNTIME="$(RUNTIME)" ARGS="--net-raw"
 	@$(MAKE) configure RUNTIME="$(RUNTIME)-d" ARGS="--net-raw --debug --strace --log-packets"
 	@$(MAKE) configure RUNTIME="$(RUNTIME)-p" ARGS="--net-raw --profile"
+	@$(MAKE) configure RUNTIME="$(RUNTIME)-vfs2-d" ARGS="--net-raw --debug --strace --log-packets --vfs2"
 	@sudo systemctl restart docker
 .PHONY: dev
 
