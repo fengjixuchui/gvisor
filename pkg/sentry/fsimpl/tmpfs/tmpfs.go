@@ -30,12 +30,12 @@ package tmpfs
 import (
 	"fmt"
 	"math"
+	"strconv"
 	"strings"
 	"sync/atomic"
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/context"
-	fslock "gvisor.dev/gvisor/pkg/sentry/fs/lock"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/time"
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
@@ -112,6 +112,58 @@ func (fstype FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 		}
 	}
 
+	mopts := vfs.GenericParseMountOptions(opts.Data)
+	rootMode := linux.FileMode(0777)
+	if rootFileType == linux.S_IFDIR {
+		rootMode = 01777
+	}
+	modeStr, ok := mopts["mode"]
+	if ok {
+		delete(mopts, "mode")
+		mode, err := strconv.ParseUint(modeStr, 8, 32)
+		if err != nil {
+			ctx.Warningf("tmpfs.FilesystemType.GetFilesystem: invalid mode: %q", modeStr)
+			return nil, nil, syserror.EINVAL
+		}
+		rootMode = linux.FileMode(mode & 07777)
+	}
+	rootKUID := creds.EffectiveKUID
+	uidStr, ok := mopts["uid"]
+	if ok {
+		delete(mopts, "uid")
+		uid, err := strconv.ParseUint(uidStr, 10, 32)
+		if err != nil {
+			ctx.Warningf("tmpfs.FilesystemType.GetFilesystem: invalid uid: %q", uidStr)
+			return nil, nil, syserror.EINVAL
+		}
+		kuid := creds.UserNamespace.MapToKUID(auth.UID(uid))
+		if !kuid.Ok() {
+			ctx.Warningf("tmpfs.FilesystemType.GetFilesystem: unmapped uid: %d", uid)
+			return nil, nil, syserror.EINVAL
+		}
+		rootKUID = kuid
+	}
+	rootKGID := creds.EffectiveKGID
+	gidStr, ok := mopts["gid"]
+	if ok {
+		delete(mopts, "gid")
+		gid, err := strconv.ParseUint(gidStr, 10, 32)
+		if err != nil {
+			ctx.Warningf("tmpfs.FilesystemType.GetFilesystem: invalid gid: %q", gidStr)
+			return nil, nil, syserror.EINVAL
+		}
+		kgid := creds.UserNamespace.MapToKGID(auth.GID(gid))
+		if !kgid.Ok() {
+			ctx.Warningf("tmpfs.FilesystemType.GetFilesystem: unmapped gid: %d", gid)
+			return nil, nil, syserror.EINVAL
+		}
+		rootKGID = kgid
+	}
+	if len(mopts) != 0 {
+		ctx.Warningf("tmpfs.FilesystemType.GetFilesystem: unknown options: %v", mopts)
+		return nil, nil, syserror.EINVAL
+	}
+
 	devMinor, err := vfsObj.GetAnonBlockDevMinor()
 	if err != nil {
 		return nil, nil, err
@@ -127,11 +179,11 @@ func (fstype FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 	var root *dentry
 	switch rootFileType {
 	case linux.S_IFREG:
-		root = fs.newDentry(fs.newRegularFile(creds, 0777))
+		root = fs.newDentry(fs.newRegularFile(rootKUID, rootKGID, rootMode))
 	case linux.S_IFLNK:
-		root = fs.newDentry(fs.newSymlink(creds, tmpfsOpts.RootSymlinkTarget))
+		root = fs.newDentry(fs.newSymlink(rootKUID, rootKGID, rootMode, tmpfsOpts.RootSymlinkTarget))
 	case linux.S_IFDIR:
-		root = &fs.newDirectory(creds, 01777).dentry
+		root = &fs.newDirectory(rootKUID, rootKGID, rootMode).dentry
 	default:
 		fs.vfsfs.DecRef()
 		return nil, nil, fmt.Errorf("invalid tmpfs root file type: %#o", rootFileType)
@@ -258,7 +310,6 @@ type inode struct {
 	ctime int64 // nanoseconds
 	mtime int64 // nanoseconds
 
-	// Advisory file locks, which lock at the inode level.
 	locks lock.FileLocks
 
 	// Inotify watches for this inode.
@@ -269,15 +320,15 @@ type inode struct {
 
 const maxLinks = math.MaxUint32
 
-func (i *inode) init(impl interface{}, fs *filesystem, creds *auth.Credentials, mode linux.FileMode) {
+func (i *inode) init(impl interface{}, fs *filesystem, kuid auth.KUID, kgid auth.KGID, mode linux.FileMode) {
 	if mode.FileType() == 0 {
 		panic("file type is required in FileMode")
 	}
 	i.fs = fs
 	i.refs = 1
 	i.mode = uint32(mode)
-	i.uid = uint32(creds.EffectiveKUID)
-	i.gid = uint32(creds.EffectiveKGID)
+	i.uid = uint32(kuid)
+	i.gid = uint32(kgid)
 	i.ino = atomic.AddUint64(&fs.nextInoMinusOne, 1)
 	// Tmpfs creation sets atime, ctime, and mtime to current time.
 	now := fs.clock.Now().Nanoseconds()
@@ -486,44 +537,6 @@ func (i *inode) setStat(ctx context.Context, creds *auth.Credentials, stat *linu
 	return nil
 }
 
-// TODO(gvisor.dev/issue/1480): support file locking for file types other than regular.
-func (i *inode) lockBSD(uid fslock.UniqueID, t fslock.LockType, block fslock.Blocker) error {
-	switch i.impl.(type) {
-	case *regularFile:
-		return i.locks.LockBSD(uid, t, block)
-	}
-	return syserror.EBADF
-}
-
-// TODO(gvisor.dev/issue/1480): support file locking for file types other than regular.
-func (i *inode) unlockBSD(uid fslock.UniqueID) error {
-	switch i.impl.(type) {
-	case *regularFile:
-		i.locks.UnlockBSD(uid)
-		return nil
-	}
-	return syserror.EBADF
-}
-
-// TODO(gvisor.dev/issue/1480): support file locking for file types other than regular.
-func (i *inode) lockPOSIX(uid fslock.UniqueID, t fslock.LockType, rng fslock.LockRange, block fslock.Blocker) error {
-	switch i.impl.(type) {
-	case *regularFile:
-		return i.locks.LockPOSIX(uid, t, rng, block)
-	}
-	return syserror.EBADF
-}
-
-// TODO(gvisor.dev/issue/1480): support file locking for file types other than regular.
-func (i *inode) unlockPOSIX(uid fslock.UniqueID, rng fslock.LockRange) error {
-	switch i.impl.(type) {
-	case *regularFile:
-		i.locks.UnlockPOSIX(uid, rng)
-		return nil
-	}
-	return syserror.EBADF
-}
-
 // allocatedBlocksForSize returns the number of 512B blocks needed to
 // accommodate the given size in bytes, as appropriate for struct
 // stat::st_blocks and struct statx::stx_blocks. (Note that this 512B block
@@ -562,6 +575,9 @@ func (i *inode) isDir() bool {
 }
 
 func (i *inode) touchAtime(mnt *vfs.Mount) {
+	if mnt.Flags.NoATime {
+		return
+	}
 	if err := mnt.CheckBeginWrite(); err != nil {
 		return
 	}
@@ -652,6 +668,7 @@ func (i *inode) userXattrSupported() bool {
 type fileDescription struct {
 	vfsfd vfs.FileDescription
 	vfs.FileDescriptionDefaultImpl
+	vfs.LockFD
 }
 
 func (fd *fileDescription) filesystem() *filesystem {
@@ -731,8 +748,7 @@ func NewMemfd(mount *vfs.Mount, creds *auth.Credentials, allowSeals bool, name s
 
 	// Per Linux, mm/shmem.c:__shmem_file_setup(), memfd inodes are set up with
 	// S_IRWXUGO.
-	mode := linux.FileMode(0777)
-	inode := fs.newRegularFile(creds, mode)
+	inode := fs.newRegularFile(creds.EffectiveKUID, creds.EffectiveKGID, 0777)
 	rf := inode.impl.(*regularFile)
 	if allowSeals {
 		rf.seals = 0

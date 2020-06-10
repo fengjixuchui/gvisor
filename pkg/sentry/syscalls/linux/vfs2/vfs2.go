@@ -62,7 +62,7 @@ func Override() {
 	s.Table[55] = syscalls.Supported("getsockopt", GetSockOpt)
 	s.Table[59] = syscalls.Supported("execve", Execve)
 	s.Table[72] = syscalls.Supported("fcntl", Fcntl)
-	delete(s.Table, 73) // flock
+	s.Table[73] = syscalls.Supported("fcntl", Flock)
 	s.Table[74] = syscalls.Supported("fsync", Fsync)
 	s.Table[75] = syscalls.Supported("fdatasync", Fdatasync)
 	s.Table[76] = syscalls.Supported("truncate", Truncate)
@@ -90,8 +90,8 @@ func Override() {
 	s.Table[138] = syscalls.Supported("fstatfs", Fstatfs)
 	s.Table[161] = syscalls.Supported("chroot", Chroot)
 	s.Table[162] = syscalls.Supported("sync", Sync)
-	delete(s.Table, 165) // mount
-	delete(s.Table, 166) // umount2
+	s.Table[165] = syscalls.Supported("mount", Mount)
+	s.Table[166] = syscalls.Supported("umount2", Umount2)
 	delete(s.Table, 187) // readahead
 	s.Table[188] = syscalls.Supported("setxattr", Setxattr)
 	s.Table[189] = syscalls.Supported("lsetxattr", Lsetxattr)

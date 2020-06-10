@@ -52,7 +52,7 @@ const (
 
 type transportProtocolState struct {
 	proto          TransportProtocol
-	defaultHandler func(r *Route, id TransportEndpointID, pkt PacketBuffer) bool
+	defaultHandler func(r *Route, id TransportEndpointID, pkt *PacketBuffer) bool
 }
 
 // TCPProbeFunc is the expected function type for a TCP probe function to be
@@ -424,12 +424,8 @@ type Stack struct {
 	// handleLocal allows non-loopback interfaces to loop packets.
 	handleLocal bool
 
-	// tablesMu protects iptables.
-	tablesMu sync.RWMutex
-
-	// tables are the iptables packet filtering and manipulation rules. The are
-	// protected by tablesMu.`
-	tables IPTables
+	// tables are the iptables packet filtering and manipulation rules.
+	tables *IPTables
 
 	// resumableEndpoints is a list of endpoints that need to be resumed if the
 	// stack is being restored.
@@ -676,6 +672,7 @@ func New(opts Options) *Stack {
 		clock:                clock,
 		stats:                opts.Stats.FillIn(),
 		handleLocal:          opts.HandleLocal,
+		tables:               DefaultTables(),
 		icmpRateLimiter:      NewICMPRateLimiter(),
 		seed:                 generateRandUint32(),
 		ndpConfigs:           opts.NDPConfigs,
@@ -778,7 +775,7 @@ func (s *Stack) TransportProtocolOption(transport tcpip.TransportProtocolNumber,
 //
 // It must be called only during initialization of the stack. Changing it as the
 // stack is operating is not supported.
-func (s *Stack) SetTransportProtocolHandler(p tcpip.TransportProtocolNumber, h func(*Route, TransportEndpointID, PacketBuffer) bool) {
+func (s *Stack) SetTransportProtocolHandler(p tcpip.TransportProtocolNumber, h func(*Route, TransportEndpointID, *PacketBuffer) bool) {
 	state := s.transportProtocols[p]
 	if state != nil {
 		state.defaultHandler = h
@@ -1020,6 +1017,13 @@ func (s *Stack) RemoveNIC(id tcpip.NICID) *tcpip.Error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	return s.removeNICLocked(id)
+}
+
+// removeNICLocked removes NIC and all related routes from the network stack.
+//
+// s.mu must be locked.
+func (s *Stack) removeNICLocked(id tcpip.NICID) *tcpip.Error {
 	nic, ok := s.nics[id]
 	if !ok {
 		return tcpip.ErrUnknownNICID
@@ -1741,18 +1745,8 @@ func (s *Stack) IsInGroup(nicID tcpip.NICID, multicastAddr tcpip.Address) (bool,
 }
 
 // IPTables returns the stack's iptables.
-func (s *Stack) IPTables() IPTables {
-	s.tablesMu.RLock()
-	t := s.tables
-	s.tablesMu.RUnlock()
-	return t
-}
-
-// SetIPTables sets the stack's iptables.
-func (s *Stack) SetIPTables(ipt IPTables) {
-	s.tablesMu.Lock()
-	s.tables = ipt
-	s.tablesMu.Unlock()
+func (s *Stack) IPTables() *IPTables {
+	return s.tables
 }
 
 // ICMPLimit returns the maximum number of ICMP messages that can be sent

@@ -21,6 +21,7 @@
 package tcp
 
 import (
+	"fmt"
 	"runtime"
 	"strings"
 	"time"
@@ -206,7 +207,7 @@ func (*protocol) ParsePorts(v buffer.View) (src, dst uint16, err *tcpip.Error) {
 // to a specific processing queue. Each queue is serviced by its own processor
 // goroutine which is responsible for dequeuing and doing full TCP dispatch of
 // the packet.
-func (p *protocol) QueuePacket(r *stack.Route, ep stack.TransportEndpoint, id stack.TransportEndpointID, pkt stack.PacketBuffer) {
+func (p *protocol) QueuePacket(r *stack.Route, ep stack.TransportEndpoint, id stack.TransportEndpointID, pkt *stack.PacketBuffer) {
 	p.dispatcher.queuePacket(r, ep, id, pkt)
 }
 
@@ -217,7 +218,7 @@ func (p *protocol) QueuePacket(r *stack.Route, ep stack.TransportEndpoint, id st
 // a reset is sent in response to any incoming segment except another reset. In
 // particular, SYNs addressed to a non-existent connection are rejected by this
 // means."
-func (*protocol) HandleUnknownDestinationPacket(r *stack.Route, id stack.TransportEndpointID, pkt stack.PacketBuffer) bool {
+func (*protocol) HandleUnknownDestinationPacket(r *stack.Route, id stack.TransportEndpointID, pkt *stack.PacketBuffer) bool {
 	s := newSegment(r, id, pkt)
 	defer s.decRef()
 
@@ -488,6 +489,26 @@ func (p *protocol) Wait() {
 // instance.
 func (p *protocol) SynRcvdCounter() *synRcvdCounter {
 	return &p.synRcvdCount
+}
+
+// Parse implements stack.TransportProtocol.Parse.
+func (*protocol) Parse(pkt *stack.PacketBuffer) bool {
+	hdr, ok := pkt.Data.PullUp(header.TCPMinimumSize)
+	if !ok {
+		return false
+	}
+
+	// If the header has options, pull those up as well.
+	if offset := int(header.TCP(hdr).DataOffset()); offset > header.TCPMinimumSize && offset <= pkt.Data.Size() {
+		hdr, ok = pkt.Data.PullUp(offset)
+		if !ok {
+			panic(fmt.Sprintf("There should be at least %d bytes in pkt.Data.", offset))
+		}
+	}
+
+	pkt.TransportHeader = hdr
+	pkt.Data.TrimFront(len(hdr))
+	return true
 }
 
 // NewProtocol returns a TCP transport protocol.

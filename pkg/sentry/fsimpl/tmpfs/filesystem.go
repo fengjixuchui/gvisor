@@ -256,11 +256,12 @@ func (fs *filesystem) LinkAt(ctx context.Context, rp *vfs.ResolvingPath, vd vfs.
 // MkdirAt implements vfs.FilesystemImpl.MkdirAt.
 func (fs *filesystem) MkdirAt(ctx context.Context, rp *vfs.ResolvingPath, opts vfs.MkdirOptions) error {
 	return fs.doCreateAt(rp, true /* dir */, func(parentDir *directory, name string) error {
+		creds := rp.Credentials()
 		if parentDir.inode.nlink == maxLinks {
 			return syserror.EMLINK
 		}
 		parentDir.inode.incLinksLocked() // from child's ".."
-		childDir := fs.newDirectory(rp.Credentials(), opts.Mode)
+		childDir := fs.newDirectory(creds.EffectiveKUID, creds.EffectiveKGID, opts.Mode)
 		parentDir.insertChildLocked(&childDir.dentry, name)
 		return nil
 	})
@@ -269,18 +270,19 @@ func (fs *filesystem) MkdirAt(ctx context.Context, rp *vfs.ResolvingPath, opts v
 // MknodAt implements vfs.FilesystemImpl.MknodAt.
 func (fs *filesystem) MknodAt(ctx context.Context, rp *vfs.ResolvingPath, opts vfs.MknodOptions) error {
 	return fs.doCreateAt(rp, false /* dir */, func(parentDir *directory, name string) error {
+		creds := rp.Credentials()
 		var childInode *inode
 		switch opts.Mode.FileType() {
 		case 0, linux.S_IFREG:
-			childInode = fs.newRegularFile(rp.Credentials(), opts.Mode)
+			childInode = fs.newRegularFile(creds.EffectiveKUID, creds.EffectiveKGID, opts.Mode)
 		case linux.S_IFIFO:
-			childInode = fs.newNamedPipe(rp.Credentials(), opts.Mode)
+			childInode = fs.newNamedPipe(creds.EffectiveKUID, creds.EffectiveKGID, opts.Mode)
 		case linux.S_IFBLK:
-			childInode = fs.newDeviceFile(rp.Credentials(), opts.Mode, vfs.BlockDevice, opts.DevMajor, opts.DevMinor)
+			childInode = fs.newDeviceFile(creds.EffectiveKUID, creds.EffectiveKGID, opts.Mode, vfs.BlockDevice, opts.DevMajor, opts.DevMinor)
 		case linux.S_IFCHR:
-			childInode = fs.newDeviceFile(rp.Credentials(), opts.Mode, vfs.CharDevice, opts.DevMajor, opts.DevMinor)
+			childInode = fs.newDeviceFile(creds.EffectiveKUID, creds.EffectiveKGID, opts.Mode, vfs.CharDevice, opts.DevMajor, opts.DevMinor)
 		case linux.S_IFSOCK:
-			childInode = fs.newSocketFile(rp.Credentials(), opts.Mode, opts.Endpoint)
+			childInode = fs.newSocketFile(creds.EffectiveKUID, creds.EffectiveKGID, opts.Mode, opts.Endpoint)
 		default:
 			return syserror.EINVAL
 		}
@@ -355,7 +357,8 @@ afterTrailingSymlink:
 		}
 		defer rp.Mount().EndWrite()
 		// Create and open the child.
-		child := fs.newDentry(fs.newRegularFile(rp.Credentials(), opts.Mode))
+		creds := rp.Credentials()
+		child := fs.newDentry(fs.newRegularFile(creds.EffectiveKUID, creds.EffectiveKGID, opts.Mode))
 		parentDir.insertChildLocked(child, name)
 		fd, err := child.open(ctx, rp, &opts, true)
 		if err != nil {
@@ -396,6 +399,7 @@ func (d *dentry) open(ctx context.Context, rp *vfs.ResolvingPath, opts *vfs.Open
 	switch impl := d.inode.impl.(type) {
 	case *regularFile:
 		var fd regularFileFD
+		fd.LockFD.Init(&d.inode.locks)
 		if err := fd.vfsfd.Init(&fd, opts.Flags, rp.Mount(), &d.vfsd, &vfs.FileDescriptionOptions{}); err != nil {
 			return nil, err
 		}
@@ -411,15 +415,16 @@ func (d *dentry) open(ctx context.Context, rp *vfs.ResolvingPath, opts *vfs.Open
 			return nil, syserror.EISDIR
 		}
 		var fd directoryFD
+		fd.LockFD.Init(&d.inode.locks)
 		if err := fd.vfsfd.Init(&fd, opts.Flags, rp.Mount(), &d.vfsd, &vfs.FileDescriptionOptions{}); err != nil {
 			return nil, err
 		}
 		return &fd.vfsfd, nil
 	case *symlink:
-		// Can't open symlinks without O_PATH (which is unimplemented).
+		// TODO(gvisor.dev/issue/2782): Can't open symlinks without O_PATH.
 		return nil, syserror.ELOOP
 	case *namedPipe:
-		return impl.pipe.Open(ctx, rp.Mount(), &d.vfsd, opts.Flags)
+		return impl.pipe.Open(ctx, rp.Mount(), &d.vfsd, opts.Flags, &d.inode.locks)
 	case *deviceFile:
 		return rp.VirtualFilesystem().OpenDeviceSpecialFile(ctx, rp.Mount(), &d.vfsd, impl.kind, impl.major, impl.minor, opts)
 	case *socketFile:
@@ -676,7 +681,8 @@ func (fs *filesystem) StatFSAt(ctx context.Context, rp *vfs.ResolvingPath) (linu
 // SymlinkAt implements vfs.FilesystemImpl.SymlinkAt.
 func (fs *filesystem) SymlinkAt(ctx context.Context, rp *vfs.ResolvingPath, target string) error {
 	return fs.doCreateAt(rp, false /* dir */, func(parentDir *directory, name string) error {
-		child := fs.newDentry(fs.newSymlink(rp.Credentials(), target))
+		creds := rp.Credentials()
+		child := fs.newDentry(fs.newSymlink(creds.EffectiveKUID, creds.EffectiveKGID, 0777, target))
 		parentDir.insertChildLocked(child, name)
 		return nil
 	})

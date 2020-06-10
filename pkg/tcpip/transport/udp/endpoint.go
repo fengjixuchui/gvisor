@@ -15,6 +15,7 @@
 package udp
 
 import (
+	"gvisor.dev/gvisor/pkg/sleep"
 	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/buffer"
@@ -247,11 +248,6 @@ func (e *endpoint) Close() {
 // ModerateRecvBuf implements tcpip.Endpoint.ModerateRecvBuf.
 func (e *endpoint) ModerateRecvBuf(copied int) {}
 
-// IPTables implements tcpip.Endpoint.IPTables.
-func (e *endpoint) IPTables() (stack.IPTables, error) {
-	return e.stack.IPTables(), nil
-}
-
 // Read reads data from the endpoint. This method does not block if
 // there is no data pending.
 func (e *endpoint) Read(addr *tcpip.FullAddress) (buffer.View, tcpip.ControlMessages, *tcpip.Error) {
@@ -430,24 +426,33 @@ func (e *endpoint) write(p tcpip.Payloader, opts tcpip.WriteOptions) (int64, <-c
 	}
 
 	var route *stack.Route
+	var resolve func(waker *sleep.Waker) (ch <-chan struct{}, err *tcpip.Error)
 	var dstPort uint16
 	if to == nil {
 		route = &e.route
 		dstPort = e.dstPort
-
-		if route.IsResolutionRequired() {
-			// Promote lock to exclusive if using a shared route, given that it may need to
-			// change in Route.Resolve() call below.
+		resolve = func(waker *sleep.Waker) (ch <-chan struct{}, err *tcpip.Error) {
+			// Promote lock to exclusive if using a shared route, given that it may
+			// need to change in Route.Resolve() call below.
 			e.mu.RUnlock()
-			defer e.mu.RLock()
-
 			e.mu.Lock()
-			defer e.mu.Unlock()
 
 			// Recheck state after lock was re-acquired.
 			if e.state != StateConnected {
-				return 0, nil, tcpip.ErrInvalidEndpointState
+				err = tcpip.ErrInvalidEndpointState
 			}
+			if err == nil && route.IsResolutionRequired() {
+				ch, err = route.Resolve(waker)
+			}
+
+			e.mu.Unlock()
+			e.mu.RLock()
+
+			// Recheck state after lock was re-acquired.
+			if e.state != StateConnected {
+				err = tcpip.ErrInvalidEndpointState
+			}
+			return
 		}
 	} else {
 		// Reject destination address if it goes through a different
@@ -478,10 +483,11 @@ func (e *endpoint) write(p tcpip.Payloader, opts tcpip.WriteOptions) (int64, <-c
 
 		route = &r
 		dstPort = dst.Port
+		resolve = route.Resolve
 	}
 
 	if route.IsResolutionRequired() {
-		if ch, err := route.Resolve(nil); err != nil {
+		if ch, err := resolve(nil); err != nil {
 			if err == tcpip.ErrWouldBlock {
 				return 0, ch, tcpip.ErrNoLinkAddress
 			}
@@ -921,7 +927,11 @@ func sendUDP(r *stack.Route, data buffer.VectorisedView, localPort, remotePort u
 	if useDefaultTTL {
 		ttl = r.DefaultTTL()
 	}
-	if err := r.WritePacket(nil /* gso */, stack.NetworkHeaderParams{Protocol: ProtocolNumber, TTL: ttl, TOS: tos}, stack.PacketBuffer{
+	if err := r.WritePacket(nil /* gso */, stack.NetworkHeaderParams{
+		Protocol: ProtocolNumber,
+		TTL:      ttl,
+		TOS:      tos,
+	}, &stack.PacketBuffer{
 		Header:          hdr,
 		Data:            data,
 		TransportHeader: buffer.View(udp),
@@ -1269,17 +1279,15 @@ func (e *endpoint) Readiness(mask waiter.EventMask) waiter.EventMask {
 
 // HandlePacket is called by the stack when new packets arrive to this transport
 // endpoint.
-func (e *endpoint) HandlePacket(r *stack.Route, id stack.TransportEndpointID, pkt stack.PacketBuffer) {
+func (e *endpoint) HandlePacket(r *stack.Route, id stack.TransportEndpointID, pkt *stack.PacketBuffer) {
 	// Get the header then trim it from the view.
-	hdr, ok := pkt.Data.PullUp(header.UDPMinimumSize)
-	if !ok || int(header.UDP(hdr).Length()) > pkt.Data.Size() {
+	hdr := header.UDP(pkt.TransportHeader)
+	if int(hdr.Length()) > pkt.Data.Size()+header.UDPMinimumSize {
 		// Malformed packet.
 		e.stack.Stats().UDP.MalformedPacketsReceived.Increment()
 		e.stats.ReceiveErrors.MalformedPacketsReceived.Increment()
 		return
 	}
-
-	pkt.Data.TrimFront(header.UDPMinimumSize)
 
 	e.rcvMu.Lock()
 	e.stack.Stats().UDP.PacketsReceived.Increment()
@@ -1336,7 +1344,7 @@ func (e *endpoint) HandlePacket(r *stack.Route, id stack.TransportEndpointID, pk
 }
 
 // HandleControlPacket implements stack.TransportEndpoint.HandleControlPacket.
-func (e *endpoint) HandleControlPacket(id stack.TransportEndpointID, typ stack.ControlType, extra uint32, pkt stack.PacketBuffer) {
+func (e *endpoint) HandleControlPacket(id stack.TransportEndpointID, typ stack.ControlType, extra uint32, pkt *stack.PacketBuffer) {
 	if typ == stack.ControlPortUnreachable {
 		e.mu.RLock()
 		defer e.mu.RUnlock()

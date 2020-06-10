@@ -802,10 +802,13 @@ cc_binary(
     ],
     linkstatic = 1,
     deps = [
+        ":socket_test_util",
         "//test/util:file_descriptor",
         "@com_google_absl//absl/strings",
         "@com_google_absl//absl/time",
         gtest,
+        "//test/util:epoll_util",
+        "//test/util:eventfd_util",
         "//test/util:posix_error",
         "//test/util:temp_path",
         "//test/util:test_main",
@@ -1408,6 +1411,21 @@ cc_binary(
         "//test/util:test_main",
         "//test/util:test_util",
         "//test/util:thread_util",
+    ],
+)
+
+cc_binary(
+    name = "ping_socket_test",
+    testonly = 1,
+    srcs = ["ping_socket.cc"],
+    linkstatic = 1,
+    deps = [
+        ":socket_test_util",
+        "//test/util:file_descriptor",
+        gtest,
+        "//test/util:save_util",
+        "//test/util:test_main",
+        "//test/util:test_util",
     ],
 )
 
@@ -2771,6 +2789,26 @@ cc_binary(
         "@com_google_absl//absl/memory",
         "@com_google_absl//absl/strings",
         "@com_google_absl//absl/time",
+        gtest,
+        "//test/util:posix_error",
+        "//test/util:save_util",
+        "//test/util:test_main",
+        "//test/util:test_util",
+        "//test/util:thread_util",
+    ],
+)
+
+cc_binary(
+    name = "socket_inet_loopback_nogotsan_test",
+    testonly = 1,
+    srcs = ["socket_inet_loopback_nogotsan.cc"],
+    linkstatic = 1,
+    deps = [
+        ":ip_socket_test_util",
+        ":socket_test_util",
+        "//test/util:file_descriptor",
+        "@com_google_absl//absl/memory",
+        "@com_google_absl//absl/strings",
         gtest,
         "//test/util:posix_error",
         "//test/util:save_util",

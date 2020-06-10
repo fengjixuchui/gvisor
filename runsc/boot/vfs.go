@@ -96,11 +96,11 @@ func setupContainerVFS2(ctx context.Context, conf *Config, mntr *containerMounte
 	procArgs.MountNamespaceVFS2 = mns
 
 	// Resolve the executable path from working dir and environment.
-	f, err := user.ResolveExecutablePathVFS2(ctx, procArgs.Credentials, procArgs.MountNamespaceVFS2, procArgs.Envv, procArgs.WorkingDirectory, procArgs.Argv[0])
+	resolved, err := user.ResolveExecutablePath(ctx, procArgs)
 	if err != nil {
-		return fmt.Errorf("searching for executable %q, cwd: %q, envv: %q: %v", procArgs.Argv[0], procArgs.WorkingDirectory, procArgs.Envv, err)
+		return err
 	}
-	procArgs.Filename = f
+	procArgs.Filename = resolved
 	return nil
 }
 
@@ -272,7 +272,7 @@ func (c *containerMounter) getMountNameAndOptionsVFS2(conf *Config, m *mountAndF
 		case "ro":
 			opts.ReadOnly = true
 		case "noatime":
-			// TODO(gvisor.dev/issue/1193): Implement MS_NOATIME.
+			opts.Flags.NoATime = true
 		case "noexec":
 			opts.Flags.NoExec = true
 		default:

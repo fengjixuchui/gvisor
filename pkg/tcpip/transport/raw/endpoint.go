@@ -166,11 +166,6 @@ func (e *endpoint) SetOwner(owner tcpip.PacketOwner) {
 	e.owner = owner
 }
 
-// IPTables implements tcpip.Endpoint.IPTables.
-func (e *endpoint) IPTables() (stack.IPTables, error) {
-	return e.stack.IPTables(), nil
-}
-
 // Read implements tcpip.Endpoint.Read.
 func (e *endpoint) Read(addr *tcpip.FullAddress) (buffer.View, tcpip.ControlMessages, *tcpip.Error) {
 	if !e.associated {
@@ -348,7 +343,7 @@ func (e *endpoint) finishWrite(payloadBytes []byte, route *stack.Route) (int64, 
 	switch e.NetProto {
 	case header.IPv4ProtocolNumber:
 		if !e.associated {
-			if err := route.WriteHeaderIncludedPacket(stack.PacketBuffer{
+			if err := route.WriteHeaderIncludedPacket(&stack.PacketBuffer{
 				Data: buffer.View(payloadBytes).ToVectorisedView(),
 			}); err != nil {
 				return 0, nil, err
@@ -357,7 +352,7 @@ func (e *endpoint) finishWrite(payloadBytes []byte, route *stack.Route) (int64, 
 		}
 
 		hdr := buffer.NewPrependable(len(payloadBytes) + int(route.MaxHeaderLength()))
-		if err := route.WritePacket(nil /* gso */, stack.NetworkHeaderParams{Protocol: e.TransProto, TTL: route.DefaultTTL(), TOS: stack.DefaultTOS}, stack.PacketBuffer{
+		if err := route.WritePacket(nil /* gso */, stack.NetworkHeaderParams{Protocol: e.TransProto, TTL: route.DefaultTTL(), TOS: stack.DefaultTOS}, &stack.PacketBuffer{
 			Header: hdr,
 			Data:   buffer.View(payloadBytes).ToVectorisedView(),
 			Owner:  e.owner,
@@ -584,7 +579,7 @@ func (e *endpoint) GetSockOptInt(opt tcpip.SockOptInt) (int, *tcpip.Error) {
 }
 
 // HandlePacket implements stack.RawTransportEndpoint.HandlePacket.
-func (e *endpoint) HandlePacket(route *stack.Route, pkt stack.PacketBuffer) {
+func (e *endpoint) HandlePacket(route *stack.Route, pkt *stack.PacketBuffer) {
 	e.rcvMu.Lock()
 
 	// Drop the packet if our buffer is currently full.
@@ -632,8 +627,9 @@ func (e *endpoint) HandlePacket(route *stack.Route, pkt stack.PacketBuffer) {
 		},
 	}
 
-	networkHeader := append(buffer.View(nil), pkt.NetworkHeader...)
-	combinedVV := networkHeader.ToVectorisedView()
+	headers := append(buffer.View(nil), pkt.NetworkHeader...)
+	headers = append(headers, pkt.TransportHeader...)
+	combinedVV := headers.ToVectorisedView()
 	combinedVV.Append(pkt.Data)
 	packet.data = combinedVV
 	packet.timestampNS = e.stack.NowNanoseconds()

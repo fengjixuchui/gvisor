@@ -21,6 +21,7 @@
 package ipv4
 
 import (
+	"fmt"
 	"sync/atomic"
 
 	"gvisor.dev/gvisor/pkg/tcpip"
@@ -129,7 +130,7 @@ func (e *endpoint) NetworkProtocolNumber() tcpip.NetworkProtocolNumber {
 // packet's stated length matches the length of the header+payload. mtu
 // includes the IP header and options. This does not support the DontFragment
 // IP flag.
-func (e *endpoint) writePacketFragments(r *stack.Route, gso *stack.GSO, mtu int, pkt stack.PacketBuffer) *tcpip.Error {
+func (e *endpoint) writePacketFragments(r *stack.Route, gso *stack.GSO, mtu int, pkt *stack.PacketBuffer) *tcpip.Error {
 	// This packet is too big, it needs to be fragmented.
 	ip := header.IPv4(pkt.Header.View())
 	flags := ip.Flags()
@@ -169,7 +170,7 @@ func (e *endpoint) writePacketFragments(r *stack.Route, gso *stack.GSO, mtu int,
 		if i > 0 {
 			newPayload := pkt.Data.Clone(nil)
 			newPayload.CapLength(innerMTU)
-			if err := e.linkEP.WritePacket(r, gso, ProtocolNumber, stack.PacketBuffer{
+			if err := e.linkEP.WritePacket(r, gso, ProtocolNumber, &stack.PacketBuffer{
 				Header:        pkt.Header,
 				Data:          newPayload,
 				NetworkHeader: buffer.View(h),
@@ -188,7 +189,7 @@ func (e *endpoint) writePacketFragments(r *stack.Route, gso *stack.GSO, mtu int,
 			newPayload := pkt.Data.Clone(nil)
 			newPayloadLength := outerMTU - pkt.Header.UsedLength()
 			newPayload.CapLength(newPayloadLength)
-			if err := e.linkEP.WritePacket(r, gso, ProtocolNumber, stack.PacketBuffer{
+			if err := e.linkEP.WritePacket(r, gso, ProtocolNumber, &stack.PacketBuffer{
 				Header:        pkt.Header,
 				Data:          newPayload,
 				NetworkHeader: buffer.View(h),
@@ -202,7 +203,7 @@ func (e *endpoint) writePacketFragments(r *stack.Route, gso *stack.GSO, mtu int,
 			startOfHdr := pkt.Header
 			startOfHdr.TrimBack(pkt.Header.UsedLength() - outerMTU)
 			emptyVV := buffer.NewVectorisedView(0, []buffer.View{})
-			if err := e.linkEP.WritePacket(r, gso, ProtocolNumber, stack.PacketBuffer{
+			if err := e.linkEP.WritePacket(r, gso, ProtocolNumber, &stack.PacketBuffer{
 				Header:        startOfHdr,
 				Data:          emptyVV,
 				NetworkHeader: buffer.View(h),
@@ -245,7 +246,7 @@ func (e *endpoint) addIPHeader(r *stack.Route, hdr *buffer.Prependable, payloadS
 }
 
 // WritePacket writes a packet to the given destination address and protocol.
-func (e *endpoint) WritePacket(r *stack.Route, gso *stack.GSO, params stack.NetworkHeaderParams, pkt stack.PacketBuffer) *tcpip.Error {
+func (e *endpoint) WritePacket(r *stack.Route, gso *stack.GSO, params stack.NetworkHeaderParams, pkt *stack.PacketBuffer) *tcpip.Error {
 	ip := e.addIPHeader(r, &pkt.Header, pkt.Data.Size(), params)
 	pkt.NetworkHeader = buffer.View(ip)
 
@@ -253,43 +254,29 @@ func (e *endpoint) WritePacket(r *stack.Route, gso *stack.GSO, params stack.Netw
 	// iptables filtering. All packets that reach here are locally
 	// generated.
 	ipt := e.stack.IPTables()
-	if ok := ipt.Check(stack.Output, &pkt, gso, r, "", nicName); !ok {
+	if ok := ipt.Check(stack.Output, pkt, gso, r, "", nicName); !ok {
 		// iptables is telling us to drop the packet.
 		return nil
 	}
 
+	// If the packet is manipulated as per NAT Ouput rules, handle packet
+	// based on destination address and do not send the packet to link layer.
+	// TODO(gvisor.dev/issue/170): We should do this for every packet, rather than
+	// only NATted packets, but removing this check short circuits broadcasts
+	// before they are sent out to other hosts.
 	if pkt.NatDone {
-		// If the packet is manipulated as per NAT Ouput rules, handle packet
-		// based on destination address and do not send the packet to link layer.
 		netHeader := header.IPv4(pkt.NetworkHeader)
 		ep, err := e.stack.FindNetworkEndpoint(header.IPv4ProtocolNumber, netHeader.DestinationAddress())
 		if err == nil {
-			src := netHeader.SourceAddress()
-			dst := netHeader.DestinationAddress()
-			route := r.ReverseRoute(src, dst)
-
-			views := make([]buffer.View, 1, 1+len(pkt.Data.Views()))
-			views[0] = pkt.Header.View()
-			views = append(views, pkt.Data.Views()...)
-			packet := stack.PacketBuffer{
-				Data: buffer.NewVectorisedView(len(views[0])+pkt.Data.Size(), views)}
-			ep.HandlePacket(&route, packet)
+			route := r.ReverseRoute(netHeader.SourceAddress(), netHeader.DestinationAddress())
+			ep.HandlePacket(&route, pkt)
 			return nil
 		}
 	}
 
 	if r.Loop&stack.PacketLoop != 0 {
-		// The inbound path expects the network header to still be in
-		// the PacketBuffer's Data field.
-		views := make([]buffer.View, 1, 1+len(pkt.Data.Views()))
-		views[0] = pkt.Header.View()
-		views = append(views, pkt.Data.Views()...)
 		loopedR := r.MakeLoopedRoute()
-
-		e.HandlePacket(&loopedR, stack.PacketBuffer{
-			Data: buffer.NewVectorisedView(len(views[0])+pkt.Data.Size(), views),
-		})
-
+		e.HandlePacket(&loopedR, pkt)
 		loopedR.Release()
 	}
 	if r.Loop&stack.PacketOut == 0 {
@@ -342,23 +329,16 @@ func (e *endpoint) WritePackets(r *stack.Route, gso *stack.GSO, pkts stack.Packe
 		}
 		if _, ok := natPkts[pkt]; ok {
 			netHeader := header.IPv4(pkt.NetworkHeader)
-			ep, err := e.stack.FindNetworkEndpoint(header.IPv4ProtocolNumber, netHeader.DestinationAddress())
-			if err == nil {
+			if ep, err := e.stack.FindNetworkEndpoint(header.IPv4ProtocolNumber, netHeader.DestinationAddress()); err == nil {
 				src := netHeader.SourceAddress()
 				dst := netHeader.DestinationAddress()
 				route := r.ReverseRoute(src, dst)
-
-				views := make([]buffer.View, 1, 1+len(pkt.Data.Views()))
-				views[0] = pkt.Header.View()
-				views = append(views, pkt.Data.Views()...)
-				packet := stack.PacketBuffer{
-					Data: buffer.NewVectorisedView(len(views[0])+pkt.Data.Size(), views)}
-				ep.HandlePacket(&route, packet)
+				ep.HandlePacket(&route, pkt)
 				n++
 				continue
 			}
 		}
-		if err := e.linkEP.WritePacket(r, gso, ProtocolNumber, *pkt); err != nil {
+		if err := e.linkEP.WritePacket(r, gso, ProtocolNumber, pkt); err != nil {
 			r.Stats().IP.PacketsSent.IncrementBy(uint64(n))
 			return n, err
 		}
@@ -370,7 +350,7 @@ func (e *endpoint) WritePackets(r *stack.Route, gso *stack.GSO, pkts stack.Packe
 
 // WriteHeaderIncludedPacket writes a packet already containing a network
 // header through the given route.
-func (e *endpoint) WriteHeaderIncludedPacket(r *stack.Route, pkt stack.PacketBuffer) *tcpip.Error {
+func (e *endpoint) WriteHeaderIncludedPacket(r *stack.Route, pkt *stack.PacketBuffer) *tcpip.Error {
 	// The packet already has an IP header, but there are a few required
 	// checks.
 	h, ok := pkt.Data.PullUp(header.IPv4MinimumSize)
@@ -426,35 +406,23 @@ func (e *endpoint) WriteHeaderIncludedPacket(r *stack.Route, pkt stack.PacketBuf
 
 // HandlePacket is called by the link layer when new ipv4 packets arrive for
 // this endpoint.
-func (e *endpoint) HandlePacket(r *stack.Route, pkt stack.PacketBuffer) {
-	headerView, ok := pkt.Data.PullUp(header.IPv4MinimumSize)
-	if !ok {
+func (e *endpoint) HandlePacket(r *stack.Route, pkt *stack.PacketBuffer) {
+	h := header.IPv4(pkt.NetworkHeader)
+	if !h.IsValid(pkt.Data.Size() + len(pkt.NetworkHeader) + len(pkt.TransportHeader)) {
 		r.Stats().IP.MalformedPacketsReceived.Increment()
 		return
 	}
-	h := header.IPv4(headerView)
-	if !h.IsValid(pkt.Data.Size()) {
-		r.Stats().IP.MalformedPacketsReceived.Increment()
-		return
-	}
-	pkt.NetworkHeader = headerView[:h.HeaderLength()]
-
-	hlen := int(h.HeaderLength())
-	tlen := int(h.TotalLength())
-	pkt.Data.TrimFront(hlen)
-	pkt.Data.CapLength(tlen - hlen)
 
 	// iptables filtering. All packets that reach here are intended for
 	// this machine and will not be forwarded.
 	ipt := e.stack.IPTables()
-	if ok := ipt.Check(stack.Input, &pkt, nil, nil, "", ""); !ok {
+	if ok := ipt.Check(stack.Input, pkt, nil, nil, "", ""); !ok {
 		// iptables is telling us to drop the packet.
 		return
 	}
 
-	more := (h.Flags() & header.IPv4FlagMoreFragments) != 0
-	if more || h.FragmentOffset() != 0 {
-		if pkt.Data.Size() == 0 {
+	if h.More() || h.FragmentOffset() != 0 {
+		if pkt.Data.Size()+len(pkt.TransportHeader) == 0 {
 			// Drop the packet as it's marked as a fragment but has
 			// no payload.
 			r.Stats().IP.MalformedPacketsReceived.Increment()
@@ -473,7 +441,7 @@ func (e *endpoint) HandlePacket(r *stack.Route, pkt stack.PacketBuffer) {
 		}
 		var ready bool
 		var err error
-		pkt.Data, ready, err = e.fragmentation.Process(hash.IPv4FragmentHash(h), h.FragmentOffset(), last, more, pkt.Data)
+		pkt.Data, ready, err = e.fragmentation.Process(hash.IPv4FragmentHash(h), h.FragmentOffset(), last, h.More(), pkt.Data)
 		if err != nil {
 			r.Stats().IP.MalformedPacketsReceived.Increment()
 			r.Stats().IP.MalformedFragmentsReceived.Increment()
@@ -485,7 +453,7 @@ func (e *endpoint) HandlePacket(r *stack.Route, pkt stack.PacketBuffer) {
 	}
 	p := h.TransportProtocol()
 	if p == header.ICMPv4ProtocolNumber {
-		headerView.CapLength(hlen)
+		pkt.NetworkHeader.CapLength(int(h.HeaderLength()))
 		e.handleICMP(r, pkt)
 		return
 	}
@@ -564,6 +532,35 @@ func (*protocol) Close() {}
 
 // Wait implements stack.TransportProtocol.Wait.
 func (*protocol) Wait() {}
+
+// Parse implements stack.TransportProtocol.Parse.
+func (*protocol) Parse(pkt *stack.PacketBuffer) (proto tcpip.TransportProtocolNumber, hasTransportHdr bool, ok bool) {
+	hdr, ok := pkt.Data.PullUp(header.IPv4MinimumSize)
+	if !ok {
+		return 0, false, false
+	}
+	ipHdr := header.IPv4(hdr)
+
+	// If there are options, pull those into hdr as well.
+	if headerLen := int(ipHdr.HeaderLength()); headerLen > header.IPv4MinimumSize && headerLen <= pkt.Data.Size() {
+		hdr, ok = pkt.Data.PullUp(headerLen)
+		if !ok {
+			panic(fmt.Sprintf("There are only %d bytes in pkt.Data, but there should be at least %d", pkt.Data.Size(), headerLen))
+		}
+		ipHdr = header.IPv4(hdr)
+	}
+
+	// If this is a fragment, don't bother parsing the transport header.
+	parseTransportHeader := true
+	if ipHdr.More() || ipHdr.FragmentOffset() != 0 {
+		parseTransportHeader = false
+	}
+
+	pkt.NetworkHeader = hdr
+	pkt.Data.TrimFront(len(hdr))
+	pkt.Data.CapLength(int(ipHdr.TotalLength()) - len(hdr))
+	return ipHdr.TransportProtocol(), parseTransportHeader, true
+}
 
 // calculateMTU calculates the network-layer payload MTU based on the link-layer
 // payload mtu.

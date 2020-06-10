@@ -37,6 +37,7 @@ go_library(
         "//pkg/sentry/socket/netfilter",
         "//pkg/sentry/unimpl",
         "//pkg/sentry/vfs",
+        "//pkg/sentry/vfs/lock",
         "//pkg/sync",
         "//pkg/syserr",
         "//pkg/syserror",
@@ -50,5 +51,6 @@ go_library(
         "//pkg/tcpip/transport/udp",
         "//pkg/usermem",
         "//pkg/waiter",
+        "@org_golang_x_sys//unix:go_default_library",
     ],
 )
