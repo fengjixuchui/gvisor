@@ -47,13 +47,6 @@ var LogPackets uint32 = 1
 // LogPacketsToPCAP must be accessed atomically.
 var LogPacketsToPCAP uint32 = 1
 
-var transportProtocolMinSizes map[tcpip.TransportProtocolNumber]int = map[tcpip.TransportProtocolNumber]int{
-	header.ICMPv4ProtocolNumber: header.IPv4MinimumSize,
-	header.ICMPv6ProtocolNumber: header.IPv6MinimumSize,
-	header.UDPProtocolNumber:    header.UDPMinimumSize,
-	header.TCPProtocolNumber:    header.TCPMinimumSize,
-}
-
 type endpoint struct {
 	dispatcher stack.NetworkDispatcher
 	lower      stack.LinkEndpoint
@@ -287,7 +280,7 @@ func logPacket(prefix string, protocol tcpip.NetworkProtocolNumber, pkt *stack.P
 		vv.TrimFront(header.ARPSize)
 		arp := header.ARP(hdr)
 		log.Infof(
-			"%s arp %v (%v) -> %v (%v) valid:%v",
+			"%s arp %s (%s) -> %s (%s) valid:%t",
 			prefix,
 			tcpip.Address(arp.ProtocolAddressSender()), tcpip.LinkAddress(arp.HardwareAddressSender()),
 			tcpip.Address(arp.ProtocolAddressTarget()), tcpip.LinkAddress(arp.HardwareAddressTarget()),
@@ -296,13 +289,6 @@ func logPacket(prefix string, protocol tcpip.NetworkProtocolNumber, pkt *stack.P
 		return
 	default:
 		log.Infof("%s unknown network protocol", prefix)
-		return
-	}
-
-	// We aren't guaranteed to have a transport header - it's possible for
-	// writes via raw endpoints to contain only network headers.
-	if minSize, ok := transportProtocolMinSizes[tcpip.TransportProtocolNumber(transProto)]; ok && vv.Size() < minSize {
-		log.Infof("%s %v -> %v transport protocol: %d, but no transport header found (possible raw packet)", prefix, src, dst, transProto)
 		return
 	}
 
@@ -346,7 +332,7 @@ func logPacket(prefix string, protocol tcpip.NetworkProtocolNumber, pkt *stack.P
 				icmpType = "info reply"
 			}
 		}
-		log.Infof("%s %s %v -> %v %s len:%d id:%04x code:%d", prefix, transName, src, dst, icmpType, size, id, icmp.Code())
+		log.Infof("%s %s %s -> %s %s len:%d id:%04x code:%d", prefix, transName, src, dst, icmpType, size, id, icmp.Code())
 		return
 
 	case header.ICMPv6ProtocolNumber:
@@ -381,7 +367,7 @@ func logPacket(prefix string, protocol tcpip.NetworkProtocolNumber, pkt *stack.P
 		case header.ICMPv6RedirectMsg:
 			icmpType = "redirect message"
 		}
-		log.Infof("%s %s %v -> %v %s len:%d id:%04x code:%d", prefix, transName, src, dst, icmpType, size, id, icmp.Code())
+		log.Infof("%s %s %s -> %s %s len:%d id:%04x code:%d", prefix, transName, src, dst, icmpType, size, id, icmp.Code())
 		return
 
 	case header.UDPProtocolNumber:
@@ -428,7 +414,7 @@ func logPacket(prefix string, protocol tcpip.NetworkProtocolNumber, pkt *stack.P
 					flagsStr[i] = ' '
 				}
 			}
-			details = fmt.Sprintf("flags:0x%02x (%v) seqnum: %v ack: %v win: %v xsum:0x%x", flags, string(flagsStr), tcp.SequenceNumber(), tcp.AckNumber(), tcp.WindowSize(), tcp.Checksum())
+			details = fmt.Sprintf("flags:0x%02x (%s) seqnum: %d ack: %d win: %d xsum:0x%x", flags, string(flagsStr), tcp.SequenceNumber(), tcp.AckNumber(), tcp.WindowSize(), tcp.Checksum())
 			if flags&header.TCPFlagSyn != 0 {
 				details += fmt.Sprintf(" options: %+v", header.ParseSynOptions(tcp.Options(), flags&header.TCPFlagAck != 0))
 			} else {
@@ -437,7 +423,7 @@ func logPacket(prefix string, protocol tcpip.NetworkProtocolNumber, pkt *stack.P
 		}
 
 	default:
-		log.Infof("%s %v -> %v unknown transport protocol: %d", prefix, src, dst, transProto)
+		log.Infof("%s %s -> %s unknown transport protocol: %d", prefix, src, dst, transProto)
 		return
 	}
 
@@ -445,5 +431,5 @@ func logPacket(prefix string, protocol tcpip.NetworkProtocolNumber, pkt *stack.P
 		details += fmt.Sprintf(" gso: %+v", gso)
 	}
 
-	log.Infof("%s %s %v:%v -> %v:%v len:%d id:%04x %s", prefix, transName, src, srcPort, dst, dstPort, size, id, details)
+	log.Infof("%s %s %s:%d -> %s:%d len:%d id:%04x %s", prefix, transName, src, srcPort, dst, dstPort, size, id, details)
 }

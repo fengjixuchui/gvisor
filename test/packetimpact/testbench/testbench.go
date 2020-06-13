@@ -17,14 +17,18 @@ package testbench
 import (
 	"flag"
 	"fmt"
+	"math/rand"
 	"net"
 	"os/exec"
+	"testing"
 	"time"
 
 	"gvisor.dev/gvisor/test/packetimpact/netdevs"
 )
 
 var (
+	// DUTType is the type of device under test.
+	DUTType = ""
 	// Device is the local device on the test network.
 	Device = ""
 	// LocalIPv4 is the local IPv4 address on the test network.
@@ -63,6 +67,7 @@ func RegisterFlags(fs *flag.FlagSet) {
 	fs.StringVar(&RemoteIPv6, "remote_ipv6", RemoteIPv6, "remote IPv6 address for test packets")
 	fs.StringVar(&RemoteMAC, "remote_mac", RemoteMAC, "remote mac address for test packets")
 	fs.StringVar(&Device, "device", Device, "local device for test packets")
+	fs.StringVar(&DUTType, "dut_type", DUTType, "type of device under test")
 }
 
 // genPseudoFlags populates flag-like global config based on real flags.
@@ -87,4 +92,15 @@ func genPseudoFlags() error {
 	LocalIPv6 = deviceInfo.IPv6Addr.String()
 
 	return nil
+}
+
+// GenerateRandomPayload generates a random byte slice of the specified length,
+// causing a fatal test failure if it is unable to do so.
+func GenerateRandomPayload(t *testing.T, n int) []byte {
+	t.Helper()
+	buf := make([]byte, n)
+	if _, err := rand.Read(buf); err != nil {
+		t.Fatalf("rand.Read(buf) failed: %s", err)
+	}
+	return buf
 }
