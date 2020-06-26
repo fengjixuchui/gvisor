@@ -813,7 +813,8 @@ type OutOfBandInlineOption int
 // a default TTL.
 type DefaultTTLOption uint8
 
-// IPPacketInfo is the message struture for IP_PKTINFO.
+//
+// IPPacketInfo is the message structure for IP_PKTINFO.
 //
 // +stateify savable
 type IPPacketInfo struct {
@@ -1198,6 +1199,9 @@ type UDPStats struct {
 
 	// PacketSendErrors is the number of datagrams failed to be sent.
 	PacketSendErrors *StatCounter
+
+	// ChecksumErrors is the number of datagrams dropped due to bad checksums.
+	ChecksumErrors *StatCounter
 }
 
 // Stats holds statistics about the networking stack.
@@ -1241,6 +1245,9 @@ type ReceiveErrors struct {
 	// ClosedReceiver is the number of received packets dropped because
 	// of receiving endpoint state being closed.
 	ClosedReceiver StatCounter
+
+	// ChecksumErrors is the number of packets dropped due to bad checksums.
+	ChecksumErrors StatCounter
 }
 
 // SendErrors collects packet send errors within the transport layer for

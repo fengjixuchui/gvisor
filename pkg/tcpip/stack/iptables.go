@@ -111,9 +111,8 @@ func DefaultTables() *IPTables {
 			Prerouting: []string{TablenameMangle, TablenameNat},
 			Output:     []string{TablenameMangle, TablenameNat, TablenameFilter},
 		},
-		connections: ConnTrackTable{
-			CtMap: make(map[uint32]ConnTrackTupleHolder),
-			Seed:  generateRandUint32(),
+		connections: ConnTrack{
+			conns: make(map[tupleID]tuple),
 		},
 	}
 }
@@ -170,15 +169,8 @@ func (it *IPTables) GetTable(name string) (Table, bool) {
 func (it *IPTables) ReplaceTable(name string, table Table) {
 	it.mu.Lock()
 	defer it.mu.Unlock()
+	it.modified = true
 	it.tables[name] = table
-}
-
-// ModifyTables acquires write-lock and calls fn with internal name-to-table
-// map. This function can be used to update multiple tables atomically.
-func (it *IPTables) ModifyTables(fn func(map[string]Table)) {
-	it.mu.Lock()
-	defer it.mu.Unlock()
-	fn(it.tables)
 }
 
 // GetPriorities returns slice of priorities associated with hook.
@@ -209,9 +201,18 @@ const (
 //
 // Precondition: pkt.NetworkHeader is set.
 func (it *IPTables) Check(hook Hook, pkt *PacketBuffer, gso *GSO, r *Route, address tcpip.Address, nicName string) bool {
+	// Many users never configure iptables. Spare them the cost of rule
+	// traversal if rules have never been set.
+	it.mu.RLock()
+	if !it.modified {
+		it.mu.RUnlock()
+		return true
+	}
+	it.mu.RUnlock()
+
 	// Packets are manipulated only if connection and matching
 	// NAT rule exists.
-	it.connections.HandlePacket(pkt, hook, gso, r)
+	it.connections.handlePacket(pkt, hook, gso, r)
 
 	// Go through each table containing the hook.
 	for _, tablename := range it.GetPriorities(hook) {

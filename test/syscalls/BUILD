@@ -33,6 +33,7 @@ syscall_test(
 syscall_test(
     add_overlay = True,
     test = "//test/syscalls/linux:aio_test",
+    vfs2 = "True",
 )
 
 syscall_test(
@@ -56,6 +57,7 @@ syscall_test(
     size = "large",
     add_overlay = True,
     test = "//test/syscalls/linux:bind_test",
+    vfs2 = "True",
 )
 
 syscall_test(
@@ -65,6 +67,11 @@ syscall_test(
 
 syscall_test(
     test = "//test/syscalls/linux:socket_test",
+    vfs2 = "True",
+)
+
+syscall_test(
+    test = "//test/syscalls/linux:socket_capability_test",
     vfs2 = "True",
 )
 
@@ -101,6 +108,7 @@ syscall_test(
 syscall_test(
     add_overlay = True,
     test = "//test/syscalls/linux:chroot_test",
+    vfs2 = "True",
 )
 
 syscall_test(
@@ -139,6 +147,7 @@ syscall_test(
 
 syscall_test(
     test = "//test/syscalls/linux:dev_test",
+    vfs2 = "True",
 )
 
 syscall_test(
@@ -173,6 +182,7 @@ syscall_test(
     size = "medium",
     add_overlay = True,
     test = "//test/syscalls/linux:exec_binary_test",
+    vfs2 = "True",
 )
 
 syscall_test(
@@ -183,6 +193,7 @@ syscall_test(
 syscall_test(
     add_overlay = True,
     test = "//test/syscalls/linux:fadvise64_test",
+    vfs2 = "True",
 )
 
 syscall_test(
@@ -210,6 +221,7 @@ syscall_test(
     size = "medium",
     add_overlay = True,
     test = "//test/syscalls/linux:flock_test",
+    vfs2 = "True",
 )
 
 syscall_test(
@@ -230,6 +242,7 @@ syscall_test(
 syscall_test(
     add_overlay = True,
     test = "//test/syscalls/linux:fsync_test",
+    vfs2 = "True",
 )
 
 syscall_test(
@@ -252,6 +265,7 @@ syscall_test(
 syscall_test(
     add_overlay = True,
     test = "//test/syscalls/linux:getdents_test",
+    vfs2 = "True",
 )
 
 syscall_test(
@@ -297,6 +311,7 @@ syscall_test(
     add_overlay = True,
     test = "//test/syscalls/linux:link_test",
     use_tmpfs = True,  # gofer needs CAP_DAC_READ_SEARCH to use AT_EMPTY_PATH with linkat(2)
+    vfs2 = "True",
 )
 
 syscall_test(
@@ -345,6 +360,7 @@ syscall_test(
 syscall_test(
     add_overlay = True,
     test = "//test/syscalls/linux:mount_test",
+    vfs2 = "True",
 )
 
 syscall_test(
@@ -452,6 +468,7 @@ syscall_test(
 syscall_test(
     add_overlay = True,
     test = "//test/syscalls/linux:preadv2_test",
+    vfs2 = "True",
 )
 
 syscall_test(
@@ -462,6 +479,7 @@ syscall_test(
 syscall_test(
     size = "medium",
     test = "//test/syscalls/linux:proc_test",
+    vfs2 = "True",
 )
 
 syscall_test(
@@ -481,6 +499,7 @@ syscall_test(
 
 syscall_test(
     test = "//test/syscalls/linux:proc_pid_uid_gid_map_test",
+    vfs2 = "True",
 )
 
 syscall_test(
@@ -541,6 +560,7 @@ syscall_test(
 syscall_test(
     add_overlay = True,
     test = "//test/syscalls/linux:readahead_test",
+    vfs2 = "True",
 )
 
 syscall_test(
@@ -561,6 +581,7 @@ syscall_test(
     size = "medium",
     add_overlay = True,
     test = "//test/syscalls/linux:rename_test",
+    vfs2 = "True",
 )
 
 syscall_test(
@@ -690,6 +711,7 @@ syscall_test(
     size = "medium",
     add_overlay = True,
     test = "//test/syscalls/linux:socket_filesystem_non_blocking_test",
+    vfs2 = "True",
 )
 
 syscall_test(
@@ -697,12 +719,14 @@ syscall_test(
     add_overlay = True,
     shard_count = 50,
     test = "//test/syscalls/linux:socket_filesystem_test",
+    vfs2 = "True",
 )
 
 syscall_test(
     size = "large",
     shard_count = 50,
     test = "//test/syscalls/linux:socket_inet_loopback_test",
+    vfs2 = "True",
 )
 
 syscall_test(
@@ -711,6 +735,7 @@ syscall_test(
     # Takes too long for TSAN. Creates a lot of TCP sockets.
     tags = ["nogotsan"],
     test = "//test/syscalls/linux:socket_inet_loopback_nogotsan_test",
+    vfs2 = "True",
 )
 
 syscall_test(
@@ -786,6 +811,7 @@ syscall_test(
 
 syscall_test(
     test = "//test/syscalls/linux:socket_blocking_local_test",
+    vfs2 = "True",
 )
 
 syscall_test(
@@ -795,6 +821,7 @@ syscall_test(
 
 syscall_test(
     test = "//test/syscalls/linux:socket_non_stream_blocking_local_test",
+    vfs2 = "True",
 )
 
 syscall_test(
@@ -805,6 +832,7 @@ syscall_test(
 syscall_test(
     size = "large",
     test = "//test/syscalls/linux:socket_stream_blocking_local_test",
+    vfs2 = "True",
 )
 
 syscall_test(
@@ -816,11 +844,13 @@ syscall_test(
 syscall_test(
     size = "medium",
     test = "//test/syscalls/linux:socket_stream_local_test",
+    vfs2 = "True",
 )
 
 syscall_test(
     size = "medium",
     test = "//test/syscalls/linux:socket_stream_nonblock_local_test",
+    vfs2 = "True",
 )
 
 syscall_test(
@@ -828,6 +858,7 @@ syscall_test(
     size = "enormous",
     shard_count = 5,
     test = "//test/syscalls/linux:socket_unix_dgram_local_test",
+    vfs2 = "True",
 )
 
 syscall_test(
@@ -849,11 +880,13 @@ syscall_test(
     size = "enormous",
     shard_count = 5,
     test = "//test/syscalls/linux:socket_unix_seqpacket_local_test",
+    vfs2 = "True",
 )
 
 syscall_test(
     size = "medium",
     test = "//test/syscalls/linux:socket_unix_stream_test",
+    vfs2 = "True",
 )
 
 syscall_test(
@@ -871,6 +904,7 @@ syscall_test(
 syscall_test(
     size = "medium",
     test = "//test/syscalls/linux:socket_unix_unbound_filesystem_test",
+    vfs2 = "True",
 )
 
 syscall_test(
@@ -884,6 +918,7 @@ syscall_test(
     size = "large",
     shard_count = 50,
     test = "//test/syscalls/linux:socket_unix_unbound_stream_test",
+    vfs2 = "True",
 )
 
 syscall_test(
@@ -895,6 +930,7 @@ syscall_test(
 syscall_test(
     add_overlay = True,
     test = "//test/syscalls/linux:stat_test",
+    vfs2 = "True",
 )
 
 syscall_test(
@@ -911,6 +947,7 @@ syscall_test(
 syscall_test(
     add_overlay = True,
     test = "//test/syscalls/linux:symlink_test",
+    vfs2 = "True",
 )
 
 syscall_test(
@@ -978,6 +1015,7 @@ syscall_test(
 
 syscall_test(
     test = "//test/syscalls/linux:tuntap_test",
+    vfs2 = "True",
 )
 
 syscall_test(
@@ -1061,6 +1099,7 @@ syscall_test(
 
 syscall_test(
     test = "//test/syscalls/linux:proc_net_unix_test",
+    vfs2 = "True",
 )
 
 syscall_test(

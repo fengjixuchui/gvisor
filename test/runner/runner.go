@@ -352,11 +352,15 @@ func runTestCaseRunsc(testBin string, tc gtest.TestCase, t *testing.T) {
 
 	// Set environment variables that indicate we are running in gVisor with
 	// the given platform, network, and filesystem stack.
-	// TODO(gvisor.dev/issue/1487): Update this when the runner supports VFS2.
 	platformVar := "TEST_ON_GVISOR"
 	networkVar := "GVISOR_NETWORK"
+	env := append(os.Environ(), platformVar+"="+*platform, networkVar+"="+*network)
 	vfsVar := "GVISOR_VFS"
-	env := append(os.Environ(), platformVar+"="+*platform, networkVar+"="+*network, vfsVar+"=VFS1")
+	if *vfs2 {
+		env = append(env, vfsVar+"=VFS2")
+	} else {
+		env = append(env, vfsVar+"=VFS1")
+	}
 
 	// Remove env variables that cause the gunit binary to write output
 	// files, since they will stomp on eachother, and on the output files
@@ -387,12 +391,12 @@ func runTestCaseRunsc(testBin string, tc gtest.TestCase, t *testing.T) {
 	}
 }
 
-// filterEnv returns an environment with the blacklisted variables removed.
-func filterEnv(env, blacklist []string) []string {
+// filterEnv returns an environment with the excluded variables removed.
+func filterEnv(env, exclude []string) []string {
 	var out []string
 	for _, kv := range env {
 		ok := true
-		for _, k := range blacklist {
+		for _, k := range exclude {
 			if strings.HasPrefix(kv, k+"=") {
 				ok = false
 				break

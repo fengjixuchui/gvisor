@@ -23,7 +23,6 @@ import (
 	"gvisor.dev/gvisor/pkg/refs"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
-	"gvisor.dev/gvisor/pkg/sentry/vfs/lock"
 	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/syserror"
 )
@@ -294,6 +293,8 @@ func (a *InodeAttrs) SetStat(ctx context.Context, fs *vfs.Filesystem, creds *aut
 	// inode numbers are immutable after node creation.
 
 	// TODO(gvisor.dev/issue/1193): Implement other stat fields like timestamps.
+	// Also, STATX_SIZE will need some special handling, because read-only static
+	// files should return EIO for truncate operations.
 
 	return nil
 }
@@ -557,7 +558,7 @@ type StaticDirectory struct {
 	InodeNoDynamicLookup
 	OrderedChildren
 
-	locks lock.FileLocks
+	locks vfs.FileLocks
 }
 
 var _ Inode = (*StaticDirectory)(nil)

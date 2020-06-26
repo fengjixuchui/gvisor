@@ -1,4 +1,4 @@
-// Copyright 2019 The gVisor Authors.
+// Copyright 2018 The gVisor Authors.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,26 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package main
+package tests
 
-import (
-	"flag"
-	"os"
-	"testing"
-)
+// +stateify savable
+type alreadyRegisteredStruct struct{}
 
-func TestMain(m *testing.M) {
-	flag.Parse()
-	os.Exit(m.Run())
-}
-
-// Test that the blacklist parses without error.
-func TestBlacklists(t *testing.T) {
-	bl, err := getBlacklist()
-	if err != nil {
-		t.Fatalf("error parsing blacklist: %v", err)
-	}
-	if *blacklistFile != "" && len(bl) == 0 {
-		t.Errorf("got empty blacklist for file %q", *blacklistFile)
-	}
-}
+// +stateify savable
+type alreadyRegisteredOther int

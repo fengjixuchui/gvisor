@@ -72,7 +72,9 @@ func (fd *regularFileFD) PRead(ctx context.Context, dst usermem.IOSequence, offs
 	if offset < 0 {
 		return 0, syserror.EINVAL
 	}
-	if opts.Flags != 0 {
+
+	// Check that flags are supported. Silently ignore RWF_HIPRI.
+	if opts.Flags&^linux.RWF_HIPRI != 0 {
 		return 0, syserror.EOPNOTSUPP
 	}
 
@@ -123,9 +125,12 @@ func (fd *regularFileFD) PWrite(ctx context.Context, src usermem.IOSequence, off
 	if offset < 0 {
 		return 0, syserror.EINVAL
 	}
-	if opts.Flags != 0 {
+
+	// Check that flags are supported. Silently ignore RWF_HIPRI.
+	if opts.Flags&^linux.RWF_HIPRI != 0 {
 		return 0, syserror.EOPNOTSUPP
 	}
+
 	limit, err := vfs.CheckLimit(ctx, offset, src.NumBytes())
 	if err != nil {
 		return 0, err
@@ -489,15 +494,24 @@ func (d *dentry) writeback(ctx context.Context, offset, size int64) error {
 func (fd *regularFileFD) Seek(ctx context.Context, offset int64, whence int32) (int64, error) {
 	fd.mu.Lock()
 	defer fd.mu.Unlock()
+	newOffset, err := regularFileSeekLocked(ctx, fd.dentry(), fd.off, offset, whence)
+	if err != nil {
+		return 0, err
+	}
+	fd.off = newOffset
+	return newOffset, nil
+}
+
+// Calculate the new offset for a seek operation on a regular file.
+func regularFileSeekLocked(ctx context.Context, d *dentry, fdOffset, offset int64, whence int32) (int64, error) {
 	switch whence {
 	case linux.SEEK_SET:
 		// Use offset as specified.
 	case linux.SEEK_CUR:
-		offset += fd.off
+		offset += fdOffset
 	case linux.SEEK_END, linux.SEEK_DATA, linux.SEEK_HOLE:
 		// Ensure file size is up to date.
-		d := fd.dentry()
-		if fd.filesystem().opts.interop == InteropModeShared {
+		if !d.cachedMetadataAuthoritative() {
 			if err := d.updateFromGetattr(ctx); err != nil {
 				return 0, err
 			}
@@ -525,7 +539,6 @@ func (fd *regularFileFD) Seek(ctx context.Context, offset int64, whence int32) (
 	if offset < 0 {
 		return 0, syserror.EINVAL
 	}
-	fd.off = offset
 	return offset, nil
 }
 

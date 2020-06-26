@@ -32,9 +32,24 @@ import (
 const (
 	// ProtocolNumber is the udp protocol number.
 	ProtocolNumber = header.UDPProtocolNumber
+
+	// MinBufferSize is the smallest size of a receive or send buffer.
+	MinBufferSize = 4 << 10 // 4KiB bytes.
+
+	// DefaultSendBufferSize is the default size of the send buffer for
+	// an endpoint.
+	DefaultSendBufferSize = 32 << 10 // 32KiB
+
+	// DefaultReceiveBufferSize is the default size of the receive buffer
+	// for an endpoint.
+	DefaultReceiveBufferSize = 32 << 10 // 32KiB
+
+	// MaxBufferSize is the largest size a receive/send buffer can grow to.
+	MaxBufferSize = 4 << 20 // 4MiB
 )
 
-type protocol struct{}
+type protocol struct {
+}
 
 // Number returns the udp protocol number.
 func (*protocol) Number() tcpip.TransportProtocolNumber {
@@ -183,12 +198,12 @@ func (p *protocol) HandleUnknownDestinationPacket(r *stack.Route, id stack.Trans
 }
 
 // SetOption implements stack.TransportProtocol.SetOption.
-func (*protocol) SetOption(option interface{}) *tcpip.Error {
+func (p *protocol) SetOption(option interface{}) *tcpip.Error {
 	return tcpip.ErrUnknownProtocolOption
 }
 
 // Option implements stack.TransportProtocol.Option.
-func (*protocol) Option(option interface{}) *tcpip.Error {
+func (p *protocol) Option(option interface{}) *tcpip.Error {
 	return tcpip.ErrUnknownProtocolOption
 }
 

@@ -29,6 +29,7 @@
 #include "absl/strings/str_cat.h"
 #include "absl/strings/str_format.h"
 #include "absl/strings/str_join.h"
+#include "absl/synchronization/mutex.h"
 #include "absl/time/clock.h"
 #include "absl/time/time.h"
 #include "test/util/epoll_util.h"
@@ -1305,7 +1306,7 @@ TEST(Inotify, UtimesGeneratesAttribEvent) {
   const int wd = ASSERT_NO_ERRNO_AND_VALUE(
       InotifyAddWatch(fd.get(), root.path(), IN_ALL_EVENTS));
 
-  struct timeval times[2] = {{1, 0}, {2, 0}};
+  const struct timeval times[2] = {{1, 0}, {2, 0}};
   EXPECT_THAT(futimes(file1_fd.get(), times), SyscallSucceeds());
 
   const std::vector<Event> events =
@@ -1839,9 +1840,7 @@ TEST(Inotify, IncludeUnlinkedFile_NoRandomSave) {
   const TempPath dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
   const TempPath file = ASSERT_NO_ERRNO_AND_VALUE(
       TempPath::CreateFileWith(dir.path(), "123", TempPath::kDefaultFileMode));
-
-  const FileDescriptor fd =
-      ASSERT_NO_ERRNO_AND_VALUE(Open(file.path(), O_RDWR));
+  FileDescriptor fd = ASSERT_NO_ERRNO_AND_VALUE(Open(file.path(), O_RDWR));
 
   const FileDescriptor inotify_fd =
       ASSERT_NO_ERRNO_AND_VALUE(InotifyInit1(IN_NONBLOCK));
@@ -1854,7 +1853,7 @@ TEST(Inotify, IncludeUnlinkedFile_NoRandomSave) {
   int val = 0;
   ASSERT_THAT(read(fd.get(), &val, sizeof(val)), SyscallSucceeds());
   ASSERT_THAT(write(fd.get(), &val, sizeof(val)), SyscallSucceeds());
-  const std::vector<Event> events =
+  std::vector<Event> events =
       ASSERT_NO_ERRNO_AND_VALUE(DrainEvents(inotify_fd.get()));
   EXPECT_THAT(events, Are({
                           Event(IN_ATTRIB, file_wd),
@@ -1863,6 +1862,15 @@ TEST(Inotify, IncludeUnlinkedFile_NoRandomSave) {
                           Event(IN_ACCESS, file_wd),
                           Event(IN_MODIFY, dir_wd, Basename(file.path())),
                           Event(IN_MODIFY, file_wd),
+                      }));
+
+  fd.reset();
+  events = ASSERT_NO_ERRNO_AND_VALUE(DrainEvents(inotify_fd.get()));
+  EXPECT_THAT(events, Are({
+                          Event(IN_CLOSE_WRITE, dir_wd, Basename(file.path())),
+                          Event(IN_CLOSE_WRITE, file_wd),
+                          Event(IN_DELETE_SELF, file_wd),
+                          Event(IN_IGNORED, file_wd),
                       }));
 }
 
@@ -1880,13 +1888,14 @@ TEST(Inotify, ExcludeUnlink_NoRandomSave) {
   const TempPath file =
       ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateFileIn(dir.path()));
 
-  const FileDescriptor fd =
-      ASSERT_NO_ERRNO_AND_VALUE(Open(file.path(), O_RDWR));
+  FileDescriptor fd = ASSERT_NO_ERRNO_AND_VALUE(Open(file.path(), O_RDWR));
 
   const FileDescriptor inotify_fd =
       ASSERT_NO_ERRNO_AND_VALUE(InotifyInit1(IN_NONBLOCK));
-  const int wd = ASSERT_NO_ERRNO_AND_VALUE(InotifyAddWatch(
+  const int dir_wd = ASSERT_NO_ERRNO_AND_VALUE(InotifyAddWatch(
       inotify_fd.get(), dir.path(), IN_ALL_EVENTS | IN_EXCL_UNLINK));
+  const int file_wd = ASSERT_NO_ERRNO_AND_VALUE(InotifyAddWatch(
+      inotify_fd.get(), file.path(), IN_ALL_EVENTS | IN_EXCL_UNLINK));
 
   // Unlink the child, which should cause further operations on the open file
   // descriptor to be ignored.
@@ -1894,14 +1903,28 @@ TEST(Inotify, ExcludeUnlink_NoRandomSave) {
   int val = 0;
   ASSERT_THAT(write(fd.get(), &val, sizeof(val)), SyscallSucceeds());
   ASSERT_THAT(read(fd.get(), &val, sizeof(val)), SyscallSucceeds());
-  const std::vector<Event> events =
+  std::vector<Event> events =
       ASSERT_NO_ERRNO_AND_VALUE(DrainEvents(inotify_fd.get()));
-  EXPECT_THAT(events, Are({Event(IN_DELETE, wd, Basename(file.path()))}));
+  EXPECT_THAT(events, Are({
+                          Event(IN_ATTRIB, file_wd),
+                          Event(IN_DELETE, dir_wd, Basename(file.path())),
+                      }));
+
+  fd.reset();
+  events = ASSERT_NO_ERRNO_AND_VALUE(DrainEvents(inotify_fd.get()));
+  ASSERT_THAT(events, Are({
+                          Event(IN_DELETE_SELF, file_wd),
+                          Event(IN_IGNORED, file_wd),
+                      }));
 }
 
 // We need to disable S/R because there are filesystems where we cannot re-open
 // fds to an unlinked file across S/R, e.g. gofer-backed filesytems.
 TEST(Inotify, ExcludeUnlinkDirectory_NoRandomSave) {
+  // TODO(gvisor.dev/issue/1624): This test fails on VFS1. Remove once VFS1 is
+  // deleted.
+  SKIP_IF(IsRunningWithVFS1());
+
   const DisableSave ds;
 
   const TempPath parent = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
@@ -1911,20 +1934,29 @@ TEST(Inotify, ExcludeUnlinkDirectory_NoRandomSave) {
   const FileDescriptor inotify_fd =
       ASSERT_NO_ERRNO_AND_VALUE(InotifyInit1(IN_NONBLOCK));
 
-  const FileDescriptor fd =
+  FileDescriptor fd =
       ASSERT_NO_ERRNO_AND_VALUE(Open(dirPath.c_str(), O_RDONLY | O_DIRECTORY));
-  const int wd = ASSERT_NO_ERRNO_AND_VALUE(InotifyAddWatch(
+  const int parent_wd = ASSERT_NO_ERRNO_AND_VALUE(InotifyAddWatch(
       inotify_fd.get(), parent.path(), IN_ALL_EVENTS | IN_EXCL_UNLINK));
+  const int self_wd = ASSERT_NO_ERRNO_AND_VALUE(InotifyAddWatch(
+      inotify_fd.get(), dir.path(), IN_ALL_EVENTS | IN_EXCL_UNLINK));
 
   // Unlink the dir, and then close the open fd.
   ASSERT_THAT(rmdir(dirPath.c_str()), SyscallSucceeds());
   dir.reset();
 
-  const std::vector<Event> events =
+  std::vector<Event> events =
       ASSERT_NO_ERRNO_AND_VALUE(DrainEvents(inotify_fd.get()));
   // No close event should appear.
   ASSERT_THAT(events,
-              Are({Event(IN_DELETE | IN_ISDIR, wd, Basename(dirPath))}));
+              Are({Event(IN_DELETE | IN_ISDIR, parent_wd, Basename(dirPath))}));
+
+  fd.reset();
+  events = ASSERT_NO_ERRNO_AND_VALUE(DrainEvents(inotify_fd.get()));
+  ASSERT_THAT(events, Are({
+                          Event(IN_DELETE_SELF, self_wd),
+                          Event(IN_IGNORED, self_wd),
+                      }));
 }
 
 // If "dir/child" and "dir/child2" are links to the same file, and "dir/child"
@@ -1988,10 +2020,6 @@ TEST(Inotify, ExcludeUnlinkInodeEvents_NoRandomSave) {
 
   const FileDescriptor fd =
       ASSERT_NO_ERRNO_AND_VALUE(Open(file.path().c_str(), O_RDWR));
-  const FileDescriptor inotify_fd =
-      ASSERT_NO_ERRNO_AND_VALUE(InotifyInit1(IN_NONBLOCK));
-  const int wd = ASSERT_NO_ERRNO_AND_VALUE(InotifyAddWatch(
-      inotify_fd.get(), dir.path(), IN_ALL_EVENTS | IN_EXCL_UNLINK));
 
   // NOTE(b/157163751): Create another link before unlinking. This is needed for
   // the gofer filesystem in gVisor, where open fds will not work once the link
@@ -2005,6 +2033,13 @@ TEST(Inotify, ExcludeUnlinkInodeEvents_NoRandomSave) {
     ASSERT_THAT(rc, SyscallSucceeds());
   }
 
+  const FileDescriptor inotify_fd =
+      ASSERT_NO_ERRNO_AND_VALUE(InotifyInit1(IN_NONBLOCK));
+  const int dir_wd = ASSERT_NO_ERRNO_AND_VALUE(InotifyAddWatch(
+      inotify_fd.get(), dir.path(), IN_ALL_EVENTS | IN_EXCL_UNLINK));
+  const int file_wd = ASSERT_NO_ERRNO_AND_VALUE(InotifyAddWatch(
+      inotify_fd.get(), file.path(), IN_ALL_EVENTS | IN_EXCL_UNLINK));
+
   // Even after unlinking, inode-level operations will trigger events regardless
   // of IN_EXCL_UNLINK.
   ASSERT_THAT(unlink(file.path().c_str()), SyscallSucceeds());
@@ -2014,20 +2049,274 @@ TEST(Inotify, ExcludeUnlinkInodeEvents_NoRandomSave) {
   std::vector<Event> events =
       ASSERT_NO_ERRNO_AND_VALUE(DrainEvents(inotify_fd.get()));
   EXPECT_THAT(events, Are({
-                          Event(IN_DELETE, wd, Basename(file.path())),
-                          Event(IN_MODIFY, wd, Basename(file.path())),
+                          Event(IN_ATTRIB, file_wd),
+                          Event(IN_DELETE, dir_wd, Basename(file.path())),
+                          Event(IN_MODIFY, dir_wd, Basename(file.path())),
+                          Event(IN_MODIFY, file_wd),
                       }));
 
-  struct timeval times[2] = {{1, 0}, {2, 0}};
+  const struct timeval times[2] = {{1, 0}, {2, 0}};
   ASSERT_THAT(futimes(fd.get(), times), SyscallSucceeds());
   events = ASSERT_NO_ERRNO_AND_VALUE(DrainEvents(inotify_fd.get()));
-  EXPECT_THAT(events, Are({Event(IN_ATTRIB, wd, Basename(file.path()))}));
+  EXPECT_THAT(events, Are({
+                          Event(IN_ATTRIB, dir_wd, Basename(file.path())),
+                          Event(IN_ATTRIB, file_wd),
+                      }));
 
   // S/R is disabled on this entire test due to behavior with unlink; it must
   // also be disabled after this point because of fchmod.
   ASSERT_THAT(fchmod(fd.get(), 0777), SyscallSucceeds());
   events = ASSERT_NO_ERRNO_AND_VALUE(DrainEvents(inotify_fd.get()));
-  EXPECT_THAT(events, Are({Event(IN_ATTRIB, wd, Basename(file.path()))}));
+  EXPECT_THAT(events, Are({
+                          Event(IN_ATTRIB, dir_wd, Basename(file.path())),
+                          Event(IN_ATTRIB, file_wd),
+                      }));
+}
+
+// This test helps verify that the lock order of filesystem and inotify locks
+// is respected when inotify instances and watch targets are concurrently being
+// destroyed.
+TEST(InotifyTest, InotifyAndTargetDestructionDoNotDeadlock_NoRandomSave) {
+  const DisableSave ds;  // Too many syscalls.
+
+  // A file descriptor protected by a mutex. This ensures that while a
+  // descriptor is in use, it cannot be closed and reused for a different file
+  // description.
+  struct atomic_fd {
+    int fd;
+    absl::Mutex mu;
+  };
+
+  // Set up initial inotify instances.
+  constexpr int num_fds = 3;
+  std::vector<atomic_fd> fds(num_fds);
+  for (int i = 0; i < num_fds; i++) {
+    int fd;
+    ASSERT_THAT(fd = inotify_init1(IN_NONBLOCK), SyscallSucceeds());
+    fds[i].fd = fd;
+  }
+
+  // Set up initial watch targets.
+  std::vector<std::string> paths;
+  for (int i = 0; i < 3; i++) {
+    paths.push_back(NewTempAbsPath());
+    ASSERT_THAT(mknod(paths[i].c_str(), S_IFREG | 0600, 0), SyscallSucceeds());
+  }
+
+  constexpr absl::Duration runtime = absl::Seconds(4);
+
+  // Constantly replace each inotify instance with a new one.
+  auto replace_fds = [&] {
+    for (auto start = absl::Now(); absl::Now() - start < runtime;) {
+      for (auto& afd : fds) {
+        int new_fd;
+        ASSERT_THAT(new_fd = inotify_init1(IN_NONBLOCK), SyscallSucceeds());
+        absl::MutexLock l(&afd.mu);
+        ASSERT_THAT(close(afd.fd), SyscallSucceeds());
+        afd.fd = new_fd;
+        for (auto& p : paths) {
+          // inotify_add_watch may fail if the file at p was deleted.
+          ASSERT_THAT(inotify_add_watch(afd.fd, p.c_str(), IN_ALL_EVENTS),
+                      AnyOf(SyscallSucceeds(), SyscallFailsWithErrno(ENOENT)));
+        }
+      }
+      sched_yield();
+    }
+  };
+
+  std::list<ScopedThread> ts;
+  for (int i = 0; i < 3; i++) {
+    ts.emplace_back(replace_fds);
+  }
+
+  // Constantly replace each watch target with a new one.
+  for (auto start = absl::Now(); absl::Now() - start < runtime;) {
+    for (auto& p : paths) {
+      ASSERT_THAT(unlink(p.c_str()), SyscallSucceeds());
+      ASSERT_THAT(mknod(p.c_str(), S_IFREG | 0600, 0), SyscallSucceeds());
+    }
+    sched_yield();
+  }
+}
+
+// This test helps verify that the lock order of filesystem and inotify locks
+// is respected when adding/removing watches occurs concurrently with the
+// removal of their targets.
+TEST(InotifyTest, AddRemoveUnlinkDoNotDeadlock_NoRandomSave) {
+  const DisableSave ds;  // Too many syscalls.
+
+  // Set up inotify instances.
+  constexpr int num_fds = 3;
+  std::vector<int> fds(num_fds);
+  for (int i = 0; i < num_fds; i++) {
+    ASSERT_THAT(fds[i] = inotify_init1(IN_NONBLOCK), SyscallSucceeds());
+  }
+
+  // Set up initial watch targets.
+  std::vector<std::string> paths;
+  for (int i = 0; i < 3; i++) {
+    paths.push_back(NewTempAbsPath());
+    ASSERT_THAT(mknod(paths[i].c_str(), S_IFREG | 0600, 0), SyscallSucceeds());
+  }
+
+  constexpr absl::Duration runtime = absl::Seconds(1);
+
+  // Constantly add/remove watches for each inotify instance/watch target pair.
+  auto add_remove_watches = [&] {
+    for (auto start = absl::Now(); absl::Now() - start < runtime;) {
+      for (int fd : fds) {
+        for (auto& p : paths) {
+          // Do not assert on inotify_add_watch and inotify_rm_watch. They may
+          // fail if the file at p was deleted. inotify_add_watch may also fail
+          // if another thread beat us to adding a watch.
+          const int wd = inotify_add_watch(fd, p.c_str(), IN_ALL_EVENTS);
+          if (wd > 0) {
+            inotify_rm_watch(fd, wd);
+          }
+        }
+      }
+      sched_yield();
+    }
+  };
+
+  std::list<ScopedThread> ts;
+  for (int i = 0; i < 15; i++) {
+    ts.emplace_back(add_remove_watches);
+  }
+
+  // Constantly replace each watch target with a new one.
+  for (auto start = absl::Now(); absl::Now() - start < runtime;) {
+    for (auto& p : paths) {
+      ASSERT_THAT(unlink(p.c_str()), SyscallSucceeds());
+      ASSERT_THAT(mknod(p.c_str(), S_IFREG | 0600, 0), SyscallSucceeds());
+    }
+    sched_yield();
+  }
+}
+
+// This test helps verify that the lock order of filesystem and inotify locks
+// is respected when many inotify events and filesystem operations occur
+// simultaneously.
+TEST(InotifyTest, NotifyNoDeadlock_NoRandomSave) {
+  const DisableSave ds;  // Too many syscalls.
+
+  const TempPath parent = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  const std::string dir = parent.path();
+
+  // mu protects file, which will change on rename.
+  absl::Mutex mu;
+  std::string file = NewTempAbsPathInDir(dir);
+  ASSERT_THAT(mknod(file.c_str(), 0644 | S_IFREG, 0), SyscallSucceeds());
+
+  const absl::Duration runtime = absl::Milliseconds(300);
+
+  // Add/remove watches on dir and file.
+  ScopedThread add_remove_watches([&] {
+    const FileDescriptor ifd =
+        ASSERT_NO_ERRNO_AND_VALUE(InotifyInit1(IN_NONBLOCK));
+    int dir_wd = ASSERT_NO_ERRNO_AND_VALUE(
+        InotifyAddWatch(ifd.get(), dir, IN_ALL_EVENTS));
+    int file_wd;
+    {
+      absl::ReaderMutexLock l(&mu);
+      file_wd = ASSERT_NO_ERRNO_AND_VALUE(
+          InotifyAddWatch(ifd.get(), file, IN_ALL_EVENTS));
+    }
+    for (auto start = absl::Now(); absl::Now() - start < runtime;) {
+      ASSERT_THAT(inotify_rm_watch(ifd.get(), file_wd), SyscallSucceeds());
+      ASSERT_THAT(inotify_rm_watch(ifd.get(), dir_wd), SyscallSucceeds());
+      dir_wd = ASSERT_NO_ERRNO_AND_VALUE(
+          InotifyAddWatch(ifd.get(), dir, IN_ALL_EVENTS));
+      {
+        absl::ReaderMutexLock l(&mu);
+        file_wd = ASSERT_NO_ERRNO_AND_VALUE(
+            InotifyAddWatch(ifd.get(), file, IN_ALL_EVENTS));
+      }
+      sched_yield();
+    }
+  });
+
+  // Modify attributes on dir and file.
+  ScopedThread stats([&] {
+    int fd, dir_fd;
+    {
+      absl::ReaderMutexLock l(&mu);
+      ASSERT_THAT(fd = open(file.c_str(), O_RDONLY), SyscallSucceeds());
+    }
+    ASSERT_THAT(dir_fd = open(dir.c_str(), O_RDONLY | O_DIRECTORY),
+                SyscallSucceeds());
+    const struct timeval times[2] = {{1, 0}, {2, 0}};
+
+    for (auto start = absl::Now(); absl::Now() - start < runtime;) {
+      {
+        absl::ReaderMutexLock l(&mu);
+        EXPECT_THAT(utimes(file.c_str(), times), SyscallSucceeds());
+      }
+      EXPECT_THAT(futimes(fd, times), SyscallSucceeds());
+      EXPECT_THAT(utimes(dir.c_str(), times), SyscallSucceeds());
+      EXPECT_THAT(futimes(dir_fd, times), SyscallSucceeds());
+      sched_yield();
+    }
+  });
+
+  // Modify extended attributes on dir and file.
+  ScopedThread xattrs([&] {
+    // TODO(gvisor.dev/issue/1636): Support extended attributes in runsc gofer.
+    if (!IsRunningOnGvisor()) {
+      int fd;
+      {
+        absl::ReaderMutexLock l(&mu);
+        ASSERT_THAT(fd = open(file.c_str(), O_RDONLY), SyscallSucceeds());
+      }
+
+      const char* name = "user.test";
+      int val = 123;
+      for (auto start = absl::Now(); absl::Now() - start < runtime;) {
+        {
+          absl::ReaderMutexLock l(&mu);
+          ASSERT_THAT(
+              setxattr(file.c_str(), name, &val, sizeof(val), /*flags=*/0),
+              SyscallSucceeds());
+          ASSERT_THAT(removexattr(file.c_str(), name), SyscallSucceeds());
+        }
+
+        ASSERT_THAT(fsetxattr(fd, name, &val, sizeof(val), /*flags=*/0),
+                    SyscallSucceeds());
+        ASSERT_THAT(fremovexattr(fd, name), SyscallSucceeds());
+        sched_yield();
+      }
+    }
+  });
+
+  // Read and write file's contents. Read and write dir's entries.
+  ScopedThread read_write([&] {
+    int fd;
+    {
+      absl::ReaderMutexLock l(&mu);
+      ASSERT_THAT(fd = open(file.c_str(), O_RDWR), SyscallSucceeds());
+    }
+    for (auto start = absl::Now(); absl::Now() - start < runtime;) {
+      int val = 123;
+      ASSERT_THAT(write(fd, &val, sizeof(val)), SyscallSucceeds());
+      ASSERT_THAT(read(fd, &val, sizeof(val)), SyscallSucceeds());
+      TempPath new_file =
+          ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateFileIn(dir));
+      ASSERT_NO_ERRNO(ListDir(dir, false));
+      new_file.reset();
+      sched_yield();
+    }
+  });
+
+  // Rename file.
+  for (auto start = absl::Now(); absl::Now() - start < runtime;) {
+    const std::string new_path = NewTempAbsPathInDir(dir);
+    {
+      absl::WriterMutexLock l(&mu);
+      ASSERT_THAT(rename(file.c_str(), new_path.c_str()), SyscallSucceeds());
+      file = new_path;
+    }
+    sched_yield();
+  }
 }
 
 }  // namespace

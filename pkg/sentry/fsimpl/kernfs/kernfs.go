@@ -227,15 +227,18 @@ func (d *Dentry) destroy() {
 
 // InotifyWithParent implements vfs.DentryImpl.InotifyWithParent.
 //
-// TODO(gvisor.dev/issue/1479): Implement inotify.
-func (d *Dentry) InotifyWithParent(events uint32, cookie uint32, et vfs.EventType) {}
+// Although Linux technically supports inotify on pseudo filesystems (inotify
+// is implemented at the vfs layer), it is not particularly useful. It is left
+// unimplemented until someone actually needs it.
+func (d *Dentry) InotifyWithParent(events, cookie uint32, et vfs.EventType) {}
 
 // Watches implements vfs.DentryImpl.Watches.
-//
-// TODO(gvisor.dev/issue/1479): Implement inotify.
 func (d *Dentry) Watches() *vfs.Watches {
 	return nil
 }
+
+// OnZeroWatches implements vfs.Dentry.OnZeroWatches.
+func (d *Dentry) OnZeroWatches() {}
 
 // InsertChild inserts child into the vfs dentry cache with the given name under
 // this dentry. This does not update the directory inode, so calling this on
@@ -425,10 +428,10 @@ type inodeDynamicLookup interface {
 	// IterDirents is used to iterate over dynamically created entries. It invokes
 	// cb on each entry in the directory represented by the FileDescription.
 	// 'offset' is the offset for the entire IterDirents call, which may include
-	// results from the caller. 'relOffset' is the offset inside the entries
-	// returned by this IterDirents invocation. In other words,
-	// 'offset+relOffset+1' is the value that should be set in vfs.Dirent.NextOff,
-	// while 'relOffset' is the place where iteration should start from.
+	// results from the caller (e.g. "." and ".."). 'relOffset' is the offset
+	// inside the entries returned by this IterDirents invocation. In other words,
+	// 'offset' should be used to calculate each vfs.Dirent.NextOff as well as
+	// the return value, while 'relOffset' is the place to start iteration.
 	IterDirents(ctx context.Context, callback vfs.IterDirentsCallback, offset, relOffset int64) (newOffset int64, err error)
 }
 

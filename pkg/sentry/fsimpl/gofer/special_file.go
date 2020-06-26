@@ -22,7 +22,6 @@ import (
 	"gvisor.dev/gvisor/pkg/fdnotifier"
 	"gvisor.dev/gvisor/pkg/safemem"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
-	"gvisor.dev/gvisor/pkg/sentry/vfs/lock"
 	"gvisor.dev/gvisor/pkg/syserror"
 	"gvisor.dev/gvisor/pkg/usermem"
 	"gvisor.dev/gvisor/pkg/waiter"
@@ -52,7 +51,7 @@ type specialFileFD struct {
 	off int64
 }
 
-func newSpecialFileFD(h handle, mnt *vfs.Mount, d *dentry, locks *lock.FileLocks, flags uint32) (*specialFileFD, error) {
+func newSpecialFileFD(h handle, mnt *vfs.Mount, d *dentry, locks *vfs.FileLocks, flags uint32) (*specialFileFD, error) {
 	ftype := d.fileType()
 	seekable := ftype == linux.S_IFREG
 	mayBlock := ftype == linux.S_IFIFO || ftype == linux.S_IFSOCK
@@ -130,7 +129,9 @@ func (fd *specialFileFD) PRead(ctx context.Context, dst usermem.IOSequence, offs
 	if fd.seekable && offset < 0 {
 		return 0, syserror.EINVAL
 	}
-	if opts.Flags != 0 {
+
+	// Check that flags are supported. Silently ignore RWF_HIPRI.
+	if opts.Flags&^linux.RWF_HIPRI != 0 {
 		return 0, syserror.EOPNOTSUPP
 	}
 
@@ -174,7 +175,9 @@ func (fd *specialFileFD) PWrite(ctx context.Context, src usermem.IOSequence, off
 	if fd.seekable && offset < 0 {
 		return 0, syserror.EINVAL
 	}
-	if opts.Flags != 0 {
+
+	// Check that flags are supported. Silently ignore RWF_HIPRI.
+	if opts.Flags&^linux.RWF_HIPRI != 0 {
 		return 0, syserror.EOPNOTSUPP
 	}
 
@@ -222,21 +225,12 @@ func (fd *specialFileFD) Seek(ctx context.Context, offset int64, whence int32) (
 	}
 	fd.mu.Lock()
 	defer fd.mu.Unlock()
-	switch whence {
-	case linux.SEEK_SET:
-		// Use offset as given.
-	case linux.SEEK_CUR:
-		offset += fd.off
-	default:
-		// SEEK_END, SEEK_DATA, and SEEK_HOLE aren't supported since it's not
-		// clear that file size is even meaningful for these files.
-		return 0, syserror.EINVAL
+	newOffset, err := regularFileSeekLocked(ctx, fd.dentry(), fd.off, offset, whence)
+	if err != nil {
+		return 0, err
 	}
-	if offset < 0 {
-		return 0, syserror.EINVAL
-	}
-	fd.off = offset
-	return offset, nil
+	fd.off = newOffset
+	return newOffset, nil
 }
 
 // Sync implements vfs.FileDescriptionImpl.Sync.

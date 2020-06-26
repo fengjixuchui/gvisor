@@ -18,7 +18,6 @@ import (
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/sentry/inet"
-	"gvisor.dev/gvisor/pkg/sentry/socket/netfilter"
 	"gvisor.dev/gvisor/pkg/syserr"
 	"gvisor.dev/gvisor/pkg/syserror"
 	"gvisor.dev/gvisor/pkg/tcpip"
@@ -314,7 +313,7 @@ func (s *Stack) Statistics(stat interface{}, arg string) error {
 			udp.PacketsSent.Value(),         // OutDatagrams.
 			udp.ReceiveBufferErrors.Value(), // RcvbufErrors.
 			0,                               // Udp/SndbufErrors.
-			0,                               // Udp/InCsumErrors.
+			udp.ChecksumErrors.Value(),      // Udp/InCsumErrors.
 			0,                               // Udp/IgnoredMulti.
 		}
 	default:
@@ -364,11 +363,6 @@ func (s *Stack) RouteTable() []inet.Route {
 // IPTables returns the stack's iptables.
 func (s *Stack) IPTables() (*stack.IPTables, error) {
 	return s.Stack.IPTables(), nil
-}
-
-// FillIPTablesMetadata populates stack's IPTables with metadata.
-func (s *Stack) FillIPTablesMetadata() {
-	netfilter.FillIPTablesMetadata(s.Stack)
 }
 
 // Resume implements inet.Stack.Resume.

@@ -71,33 +71,35 @@ const (
 	DefaultSynRetries = 6
 )
 
-// SACKEnabled option can be used to enable SACK support in the TCP
-// protocol. See: https://tools.ietf.org/html/rfc2018.
+const (
+	ccReno  = "reno"
+	ccCubic = "cubic"
+)
+
+// SACKEnabled is used by stack.(*Stack).TransportProtocolOption to
+// enable/disable SACK support in TCP. See: https://tools.ietf.org/html/rfc2018.
 type SACKEnabled bool
 
-// DelayEnabled option can be used to enable Nagle's algorithm in the TCP protocol.
+// DelayEnabled is used by stack.(Stack*).TransportProtocolOption to
+// enable/disable Nagle's algorithm in TCP.
 type DelayEnabled bool
 
-// SendBufferSizeOption allows the default, min and max send buffer sizes for
-// TCP endpoints to be queried or configured.
+// SendBufferSizeOption is used by stack.(Stack*).TransportProtocolOption
+// to get/set the default, min and max TCP send buffer sizes.
 type SendBufferSizeOption struct {
 	Min     int
 	Default int
 	Max     int
 }
 
-// ReceiveBufferSizeOption allows the default, min and max receive buffer size
-// for TCP endpoints to be queried or configured.
+// ReceiveBufferSizeOption is used by
+// stack.(Stack*).TransportProtocolOption to get/set the default, min and max
+// TCP receive buffer sizes.
 type ReceiveBufferSizeOption struct {
 	Min     int
 	Default int
 	Max     int
 }
-
-const (
-	ccReno  = "reno"
-	ccCubic = "cubic"
-)
 
 // syncRcvdCounter tracks the number of endpoints in the SYN-RCVD state. The
 // value is protected by a mutex so that we can increment only when it's
@@ -514,8 +516,16 @@ func (*protocol) Parse(pkt *stack.PacketBuffer) bool {
 // NewProtocol returns a TCP transport protocol.
 func NewProtocol() stack.TransportProtocol {
 	return &protocol{
-		sendBufferSize:             SendBufferSizeOption{MinBufferSize, DefaultSendBufferSize, MaxBufferSize},
-		recvBufferSize:             ReceiveBufferSizeOption{MinBufferSize, DefaultReceiveBufferSize, MaxBufferSize},
+		sendBufferSize: SendBufferSizeOption{
+			Min:     MinBufferSize,
+			Default: DefaultSendBufferSize,
+			Max:     MaxBufferSize,
+		},
+		recvBufferSize: ReceiveBufferSizeOption{
+			Min:     MinBufferSize,
+			Default: DefaultReceiveBufferSize,
+			Max:     MaxBufferSize,
+		},
 		congestionControl:          ccReno,
 		availableCongestionControl: []string{ccReno, ccCubic},
 		tcpLingerTimeout:           DefaultTCPLingerTimeout,

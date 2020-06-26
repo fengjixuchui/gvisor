@@ -17,10 +17,12 @@ package vfs2
 import (
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
+	"gvisor.dev/gvisor/pkg/sentry/fs/lock"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/tmpfs"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/pipe"
 	slinux "gvisor.dev/gvisor/pkg/sentry/syscalls/linux"
+	"gvisor.dev/gvisor/pkg/sentry/vfs"
 	"gvisor.dev/gvisor/pkg/syserror"
 )
 
@@ -167,8 +169,82 @@ func Fcntl(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.Syscall
 		}
 		err := tmpfs.AddSeals(file, args[2].Uint())
 		return 0, nil, err
+	case linux.F_SETLK, linux.F_SETLKW:
+		return 0, nil, posixLock(t, args, file, cmd)
 	default:
 		// TODO(gvisor.dev/issue/2920): Everything else is not yet supported.
 		return 0, nil, syserror.EINVAL
 	}
+}
+
+func posixLock(t *kernel.Task, args arch.SyscallArguments, file *vfs.FileDescription, cmd int32) error {
+	// Copy in the lock request.
+	flockAddr := args[2].Pointer()
+	var flock linux.Flock
+	if _, err := t.CopyIn(flockAddr, &flock); err != nil {
+		return err
+	}
+
+	var blocker lock.Blocker
+	if cmd == linux.F_SETLKW {
+		blocker = t
+	}
+
+	switch flock.Type {
+	case linux.F_RDLCK:
+		if !file.IsReadable() {
+			return syserror.EBADF
+		}
+		return file.LockPOSIX(t, t.FDTable(), lock.ReadLock, uint64(flock.Start), uint64(flock.Len), flock.Whence, blocker)
+
+	case linux.F_WRLCK:
+		if !file.IsWritable() {
+			return syserror.EBADF
+		}
+		return file.LockPOSIX(t, t.FDTable(), lock.WriteLock, uint64(flock.Start), uint64(flock.Len), flock.Whence, blocker)
+
+	case linux.F_UNLCK:
+		return file.UnlockPOSIX(t, t.FDTable(), uint64(flock.Start), uint64(flock.Len), flock.Whence)
+
+	default:
+		return syserror.EINVAL
+	}
+}
+
+// Fadvise64 implements fadvise64(2).
+// This implementation currently ignores the provided advice.
+func Fadvise64(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error) {
+	fd := args[0].Int()
+	length := args[2].Int64()
+	advice := args[3].Int()
+
+	// Note: offset is allowed to be negative.
+	if length < 0 {
+		return 0, nil, syserror.EINVAL
+	}
+
+	file := t.GetFileVFS2(fd)
+	if file == nil {
+		return 0, nil, syserror.EBADF
+	}
+	defer file.DecRef()
+
+	// If the FD refers to a pipe or FIFO, return error.
+	if _, isPipe := file.Impl().(*pipe.VFSPipeFD); isPipe {
+		return 0, nil, syserror.ESPIPE
+	}
+
+	switch advice {
+	case linux.POSIX_FADV_NORMAL:
+	case linux.POSIX_FADV_RANDOM:
+	case linux.POSIX_FADV_SEQUENTIAL:
+	case linux.POSIX_FADV_WILLNEED:
+	case linux.POSIX_FADV_DONTNEED:
+	case linux.POSIX_FADV_NOREUSE:
+	default:
+		return 0, nil, syserror.EINVAL
+	}
+
+	// Sure, whatever.
+	return 0, nil, nil
 }

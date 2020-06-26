@@ -15,6 +15,8 @@
 package udp
 
 import (
+	"fmt"
+
 	"gvisor.dev/gvisor/pkg/sleep"
 	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/tcpip"
@@ -94,6 +96,7 @@ type endpoint struct {
 	// The following fields are protected by the mu mutex.
 	mu             sync.RWMutex `state:"nosave"`
 	sndBufSize     int
+	sndBufSizeMax  int
 	state          EndpointState
 	route          stack.Route `state:"manual"`
 	dstPort        uint16
@@ -159,7 +162,7 @@ type multicastMembership struct {
 }
 
 func newEndpoint(s *stack.Stack, netProto tcpip.NetworkProtocolNumber, waiterQueue *waiter.Queue) *endpoint {
-	return &endpoint{
+	e := &endpoint{
 		stack: s,
 		TransportEndpointInfo: stack.TransportEndpointInfo{
 			NetProto:   netProto,
@@ -181,10 +184,23 @@ func newEndpoint(s *stack.Stack, netProto tcpip.NetworkProtocolNumber, waiterQue
 		multicastTTL:  1,
 		multicastLoop: true,
 		rcvBufSizeMax: 32 * 1024,
-		sndBufSize:    32 * 1024,
+		sndBufSizeMax: 32 * 1024,
 		state:         StateInitial,
 		uniqueID:      s.UniqueID(),
 	}
+
+	// Override with stack defaults.
+	var ss stack.SendBufferSizeOption
+	if err := s.Option(&ss); err == nil {
+		e.sndBufSizeMax = ss.Default
+	}
+
+	var rs stack.ReceiveBufferSizeOption
+	if err := s.Option(&rs); err == nil {
+		e.rcvBufSizeMax = rs.Default
+	}
+
+	return e
 }
 
 // UniqueID implements stack.TransportEndpoint.UniqueID.
@@ -215,7 +231,7 @@ func (e *endpoint) Close() {
 	switch e.state {
 	case StateBound, StateConnected:
 		e.stack.UnregisterTransportEndpoint(e.RegisterNICID, e.effectiveNetProtos, ProtocolNumber, e.ID, e, e.boundPortFlags, e.boundBindToDevice)
-		e.stack.ReleasePort(e.effectiveNetProtos, ProtocolNumber, e.ID.LocalAddress, e.ID.LocalPort, e.boundPortFlags, e.boundBindToDevice)
+		e.stack.ReleasePort(e.effectiveNetProtos, ProtocolNumber, e.ID.LocalAddress, e.ID.LocalPort, e.boundPortFlags, e.boundBindToDevice, tcpip.FullAddress{})
 		e.boundBindToDevice = 0
 		e.boundPortFlags = ports.Flags{}
 	}
@@ -611,8 +627,43 @@ func (e *endpoint) SetSockOptInt(opt tcpip.SockOptInt, v int) *tcpip.Error {
 		e.mu.Unlock()
 
 	case tcpip.ReceiveBufferSizeOption:
-	case tcpip.SendBufferSizeOption:
+		// Make sure the receive buffer size is within the min and max
+		// allowed.
+		var rs stack.ReceiveBufferSizeOption
+		if err := e.stack.Option(&rs); err != nil {
+			panic(fmt.Sprintf("e.stack.Option(%#v) = %s", rs, err))
+		}
 
+		if v < rs.Min {
+			v = rs.Min
+		}
+		if v > rs.Max {
+			v = rs.Max
+		}
+
+		e.mu.Lock()
+		e.rcvBufSizeMax = v
+		e.mu.Unlock()
+		return nil
+	case tcpip.SendBufferSizeOption:
+		// Make sure the send buffer size is within the min and max
+		// allowed.
+		var ss stack.SendBufferSizeOption
+		if err := e.stack.Option(&ss); err != nil {
+			panic(fmt.Sprintf("e.stack.Option(%#v) = %s", ss, err))
+		}
+
+		if v < ss.Min {
+			v = ss.Min
+		}
+		if v > ss.Max {
+			v = ss.Max
+		}
+
+		e.mu.Lock()
+		e.sndBufSizeMax = v
+		e.mu.Unlock()
+		return nil
 	}
 
 	return nil
@@ -861,7 +912,7 @@ func (e *endpoint) GetSockOptInt(opt tcpip.SockOptInt) (int, *tcpip.Error) {
 
 	case tcpip.SendBufferSizeOption:
 		e.mu.Lock()
-		v := e.sndBufSize
+		v := e.sndBufSizeMax
 		e.mu.Unlock()
 		return v, nil
 
@@ -996,7 +1047,7 @@ func (e *endpoint) Disconnect() *tcpip.Error {
 	} else {
 		if e.ID.LocalPort != 0 {
 			// Release the ephemeral port.
-			e.stack.ReleasePort(e.effectiveNetProtos, ProtocolNumber, e.ID.LocalAddress, e.ID.LocalPort, boundPortFlags, e.boundBindToDevice)
+			e.stack.ReleasePort(e.effectiveNetProtos, ProtocolNumber, e.ID.LocalAddress, e.ID.LocalPort, boundPortFlags, e.boundBindToDevice, tcpip.FullAddress{})
 			e.boundPortFlags = ports.Flags{}
 		}
 		e.state = StateInitial
@@ -1147,7 +1198,7 @@ func (*endpoint) Accept() (tcpip.Endpoint, *waiter.Queue, *tcpip.Error) {
 
 func (e *endpoint) registerWithStack(nicID tcpip.NICID, netProtos []tcpip.NetworkProtocolNumber, id stack.TransportEndpointID) (stack.TransportEndpointID, tcpip.NICID, *tcpip.Error) {
 	if e.ID.LocalPort == 0 {
-		port, err := e.stack.ReservePort(netProtos, ProtocolNumber, id.LocalAddress, id.LocalPort, e.portFlags, e.bindToDevice)
+		port, err := e.stack.ReservePort(netProtos, ProtocolNumber, id.LocalAddress, id.LocalPort, e.portFlags, e.bindToDevice, tcpip.FullAddress{})
 		if err != nil {
 			return id, e.bindToDevice, err
 		}
@@ -1157,7 +1208,7 @@ func (e *endpoint) registerWithStack(nicID tcpip.NICID, netProtos []tcpip.Networ
 
 	err := e.stack.RegisterTransportEndpoint(nicID, netProtos, ProtocolNumber, id, e, e.boundPortFlags, e.bindToDevice)
 	if err != nil {
-		e.stack.ReleasePort(netProtos, ProtocolNumber, id.LocalAddress, id.LocalPort, e.boundPortFlags, e.bindToDevice)
+		e.stack.ReleasePort(netProtos, ProtocolNumber, id.LocalAddress, id.LocalPort, e.boundPortFlags, e.bindToDevice, tcpip.FullAddress{})
 		e.boundPortFlags = ports.Flags{}
 	}
 	return id, e.bindToDevice, err
@@ -1297,6 +1348,24 @@ func (e *endpoint) HandlePacket(r *stack.Route, id stack.TransportEndpointID, pk
 		e.stack.Stats().UDP.MalformedPacketsReceived.Increment()
 		e.stats.ReceiveErrors.MalformedPacketsReceived.Increment()
 		return
+	}
+
+	// Verify checksum unless RX checksum offload is enabled.
+	// On IPv4, UDP checksum is optional, and a zero value means
+	// the transmitter omitted the checksum generation (RFC768).
+	// On IPv6, UDP checksum is not optional (RFC2460 Section 8.1).
+	if r.Capabilities()&stack.CapabilityRXChecksumOffload == 0 &&
+		(hdr.Checksum() != 0 || r.NetProto == header.IPv6ProtocolNumber) {
+		xsum := r.PseudoHeaderChecksum(ProtocolNumber, hdr.Length())
+		for _, v := range pkt.Data.Views() {
+			xsum = header.Checksum(v, xsum)
+		}
+		if hdr.CalculateChecksum(xsum) != 0xffff {
+			// Checksum Error.
+			e.stack.Stats().UDP.ChecksumErrors.Increment()
+			e.stats.ReceiveErrors.ChecksumErrors.Increment()
+			return
+		}
 	}
 
 	e.rcvMu.Lock()

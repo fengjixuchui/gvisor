@@ -371,16 +371,24 @@ func (fs *filesystem) doCreateAt(ctx context.Context, rp *vfs.ResolvingPath, dir
 		}
 		parent.touchCMtime()
 		parent.dirents = nil
+		ev := linux.IN_CREATE
+		if dir {
+			ev |= linux.IN_ISDIR
+		}
+		parent.watches.Notify(name, uint32(ev), 0, vfs.InodeEvent, false /* unlinked */)
 		return nil
 	}
 	if fs.opts.interop == InteropModeShared {
-		// The existence of a dentry at name would be inconclusive because the
-		// file it represents may have been deleted from the remote filesystem,
-		// so we would need to make an RPC to revalidate the dentry. Just
-		// attempt the file creation RPC instead. If a file does exist, the RPC
-		// will fail with EEXIST like we would have. If the RPC succeeds, and a
-		// stale dentry exists, the dentry will fail revalidation next time
-		// it's used.
+		if child := parent.children[name]; child != nil && child.isSynthetic() {
+			return syserror.EEXIST
+		}
+		// The existence of a non-synthetic dentry at name would be inconclusive
+		// because the file it represents may have been deleted from the remote
+		// filesystem, so we would need to make an RPC to revalidate the dentry.
+		// Just attempt the file creation RPC instead. If a file does exist, the
+		// RPC will fail with EEXIST like we would have. If the RPC succeeds, and a
+		// stale dentry exists, the dentry will fail revalidation next time it's
+		// used.
 		return createInRemoteDir(parent, name)
 	}
 	if child := parent.children[name]; child != nil {
@@ -397,6 +405,11 @@ func (fs *filesystem) doCreateAt(ctx context.Context, rp *vfs.ResolvingPath, dir
 	}
 	parent.touchCMtime()
 	parent.dirents = nil
+	ev := linux.IN_CREATE
+	if dir {
+		ev |= linux.IN_ISDIR
+	}
+	parent.watches.Notify(name, uint32(ev), 0, vfs.InodeEvent, false /* unlinked */)
 	return nil
 }
 
@@ -518,7 +531,7 @@ func (fs *filesystem) unlinkAt(ctx context.Context, rp *vfs.ResolvingPath, dir b
 		if child == nil {
 			return syserror.ENOENT
 		}
-	} else {
+	} else if child == nil || !child.isSynthetic() {
 		err = parent.file.unlinkAt(ctx, name, flags)
 		if err != nil {
 			if child != nil {
@@ -527,6 +540,18 @@ func (fs *filesystem) unlinkAt(ctx context.Context, rp *vfs.ResolvingPath, dir b
 			return err
 		}
 	}
+
+	// Generate inotify events for rmdir or unlink.
+	if dir {
+		parent.watches.Notify(name, linux.IN_DELETE|linux.IN_ISDIR, 0, vfs.InodeEvent, true /* unlinked */)
+	} else {
+		var cw *vfs.Watches
+		if child != nil {
+			cw = &child.watches
+		}
+		vfs.InotifyRemoveChild(cw, &parent.watches, name)
+	}
+
 	if child != nil {
 		vfsObj.CommitDeleteDentry(&child.vfsd)
 		child.setDeleted()
@@ -764,15 +789,17 @@ afterTrailingSymlink:
 		parent.dirMu.Unlock()
 		return fd, err
 	}
+	parent.dirMu.Unlock()
 	if err != nil {
-		parent.dirMu.Unlock()
 		return nil, err
 	}
-	// Open existing child or follow symlink.
-	parent.dirMu.Unlock()
 	if mustCreate {
 		return nil, syserror.EEXIST
 	}
+	if !child.isDir() && rp.MustBeDir() {
+		return nil, syserror.ENOTDIR
+	}
+	// Open existing child or follow symlink.
 	if child.isSymlink() && rp.ShouldFollowSymlink() {
 		target, err := child.readlink(ctx, rp.Mount())
 		if err != nil {
@@ -1013,6 +1040,7 @@ func (d *dentry) createAndOpenChildLocked(ctx context.Context, rp *vfs.Resolving
 		}
 		childVFSFD = &fd.vfsfd
 	}
+	d.watches.Notify(name, linux.IN_CREATE, 0, vfs.PathEvent, false /* unlinked */)
 	return childVFSFD, nil
 }
 
@@ -1193,10 +1221,12 @@ func (fs *filesystem) RenameAt(ctx context.Context, rp *vfs.ResolvingPath, oldPa
 	if newParent.cachedMetadataAuthoritative() {
 		newParent.dirents = nil
 		newParent.touchCMtime()
-		if renamed.isDir() {
+		if renamed.isDir() && (replaced == nil || !replaced.isDir()) {
+			// Increase the link count if we did not replace another directory.
 			newParent.incLinks()
 		}
 	}
+	vfs.InotifyRename(ctx, &renamed.watches, &oldParent.watches, &newParent.watches, oldName, newName, renamed.isDir())
 	return nil
 }
 
@@ -1209,12 +1239,21 @@ func (fs *filesystem) RmdirAt(ctx context.Context, rp *vfs.ResolvingPath) error 
 func (fs *filesystem) SetStatAt(ctx context.Context, rp *vfs.ResolvingPath, opts vfs.SetStatOptions) error {
 	var ds *[]*dentry
 	fs.renameMu.RLock()
-	defer fs.renameMuRUnlockAndCheckCaching(&ds)
 	d, err := fs.resolveLocked(ctx, rp, &ds)
 	if err != nil {
+		fs.renameMuRUnlockAndCheckCaching(&ds)
 		return err
 	}
-	return d.setStat(ctx, rp.Credentials(), &opts.Stat, rp.Mount())
+	if err := d.setStat(ctx, rp.Credentials(), &opts.Stat, rp.Mount()); err != nil {
+		fs.renameMuRUnlockAndCheckCaching(&ds)
+		return err
+	}
+	fs.renameMuRUnlockAndCheckCaching(&ds)
+
+	if ev := vfs.InotifyEventFromStatMask(opts.Stat.Mask); ev != 0 {
+		d.InotifyWithParent(ev, 0, vfs.InodeEvent)
+	}
+	return nil
 }
 
 // StatAt implements vfs.FilesystemImpl.StatAt.
@@ -1338,24 +1377,38 @@ func (fs *filesystem) GetxattrAt(ctx context.Context, rp *vfs.ResolvingPath, opt
 func (fs *filesystem) SetxattrAt(ctx context.Context, rp *vfs.ResolvingPath, opts vfs.SetxattrOptions) error {
 	var ds *[]*dentry
 	fs.renameMu.RLock()
-	defer fs.renameMuRUnlockAndCheckCaching(&ds)
 	d, err := fs.resolveLocked(ctx, rp, &ds)
 	if err != nil {
+		fs.renameMuRUnlockAndCheckCaching(&ds)
 		return err
 	}
-	return d.setxattr(ctx, rp.Credentials(), &opts)
+	if err := d.setxattr(ctx, rp.Credentials(), &opts); err != nil {
+		fs.renameMuRUnlockAndCheckCaching(&ds)
+		return err
+	}
+	fs.renameMuRUnlockAndCheckCaching(&ds)
+
+	d.InotifyWithParent(linux.IN_ATTRIB, 0, vfs.InodeEvent)
+	return nil
 }
 
 // RemovexattrAt implements vfs.FilesystemImpl.RemovexattrAt.
 func (fs *filesystem) RemovexattrAt(ctx context.Context, rp *vfs.ResolvingPath, name string) error {
 	var ds *[]*dentry
 	fs.renameMu.RLock()
-	defer fs.renameMuRUnlockAndCheckCaching(&ds)
 	d, err := fs.resolveLocked(ctx, rp, &ds)
 	if err != nil {
+		fs.renameMuRUnlockAndCheckCaching(&ds)
 		return err
 	}
-	return d.removexattr(ctx, rp.Credentials(), name)
+	if err := d.removexattr(ctx, rp.Credentials(), name); err != nil {
+		fs.renameMuRUnlockAndCheckCaching(&ds)
+		return err
+	}
+	fs.renameMuRUnlockAndCheckCaching(&ds)
+
+	d.InotifyWithParent(linux.IN_ATTRIB, 0, vfs.InodeEvent)
+	return nil
 }
 
 // PrependPath implements vfs.FilesystemImpl.PrependPath.

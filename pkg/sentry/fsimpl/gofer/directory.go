@@ -138,6 +138,7 @@ func (fd *directoryFD) IterDirents(ctx context.Context, cb vfs.IterDirentsCallba
 		fd.dirents = ds
 	}
 
+	d.InotifyWithParent(linux.IN_ACCESS, 0, vfs.PathEvent)
 	if d.cachedMetadataAuthoritative() {
 		d.touchAtime(fd.vfsfd.Mount())
 	}
@@ -298,4 +299,9 @@ func (fd *directoryFD) Seek(ctx context.Context, offset int64, whence int32) (in
 	default:
 		return 0, syserror.EINVAL
 	}
+}
+
+// Sync implements vfs.FileDescriptionImpl.Sync.
+func (fd *directoryFD) Sync(ctx context.Context) error {
+	return fd.dentry().handle.sync(ctx)
 }

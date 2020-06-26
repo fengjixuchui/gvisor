@@ -53,7 +53,6 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
 	"gvisor.dev/gvisor/pkg/sentry/socket/unix/transport"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
-	"gvisor.dev/gvisor/pkg/sentry/vfs/lock"
 	"gvisor.dev/gvisor/pkg/syserror"
 	"gvisor.dev/gvisor/pkg/unet"
 	"gvisor.dev/gvisor/pkg/usermem"
@@ -665,7 +664,10 @@ type dentry struct {
 	// endpoint bound to this file.
 	pipe *pipe.VFSPipe
 
-	locks lock.FileLocks
+	locks vfs.FileLocks
+
+	// Inotify watches for this dentry.
+	watches vfs.Watches
 }
 
 // dentryAttrMask returns a p9.AttrMask enabling all attributes used by the
@@ -835,6 +837,14 @@ func (d *dentry) statTo(stat *linux.Statx) {
 	stat.Mask = linux.STATX_TYPE | linux.STATX_MODE | linux.STATX_NLINK | linux.STATX_UID | linux.STATX_GID | linux.STATX_ATIME | linux.STATX_MTIME | linux.STATX_CTIME | linux.STATX_INO | linux.STATX_SIZE | linux.STATX_BLOCKS | linux.STATX_BTIME
 	stat.Blksize = atomic.LoadUint32(&d.blockSize)
 	stat.Nlink = atomic.LoadUint32(&d.nlink)
+	if stat.Nlink == 0 {
+		// The remote filesystem doesn't support link count; just make
+		// something up. This is consistent with Linux, where
+		// fs/inode.c:inode_init_always() initializes link count to 1, and
+		// fs/9p/vfs_inode_dotl.c:v9fs_stat2inode_dotl() doesn't touch it if
+		// it's not provided by the remote filesystem.
+		stat.Nlink = 1
+	}
 	stat.UID = atomic.LoadUint32(&d.uid)
 	stat.GID = atomic.LoadUint32(&d.gid)
 	stat.Mode = uint16(atomic.LoadUint32(&d.mode))
@@ -940,6 +950,8 @@ func (d *dentry) setStat(ctx context.Context, creds *auth.Credentials, stat *lin
 		} else {
 			atomic.StoreInt64(&d.atime, dentryTimestampFromStatx(stat.Atime))
 		}
+		// Restore mask bits that we cleared earlier.
+		stat.Mask |= linux.STATX_ATIME
 	}
 	if setLocalMtime {
 		if stat.Mtime.Nsec == linux.UTIME_NOW {
@@ -947,6 +959,8 @@ func (d *dentry) setStat(ctx context.Context, creds *auth.Credentials, stat *lin
 		} else {
 			atomic.StoreInt64(&d.mtime, dentryTimestampFromStatx(stat.Mtime))
 		}
+		// Restore mask bits that we cleared earlier.
+		stat.Mask |= linux.STATX_MTIME
 	}
 	atomic.StoreInt64(&d.ctime, now)
 	if stat.Mask&linux.STATX_SIZE != 0 {
@@ -1044,15 +1058,34 @@ func (d *dentry) decRefLocked() {
 }
 
 // InotifyWithParent implements vfs.DentryImpl.InotifyWithParent.
-//
-// TODO(gvisor.dev/issue/1479): Implement inotify.
-func (d *dentry) InotifyWithParent(events uint32, cookie uint32, et vfs.EventType) {}
+func (d *dentry) InotifyWithParent(events, cookie uint32, et vfs.EventType) {
+	if d.isDir() {
+		events |= linux.IN_ISDIR
+	}
+
+	d.fs.renameMu.RLock()
+	// The ordering below is important, Linux always notifies the parent first.
+	if d.parent != nil {
+		d.parent.watches.Notify(d.name, events, cookie, et, d.isDeleted())
+	}
+	d.watches.Notify("", events, cookie, et, d.isDeleted())
+	d.fs.renameMu.RUnlock()
+}
 
 // Watches implements vfs.DentryImpl.Watches.
-//
-// TODO(gvisor.dev/issue/1479): Implement inotify.
 func (d *dentry) Watches() *vfs.Watches {
-	return nil
+	return &d.watches
+}
+
+// OnZeroWatches implements vfs.DentryImpl.OnZeroWatches.
+//
+// If no watches are left on this dentry and it has no references, cache it.
+func (d *dentry) OnZeroWatches() {
+	if atomic.LoadInt64(&d.refs) == 0 {
+		d.fs.renameMu.Lock()
+		d.checkCachingLocked()
+		d.fs.renameMu.Unlock()
+	}
 }
 
 // checkCachingLocked should be called after d's reference count becomes 0 or it
@@ -1086,12 +1119,23 @@ func (d *dentry) checkCachingLocked() {
 	// Deleted and invalidated dentries with zero references are no longer
 	// reachable by path resolution and should be dropped immediately.
 	if d.vfsd.IsDead() {
+		if d.isDeleted() {
+			d.watches.HandleDeletion()
+		}
 		if d.cached {
 			d.fs.cachedDentries.Remove(d)
 			d.fs.cachedDentriesLen--
 			d.cached = false
 		}
 		d.destroyLocked()
+		return
+	}
+	// If d still has inotify watches and it is not deleted or invalidated, we
+	// cannot cache it and allow it to be evicted. Otherwise, we will lose its
+	// watches, even if a new dentry is created for the same file in the future.
+	// Note that the size of d.watches cannot concurrently transition from zero
+	// to non-zero, because adding a watch requires holding a reference on d.
+	if d.watches.Size() > 0 {
 		return
 	}
 	// If d is already cached, just move it to the front of the LRU.
@@ -1199,7 +1243,7 @@ func (d *dentry) setDeleted() {
 // We only support xattrs prefixed with "user." (see b/148380782). Currently,
 // there is no need to expose any other xattrs through a gofer.
 func (d *dentry) listxattr(ctx context.Context, creds *auth.Credentials, size uint64) ([]string, error) {
-	if d.file.isNil() {
+	if d.file.isNil() || !d.userXattrSupported() {
 		return nil, nil
 	}
 	xattrMap, err := d.file.listXattr(ctx, size)
@@ -1225,6 +1269,9 @@ func (d *dentry) getxattr(ctx context.Context, creds *auth.Credentials, opts *vf
 	if !strings.HasPrefix(opts.Name, linux.XATTR_USER_PREFIX) {
 		return "", syserror.EOPNOTSUPP
 	}
+	if !d.userXattrSupported() {
+		return "", syserror.ENODATA
+	}
 	return d.file.getXattr(ctx, opts.Name, opts.Size)
 }
 
@@ -1237,6 +1284,9 @@ func (d *dentry) setxattr(ctx context.Context, creds *auth.Credentials, opts *vf
 	}
 	if !strings.HasPrefix(opts.Name, linux.XATTR_USER_PREFIX) {
 		return syserror.EOPNOTSUPP
+	}
+	if !d.userXattrSupported() {
+		return syserror.EPERM
 	}
 	return d.file.setXattr(ctx, opts.Name, opts.Value, opts.Flags)
 }
@@ -1251,10 +1301,20 @@ func (d *dentry) removexattr(ctx context.Context, creds *auth.Credentials, name 
 	if !strings.HasPrefix(name, linux.XATTR_USER_PREFIX) {
 		return syserror.EOPNOTSUPP
 	}
+	if !d.userXattrSupported() {
+		return syserror.EPERM
+	}
 	return d.file.removeXattr(ctx, name)
 }
 
-// Preconditions: !d.isSynthetic(). d.isRegularFile() || d.isDirectory().
+// Extended attributes in the user.* namespace are only supported for regular
+// files and directories.
+func (d *dentry) userXattrSupported() bool {
+	filetype := linux.S_IFMT & atomic.LoadUint32(&d.mode)
+	return filetype == linux.S_IFREG || filetype == linux.S_IFDIR
+}
+
+// Preconditions: !d.isSynthetic(). d.isRegularFile() || d.isDir().
 func (d *dentry) ensureSharedHandle(ctx context.Context, read, write, trunc bool) error {
 	// O_TRUNC unconditionally requires us to obtain a new handle (opened with
 	// O_TRUNC).
@@ -1346,23 +1406,21 @@ func (d *dentry) ensureSharedHandle(ctx context.Context, read, write, trunc bool
 }
 
 // incLinks increments link count.
-//
-// Preconditions: d.nlink != 0 && d.nlink < math.MaxUint32.
 func (d *dentry) incLinks() {
-	v := atomic.AddUint32(&d.nlink, 1)
-	if v < 2 {
-		panic(fmt.Sprintf("dentry.nlink is invalid (was 0 or overflowed): %d", v))
+	if atomic.LoadUint32(&d.nlink) == 0 {
+		// The remote filesystem doesn't support link count.
+		return
 	}
+	atomic.AddUint32(&d.nlink, 1)
 }
 
 // decLinks decrements link count.
-//
-// Preconditions: d.nlink > 1.
 func (d *dentry) decLinks() {
-	v := atomic.AddUint32(&d.nlink, ^uint32(0))
-	if v == 0 {
-		panic(fmt.Sprintf("dentry.nlink must be greater than 0: %d", v))
+	if atomic.LoadUint32(&d.nlink) == 0 {
+		// The remote filesystem doesn't support link count.
+		return
 	}
+	atomic.AddUint32(&d.nlink, ^uint32(0))
 }
 
 // fileDescription is embedded by gofer implementations of
@@ -1401,7 +1459,13 @@ func (fd *fileDescription) Stat(ctx context.Context, opts vfs.StatOptions) (linu
 
 // SetStat implements vfs.FileDescriptionImpl.SetStat.
 func (fd *fileDescription) SetStat(ctx context.Context, opts vfs.SetStatOptions) error {
-	return fd.dentry().setStat(ctx, auth.CredentialsFromContext(ctx), &opts.Stat, fd.vfsfd.Mount())
+	if err := fd.dentry().setStat(ctx, auth.CredentialsFromContext(ctx), &opts.Stat, fd.vfsfd.Mount()); err != nil {
+		return err
+	}
+	if ev := vfs.InotifyEventFromStatMask(opts.Stat.Mask); ev != 0 {
+		fd.dentry().InotifyWithParent(ev, 0, vfs.InodeEvent)
+	}
+	return nil
 }
 
 // Listxattr implements vfs.FileDescriptionImpl.Listxattr.
@@ -1416,12 +1480,22 @@ func (fd *fileDescription) Getxattr(ctx context.Context, opts vfs.GetxattrOption
 
 // Setxattr implements vfs.FileDescriptionImpl.Setxattr.
 func (fd *fileDescription) Setxattr(ctx context.Context, opts vfs.SetxattrOptions) error {
-	return fd.dentry().setxattr(ctx, auth.CredentialsFromContext(ctx), &opts)
+	d := fd.dentry()
+	if err := d.setxattr(ctx, auth.CredentialsFromContext(ctx), &opts); err != nil {
+		return err
+	}
+	d.InotifyWithParent(linux.IN_ATTRIB, 0, vfs.InodeEvent)
+	return nil
 }
 
 // Removexattr implements vfs.FileDescriptionImpl.Removexattr.
 func (fd *fileDescription) Removexattr(ctx context.Context, name string) error {
-	return fd.dentry().removexattr(ctx, auth.CredentialsFromContext(ctx), name)
+	d := fd.dentry()
+	if err := d.removexattr(ctx, auth.CredentialsFromContext(ctx), name); err != nil {
+		return err
+	}
+	d.InotifyWithParent(linux.IN_ATTRIB, 0, vfs.InodeEvent)
+	return nil
 }
 
 // LockBSD implements vfs.FileDescriptionImpl.LockBSD.
@@ -1433,9 +1507,14 @@ func (fd *fileDescription) LockBSD(ctx context.Context, uid fslock.UniqueID, t f
 }
 
 // LockPOSIX implements vfs.FileDescriptionImpl.LockPOSIX.
-func (fd *fileDescription) LockPOSIX(ctx context.Context, uid fslock.UniqueID, t fslock.LockType, rng fslock.LockRange, block fslock.Blocker) error {
+func (fd *fileDescription) LockPOSIX(ctx context.Context, uid fslock.UniqueID, t fslock.LockType, start, length uint64, whence int16, block fslock.Blocker) error {
 	fd.lockLogging.Do(func() {
 		log.Infof("Range lock using gofer file handled internally.")
 	})
-	return fd.LockFD.LockPOSIX(ctx, uid, t, rng, block)
+	return fd.Locks().LockPOSIX(ctx, &fd.vfsfd, uid, t, start, length, whence, block)
+}
+
+// UnlockPOSIX implements vfs.FileDescriptionImpl.UnlockPOSIX.
+func (fd *fileDescription) UnlockPOSIX(ctx context.Context, uid fslock.UniqueID, start, length uint64, whence int16) error {
+	return fd.Locks().UnlockPOSIX(ctx, &fd.vfsfd, uid, start, length, whence)
 }

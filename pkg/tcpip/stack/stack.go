@@ -471,6 +471,14 @@ type Stack struct {
 	// randomGenerator is an injectable pseudo random generator that can be
 	// used when a random number is required.
 	randomGenerator *mathrand.Rand
+
+	// sendBufferSize holds the min/default/max send buffer sizes for
+	// endpoints other than TCP.
+	sendBufferSize SendBufferSizeOption
+
+	// receiveBufferSize holds the min/default/max receive buffer sizes for
+	// endpoints other than TCP.
+	receiveBufferSize ReceiveBufferSizeOption
 }
 
 // UniqueID is an abstract generator of unique identifiers.
@@ -683,6 +691,16 @@ func New(opts Options) *Stack {
 		tempIIDSeed:          opts.TempIIDSeed,
 		forwarder:            newForwardQueue(),
 		randomGenerator:      mathrand.New(randSrc),
+		sendBufferSize: SendBufferSizeOption{
+			Min:     MinBufferSize,
+			Default: DefaultBufferSize,
+			Max:     DefaultMaxBufferSize,
+		},
+		receiveBufferSize: ReceiveBufferSizeOption{
+			Min:     MinBufferSize,
+			Default: DefaultBufferSize,
+			Max:     DefaultMaxBufferSize,
+		},
 	}
 
 	// Add specified network protocols.
@@ -1033,14 +1051,14 @@ func (s *Stack) removeNICLocked(id tcpip.NICID) *tcpip.Error {
 	// Remove routes in-place. n tracks the number of routes written.
 	n := 0
 	for i, r := range s.routeTable {
+		s.routeTable[i] = tcpip.Route{}
 		if r.NIC != id {
 			// Keep this route.
-			if i > n {
-				s.routeTable[n] = r
-			}
+			s.routeTable[n] = r
 			n++
 		}
 	}
+
 	s.routeTable = s.routeTable[:n]
 
 	return nic.remove()
@@ -1406,6 +1424,12 @@ func (s *Stack) RemoveWaker(nicID tcpip.NICID, addr tcpip.Address, waker *sleep.
 // nic-specific IDs have precedence over global ones.
 func (s *Stack) RegisterTransportEndpoint(nicID tcpip.NICID, netProtos []tcpip.NetworkProtocolNumber, protocol tcpip.TransportProtocolNumber, id TransportEndpointID, ep TransportEndpoint, flags ports.Flags, bindToDevice tcpip.NICID) *tcpip.Error {
 	return s.demux.registerEndpoint(netProtos, protocol, id, ep, flags, bindToDevice)
+}
+
+// CheckRegisterTransportEndpoint checks if an endpoint can be registered with
+// the stack transport dispatcher.
+func (s *Stack) CheckRegisterTransportEndpoint(nicID tcpip.NICID, netProtos []tcpip.NetworkProtocolNumber, protocol tcpip.TransportProtocolNumber, id TransportEndpointID, flags ports.Flags, bindToDevice tcpip.NICID) *tcpip.Error {
+	return s.demux.checkEndpoint(netProtos, protocol, id, flags, bindToDevice)
 }
 
 // UnregisterTransportEndpoint removes the endpoint with the given id from the

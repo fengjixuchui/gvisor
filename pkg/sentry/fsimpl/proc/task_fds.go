@@ -27,7 +27,6 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
-	"gvisor.dev/gvisor/pkg/sentry/vfs/lock"
 	"gvisor.dev/gvisor/pkg/syserror"
 )
 
@@ -54,7 +53,7 @@ func taskFDExists(t *kernel.Task, fd int32) bool {
 }
 
 type fdDir struct {
-	locks lock.FileLocks
+	locks vfs.FileLocks
 
 	fs   *filesystem
 	task *kernel.Task
@@ -65,7 +64,7 @@ type fdDir struct {
 }
 
 // IterDirents implements kernfs.inodeDynamicLookup.
-func (i *fdDir) IterDirents(ctx context.Context, cb vfs.IterDirentsCallback, absOffset, relOffset int64) (int64, error) {
+func (i *fdDir) IterDirents(ctx context.Context, cb vfs.IterDirentsCallback, offset, relOffset int64) (int64, error) {
 	var fds []int32
 	i.task.WithMuLocked(func(t *kernel.Task) {
 		if fdTable := t.FDTable(); fdTable != nil {
@@ -73,7 +72,6 @@ func (i *fdDir) IterDirents(ctx context.Context, cb vfs.IterDirentsCallback, abs
 		}
 	})
 
-	offset := absOffset + relOffset
 	typ := uint8(linux.DT_REG)
 	if i.produceSymlink {
 		typ = linux.DT_LNK

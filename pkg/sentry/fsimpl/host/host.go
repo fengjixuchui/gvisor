@@ -28,13 +28,13 @@ import (
 	"gvisor.dev/gvisor/pkg/fspath"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/refs"
+	fslock "gvisor.dev/gvisor/pkg/sentry/fs/lock"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/kernfs"
 	"gvisor.dev/gvisor/pkg/sentry/hostfd"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
 	unixsocket "gvisor.dev/gvisor/pkg/sentry/socket/unix"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
-	"gvisor.dev/gvisor/pkg/sentry/vfs/lock"
 	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/syserror"
 	"gvisor.dev/gvisor/pkg/usermem"
@@ -91,7 +91,9 @@ func NewFD(ctx context.Context, mnt *vfs.Mount, hostFD int, opts *NewFDOptions) 
 		isTTY:      opts.IsTTY,
 		wouldBlock: wouldBlock(uint32(fileType)),
 		seekable:   seekable,
-		canMap:     canMap(uint32(fileType)),
+		// NOTE(b/38213152): Technically, some obscure char devices can be memory
+		// mapped, but we only allow regular files.
+		canMap: fileType == linux.S_IFREG,
 	}
 	i.pf.inode = i
 
@@ -183,7 +185,7 @@ type inode struct {
 	kernfs.InodeNotDirectory
 	kernfs.InodeNotSymlink
 
-	locks lock.FileLocks
+	locks vfs.FileLocks
 
 	// When the reference count reaches zero, the host fd is closed.
 	refs.AtomicRefCount
@@ -457,10 +459,12 @@ func (i *inode) open(ctx context.Context, d *vfs.Dentry, mnt *vfs.Mount, flags u
 	fileType := s.Mode & linux.FileTypeMask
 
 	// Constrain flags to a subset we can handle.
-	// TODO(gvisor.dev/issue/1672): implement behavior corresponding to these allowed flags.
-	flags &= syscall.O_ACCMODE | syscall.O_DIRECT | syscall.O_NONBLOCK | syscall.O_DSYNC | syscall.O_SYNC | syscall.O_APPEND
+	//
+	// TODO(gvisor.dev/issue/2601): Support O_NONBLOCK by adding RWF_NOWAIT to pread/pwrite calls.
+	flags &= syscall.O_ACCMODE | syscall.O_NONBLOCK | syscall.O_DSYNC | syscall.O_SYNC | syscall.O_APPEND
 
-	if fileType == syscall.S_IFSOCK {
+	switch fileType {
+	case syscall.S_IFSOCK:
 		if i.isTTY {
 			log.Warningf("cannot use host socket fd %d as TTY", i.hostFD)
 			return nil, syserror.ENOTTY
@@ -472,30 +476,33 @@ func (i *inode) open(ctx context.Context, d *vfs.Dentry, mnt *vfs.Mount, flags u
 		}
 		// Currently, we only allow Unix sockets to be imported.
 		return unixsocket.NewFileDescription(ep, ep.Type(), flags, mnt, d, &i.locks)
-	}
 
-	// TODO(gvisor.dev/issue/1672): Whitelist specific file types here, so that
-	// we don't allow importing arbitrary file types without proper support.
-	if i.isTTY {
-		fd := &TTYFileDescription{
-			fileDescription: fileDescription{inode: i},
-			termios:         linux.DefaultSlaveTermios,
+	case syscall.S_IFREG, syscall.S_IFIFO, syscall.S_IFCHR:
+		if i.isTTY {
+			fd := &TTYFileDescription{
+				fileDescription: fileDescription{inode: i},
+				termios:         linux.DefaultSlaveTermios,
+			}
+			fd.LockFD.Init(&i.locks)
+			vfsfd := &fd.vfsfd
+			if err := vfsfd.Init(fd, flags, mnt, d, &vfs.FileDescriptionOptions{}); err != nil {
+				return nil, err
+			}
+			return vfsfd, nil
 		}
+
+		fd := &fileDescription{inode: i}
 		fd.LockFD.Init(&i.locks)
 		vfsfd := &fd.vfsfd
 		if err := vfsfd.Init(fd, flags, mnt, d, &vfs.FileDescriptionOptions{}); err != nil {
 			return nil, err
 		}
 		return vfsfd, nil
-	}
 
-	fd := &fileDescription{inode: i}
-	fd.LockFD.Init(&i.locks)
-	vfsfd := &fd.vfsfd
-	if err := vfsfd.Init(fd, flags, mnt, d, &vfs.FileDescriptionOptions{}); err != nil {
-		return nil, err
+	default:
+		log.Warningf("cannot import host fd %d with file type %o", i.hostFD, fileType)
+		return nil, syserror.EPERM
 	}
-	return vfsfd, nil
 }
 
 // fileDescription is embedded by host fd implementations of FileDescriptionImpl.
@@ -562,7 +569,7 @@ func (f *fileDescription) Read(ctx context.Context, dst usermem.IOSequence, opts
 		}
 		return n, err
 	}
-	// TODO(gvisor.dev/issue/1672): Cache pages, when forced to do so.
+
 	f.offsetMu.Lock()
 	n, err := readFromHostFD(ctx, i.hostFD, dst, f.offset, opts.Flags)
 	f.offset += n
@@ -571,7 +578,7 @@ func (f *fileDescription) Read(ctx context.Context, dst usermem.IOSequence, opts
 }
 
 func readFromHostFD(ctx context.Context, hostFD int, dst usermem.IOSequence, offset int64, flags uint32) (int64, error) {
-	// TODO(gvisor.dev/issue/1672): Support select preadv2 flags.
+	// TODO(gvisor.dev/issue/2601): Support select preadv2 flags.
 	if flags != 0 {
 		return 0, syserror.EOPNOTSUPP
 	}
@@ -583,41 +590,58 @@ func readFromHostFD(ctx context.Context, hostFD int, dst usermem.IOSequence, off
 
 // PWrite implements FileDescriptionImpl.
 func (f *fileDescription) PWrite(ctx context.Context, src usermem.IOSequence, offset int64, opts vfs.WriteOptions) (int64, error) {
-	i := f.inode
-	if !i.seekable {
+	if !f.inode.seekable {
 		return 0, syserror.ESPIPE
 	}
 
-	return writeToHostFD(ctx, i.hostFD, src, offset, opts.Flags)
+	return f.writeToHostFD(ctx, src, offset, opts.Flags)
 }
 
 // Write implements FileDescriptionImpl.
 func (f *fileDescription) Write(ctx context.Context, src usermem.IOSequence, opts vfs.WriteOptions) (int64, error) {
 	i := f.inode
 	if !i.seekable {
-		n, err := writeToHostFD(ctx, i.hostFD, src, -1, opts.Flags)
+		n, err := f.writeToHostFD(ctx, src, -1, opts.Flags)
 		if isBlockError(err) {
 			err = syserror.ErrWouldBlock
 		}
 		return n, err
 	}
-	// TODO(gvisor.dev/issue/1672): Cache pages, when forced to do so.
-	// TODO(gvisor.dev/issue/1672): Write to end of file and update offset if O_APPEND is set on this file.
+
 	f.offsetMu.Lock()
-	n, err := writeToHostFD(ctx, i.hostFD, src, f.offset, opts.Flags)
+	// NOTE(gvisor.dev/issue/2983): O_APPEND may cause memory corruption if
+	// another process modifies the host file between retrieving the file size
+	// and writing to the host fd. This is an unavoidable race condition because
+	// we cannot enforce synchronization on the host.
+	if f.vfsfd.StatusFlags()&linux.O_APPEND != 0 {
+		var s syscall.Stat_t
+		if err := syscall.Fstat(i.hostFD, &s); err != nil {
+			f.offsetMu.Unlock()
+			return 0, err
+		}
+		f.offset = s.Size
+	}
+	n, err := f.writeToHostFD(ctx, src, f.offset, opts.Flags)
 	f.offset += n
 	f.offsetMu.Unlock()
 	return n, err
 }
 
-func writeToHostFD(ctx context.Context, hostFD int, src usermem.IOSequence, offset int64, flags uint32) (int64, error) {
-	// TODO(gvisor.dev/issue/1672): Support select pwritev2 flags.
+func (f *fileDescription) writeToHostFD(ctx context.Context, src usermem.IOSequence, offset int64, flags uint32) (int64, error) {
+	hostFD := f.inode.hostFD
+	// TODO(gvisor.dev/issue/2601): Support select pwritev2 flags.
 	if flags != 0 {
 		return 0, syserror.EOPNOTSUPP
 	}
 	writer := hostfd.GetReadWriterAt(int32(hostFD), offset, flags)
 	n, err := src.CopyInTo(ctx, writer)
 	hostfd.PutReadWriterAt(writer)
+	// NOTE(gvisor.dev/issue/2979): We always sync everything, even for O_DSYNC.
+	if n > 0 && f.vfsfd.StatusFlags()&(linux.O_DSYNC|linux.O_SYNC) != 0 {
+		if syncErr := unix.Fsync(hostFD); syncErr != nil {
+			return int64(n), syncErr
+		}
+	}
 	return int64(n), err
 }
 
@@ -688,7 +712,7 @@ func (f *fileDescription) Seek(_ context.Context, offset int64, whence int32) (i
 
 // Sync implements FileDescriptionImpl.
 func (f *fileDescription) Sync(context.Context) error {
-	// TODO(gvisor.dev/issue/1672): Currently we do not support the SyncData optimization, so we always sync everything.
+	// TODO(gvisor.dev/issue/1897): Currently, we always sync everything.
 	return unix.Fsync(f.inode.hostFD)
 }
 
@@ -717,4 +741,14 @@ func (f *fileDescription) EventUnregister(e *waiter.Entry) {
 // Readiness uses the poll() syscall to check the status of the underlying FD.
 func (f *fileDescription) Readiness(mask waiter.EventMask) waiter.EventMask {
 	return fdnotifier.NonBlockingPoll(int32(f.inode.hostFD), mask)
+}
+
+// LockPOSIX implements vfs.FileDescriptionImpl.LockPOSIX.
+func (f *fileDescription) LockPOSIX(ctx context.Context, uid fslock.UniqueID, t fslock.LockType, start, length uint64, whence int16, block fslock.Blocker) error {
+	return f.Locks().LockPOSIX(ctx, &f.vfsfd, uid, t, start, length, whence, block)
+}
+
+// UnlockPOSIX implements vfs.FileDescriptionImpl.UnlockPOSIX.
+func (f *fileDescription) UnlockPOSIX(ctx context.Context, uid fslock.UniqueID, start, length uint64, whence int16) error {
+	return f.Locks().UnlockPOSIX(ctx, &f.vfsfd, uid, start, length, whence)
 }

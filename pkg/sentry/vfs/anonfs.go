@@ -300,12 +300,15 @@ func (d *anonDentry) DecRef() {
 
 // InotifyWithParent implements DentryImpl.InotifyWithParent.
 //
-// TODO(gvisor.dev/issue/1479): Implement inotify.
-func (d *anonDentry) InotifyWithParent(events uint32, cookie uint32, et EventType) {}
+// Although Linux technically supports inotify on pseudo filesystems (inotify
+// is implemented at the vfs layer), it is not particularly useful. It is left
+// unimplemented until someone actually needs it.
+func (d *anonDentry) InotifyWithParent(events, cookie uint32, et EventType) {}
 
 // Watches implements DentryImpl.Watches.
-//
-// TODO(gvisor.dev/issue/1479): Implement inotify.
 func (d *anonDentry) Watches() *Watches {
 	return nil
 }
+
+// OnZeroWatches implements Dentry.OnZeroWatches.
+func (d *anonDentry) OnZeroWatches() {}

@@ -79,7 +79,7 @@ afterSymlink:
 	}
 	if symlink, ok := child.inode.impl.(*symlink); ok && rp.ShouldFollowSymlink() {
 		// Symlink traversal updates access time.
-		atomic.StoreInt64(&d.inode.atime, d.inode.fs.clock.Now().Nanoseconds())
+		child.inode.touchAtime(rp.Mount())
 		if err := rp.HandleSymlink(symlink.target); err != nil {
 			return nil, err
 		}
@@ -182,7 +182,7 @@ func (fs *filesystem) doCreateAt(rp *vfs.ResolvingPath, dir bool, create func(pa
 	if dir {
 		ev |= linux.IN_ISDIR
 	}
-	parentDir.inode.watches.Notify(name, uint32(ev), 0, vfs.InodeEvent)
+	parentDir.inode.watches.Notify(name, uint32(ev), 0, vfs.InodeEvent, false /* unlinked */)
 	parentDir.inode.touchCMtime()
 	return nil
 }
@@ -237,18 +237,22 @@ func (fs *filesystem) LinkAt(ctx context.Context, rp *vfs.ResolvingPath, vd vfs.
 			return syserror.EXDEV
 		}
 		d := vd.Dentry().Impl().(*dentry)
-		if d.inode.isDir() {
+		i := d.inode
+		if i.isDir() {
 			return syserror.EPERM
 		}
-		if d.inode.nlink == 0 {
+		if err := vfs.MayLink(auth.CredentialsFromContext(ctx), linux.FileMode(atomic.LoadUint32(&i.mode)), auth.KUID(atomic.LoadUint32(&i.uid)), auth.KGID(atomic.LoadUint32(&i.gid))); err != nil {
+			return err
+		}
+		if i.nlink == 0 {
 			return syserror.ENOENT
 		}
-		if d.inode.nlink == maxLinks {
+		if i.nlink == maxLinks {
 			return syserror.EMLINK
 		}
-		d.inode.incLinksLocked()
-		d.inode.watches.Notify("", linux.IN_ATTRIB, 0, vfs.InodeEvent)
-		parentDir.insertChildLocked(fs.newDentry(d.inode), name)
+		i.incLinksLocked()
+		i.watches.Notify("", linux.IN_ATTRIB, 0, vfs.InodeEvent, false /* unlinked */)
+		parentDir.insertChildLocked(fs.newDentry(i), name)
 		return nil
 	})
 }
@@ -364,9 +368,12 @@ afterTrailingSymlink:
 		if err != nil {
 			return nil, err
 		}
-		parentDir.inode.watches.Notify(name, linux.IN_CREATE, 0, vfs.PathEvent)
+		parentDir.inode.watches.Notify(name, linux.IN_CREATE, 0, vfs.PathEvent, false /* unlinked */)
 		parentDir.inode.touchCMtime()
 		return fd, nil
+	}
+	if mustCreate {
+		return nil, syserror.EEXIST
 	}
 	// Is the file mounted over?
 	if err := rp.CheckMount(&child.vfsd); err != nil {
@@ -375,7 +382,7 @@ afterTrailingSymlink:
 	// Do we need to resolve a trailing symlink?
 	if symlink, ok := child.inode.impl.(*symlink); ok && rp.ShouldFollowSymlink() {
 		// Symlink traversal updates access time.
-		atomic.StoreInt64(&child.inode.atime, child.inode.fs.clock.Now().Nanoseconds())
+		child.inode.touchAtime(rp.Mount())
 		if err := rp.HandleSymlink(symlink.target); err != nil {
 			return nil, err
 		}
@@ -618,7 +625,7 @@ func (fs *filesystem) RmdirAt(ctx context.Context, rp *vfs.ResolvingPath) error 
 		return err
 	}
 	parentDir.removeChildLocked(child)
-	parentDir.inode.watches.Notify(name, linux.IN_DELETE|linux.IN_ISDIR, 0, vfs.InodeEvent)
+	parentDir.inode.watches.Notify(name, linux.IN_DELETE|linux.IN_ISDIR, 0, vfs.InodeEvent, true /* unlinked */)
 	// Remove links for child, child/., and child/..
 	child.inode.decLinksLocked()
 	child.inode.decLinksLocked()
@@ -631,14 +638,16 @@ func (fs *filesystem) RmdirAt(ctx context.Context, rp *vfs.ResolvingPath) error 
 // SetStatAt implements vfs.FilesystemImpl.SetStatAt.
 func (fs *filesystem) SetStatAt(ctx context.Context, rp *vfs.ResolvingPath, opts vfs.SetStatOptions) error {
 	fs.mu.RLock()
-	defer fs.mu.RUnlock()
 	d, err := resolveLocked(rp)
 	if err != nil {
+		fs.mu.RUnlock()
 		return err
 	}
 	if err := d.inode.setStat(ctx, rp.Credentials(), &opts.Stat); err != nil {
+		fs.mu.RUnlock()
 		return err
 	}
+	fs.mu.RUnlock()
 
 	if ev := vfs.InotifyEventFromStatMask(opts.Stat.Mask); ev != 0 {
 		d.InotifyWithParent(ev, 0, vfs.InodeEvent)
@@ -781,14 +790,16 @@ func (fs *filesystem) GetxattrAt(ctx context.Context, rp *vfs.ResolvingPath, opt
 // SetxattrAt implements vfs.FilesystemImpl.SetxattrAt.
 func (fs *filesystem) SetxattrAt(ctx context.Context, rp *vfs.ResolvingPath, opts vfs.SetxattrOptions) error {
 	fs.mu.RLock()
-	defer fs.mu.RUnlock()
 	d, err := resolveLocked(rp)
 	if err != nil {
+		fs.mu.RUnlock()
 		return err
 	}
 	if err := d.inode.setxattr(rp.Credentials(), &opts); err != nil {
+		fs.mu.RUnlock()
 		return err
 	}
+	fs.mu.RUnlock()
 
 	d.InotifyWithParent(linux.IN_ATTRIB, 0, vfs.InodeEvent)
 	return nil
@@ -797,14 +808,16 @@ func (fs *filesystem) SetxattrAt(ctx context.Context, rp *vfs.ResolvingPath, opt
 // RemovexattrAt implements vfs.FilesystemImpl.RemovexattrAt.
 func (fs *filesystem) RemovexattrAt(ctx context.Context, rp *vfs.ResolvingPath, name string) error {
 	fs.mu.RLock()
-	defer fs.mu.RUnlock()
 	d, err := resolveLocked(rp)
 	if err != nil {
+		fs.mu.RUnlock()
 		return err
 	}
 	if err := d.inode.removexattr(rp.Credentials(), name); err != nil {
+		fs.mu.RUnlock()
 		return err
 	}
+	fs.mu.RUnlock()
 
 	d.InotifyWithParent(linux.IN_ATTRIB, 0, vfs.InodeEvent)
 	return nil

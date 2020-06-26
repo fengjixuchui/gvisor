@@ -754,8 +754,53 @@ TEST(ProcCpuinfo, RequiredFieldsArePresent) {
   }
 }
 
-TEST(ProcCpuinfo, DeniesWrite) {
-  EXPECT_THAT(open("/proc/cpuinfo", O_WRONLY), SyscallFailsWithErrno(EACCES));
+TEST(ProcCpuinfo, DeniesWriteNonRoot) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_FOWNER)));
+
+  // Do setuid in a separate thread so that after finishing this test, the
+  // process can still open files the test harness created before starting this
+  // test. Otherwise, the files are created by root (UID before the test), but
+  // cannot be opened by the `uid` set below after the test. After calling
+  // setuid(non-zero-UID), there is no way to get root privileges back.
+  ScopedThread([&] {
+    // Use syscall instead of glibc setuid wrapper because we want this setuid
+    // call to only apply to this task. POSIX threads, however, require that all
+    // threads have the same UIDs, so using the setuid wrapper sets all threads'
+    // real UID.
+    // Also drops capabilities.
+    constexpr int kNobody = 65534;
+    EXPECT_THAT(syscall(SYS_setuid, kNobody), SyscallSucceeds());
+    EXPECT_THAT(open("/proc/cpuinfo", O_WRONLY), SyscallFailsWithErrno(EACCES));
+    // TODO(gvisor.dev/issue/1193): Properly support setting size attributes in
+    // kernfs.
+    if (!IsRunningOnGvisor() || IsRunningWithVFS1()) {
+      EXPECT_THAT(truncate("/proc/cpuinfo", 123),
+                  SyscallFailsWithErrno(EACCES));
+    }
+  });
+}
+
+// With root privileges, it is possible to open /proc/cpuinfo with write mode,
+// but all write operations will return EIO.
+TEST(ProcCpuinfo, DeniesWriteRoot) {
+  // VFS1 does not behave differently for root/non-root.
+  SKIP_IF(IsRunningWithVFS1());
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_FOWNER)));
+
+  int fd;
+  EXPECT_THAT(fd = open("/proc/cpuinfo", O_WRONLY), SyscallSucceeds());
+  if (fd > 0) {
+    EXPECT_THAT(write(fd, "x", 1), SyscallFailsWithErrno(EIO));
+    EXPECT_THAT(pwrite(fd, "x", 1, 123), SyscallFailsWithErrno(EIO));
+  }
+  // TODO(gvisor.dev/issue/1193): Properly support setting size attributes in
+  // kernfs.
+  if (!IsRunningOnGvisor() || IsRunningWithVFS1()) {
+    if (fd > 0) {
+      EXPECT_THAT(ftruncate(fd, 123), SyscallFailsWithErrno(EIO));
+    }
+    EXPECT_THAT(truncate("/proc/cpuinfo", 123), SyscallFailsWithErrno(EIO));
+  }
 }
 
 // Sanity checks that uptime is present.
@@ -1921,7 +1966,7 @@ TEST(ProcSelfMountinfo, RequiredFieldsArePresent) {
       AllOf(
           // Root mount.
           ContainsRegex(
-              R"([0-9]+ [0-9]+ [0-9]+:[0-9]+ / / (rw|ro).*- \S+ \S+ (rw|ro)\S*)"),
+              R"([0-9]+ [0-9]+ [0-9]+:[0-9]+ /\S* / (rw|ro).*- \S+ \S+ (rw|ro)\S*)"),
           // Proc mount - always rw.
           ContainsRegex(
               R"([0-9]+ [0-9]+ [0-9]+:[0-9]+ / /proc rw.*- \S+ \S+ rw\S*)")));
@@ -1967,30 +2012,41 @@ void CheckDuplicatesRecursively(std::string path) {
       errno = 0;
       struct dirent* dp = readdir(dir);
       if (dp == nullptr) {
+        // Linux will return EINVAL when calling getdents on a /proc/tid/net
+        // file corresponding to a zombie task.
+        // See fs/proc/proc_net.c:proc_tgid_net_readdir().
+        //
+        // We just ignore the directory in this case.
+        if (errno == EINVAL && absl::StartsWith(path, "/proc/") &&
+            absl::EndsWith(path, "/net")) {
+          break;
+        }
+
+        // Otherwise, no errors are allowed.
         ASSERT_EQ(errno, 0) << path;
         break;  // We're done.
       }
 
-      if (strcmp(dp->d_name, ".") == 0 || strcmp(dp->d_name, "..") == 0) {
+      const std::string name = dp->d_name;
+
+      if (name == "." || name == "..") {
         continue;
       }
 
       // Ignore a duplicate entry if it isn't the last attempt.
       if (i == max_attempts - 1) {
-        ASSERT_EQ(children.find(std::string(dp->d_name)), children.end())
-            << absl::StrCat(path, "/", dp->d_name);
-      } else if (children.find(std::string(dp->d_name)) != children.end()) {
+        ASSERT_EQ(children.find(name), children.end())
+            << absl::StrCat(path, "/", name);
+      } else if (children.find(name) != children.end()) {
         std::cerr << "Duplicate entry: " << i << ":"
-                  << absl::StrCat(path, "/", dp->d_name) << std::endl;
+                  << absl::StrCat(path, "/", name) << std::endl;
         success = false;
         break;
       }
-      children.insert(std::string(dp->d_name));
-
-      ASSERT_NE(dp->d_type, DT_UNKNOWN);
+      children.insert(name);
 
       if (dp->d_type == DT_DIR) {
-        child_dirs.push_back(std::string(dp->d_name));
+        child_dirs.push_back(name);
       }
     }
     if (success) {

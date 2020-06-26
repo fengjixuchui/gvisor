@@ -36,11 +36,11 @@ import (
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/context"
+	fslock "gvisor.dev/gvisor/pkg/sentry/fs/lock"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/time"
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
-	"gvisor.dev/gvisor/pkg/sentry/vfs/lock"
 	"gvisor.dev/gvisor/pkg/sentry/vfs/memxattr"
 	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/syserror"
@@ -215,11 +215,6 @@ type dentry struct {
 	// filesystem.mu.
 	name string
 
-	// unlinked indicates whether this dentry has been unlinked from its parent.
-	// It is only set to true on an unlink operation, and never set from true to
-	// false. unlinked is protected by filesystem.mu.
-	unlinked bool
-
 	// dentryEntry (ugh) links dentries into their parent directory.childList.
 	dentryEntry
 
@@ -259,24 +254,31 @@ func (d *dentry) DecRef() {
 }
 
 // InotifyWithParent implements vfs.DentryImpl.InotifyWithParent.
-func (d *dentry) InotifyWithParent(events uint32, cookie uint32, et vfs.EventType) {
+func (d *dentry) InotifyWithParent(events, cookie uint32, et vfs.EventType) {
 	if d.inode.isDir() {
 		events |= linux.IN_ISDIR
 	}
 
+	// tmpfs never calls VFS.InvalidateDentry(), so d.vfsd.IsDead() indicates
+	// that d was deleted.
+	deleted := d.vfsd.IsDead()
+
+	d.inode.fs.mu.RLock()
 	// The ordering below is important, Linux always notifies the parent first.
 	if d.parent != nil {
-		// Note that d.parent or d.name may be stale if there is a concurrent
-		// rename operation. Inotify does not provide consistency guarantees.
-		d.parent.inode.watches.NotifyWithExclusions(d.name, events, cookie, et, d.unlinked)
+		d.parent.inode.watches.Notify(d.name, events, cookie, et, deleted)
 	}
-	d.inode.watches.Notify("", events, cookie, et)
+	d.inode.watches.Notify("", events, cookie, et, deleted)
+	d.inode.fs.mu.RUnlock()
 }
 
 // Watches implements vfs.DentryImpl.Watches.
 func (d *dentry) Watches() *vfs.Watches {
 	return &d.inode.watches
 }
+
+// OnZeroWatches implements vfs.Dentry.OnZeroWatches.
+func (d *dentry) OnZeroWatches() {}
 
 // inode represents a filesystem object.
 type inode struct {
@@ -310,7 +312,7 @@ type inode struct {
 	ctime int64 // nanoseconds
 	mtime int64 // nanoseconds
 
-	locks lock.FileLocks
+	locks vfs.FileLocks
 
 	// Inotify watches for this inode.
 	watches vfs.Watches
@@ -336,7 +338,6 @@ func (i *inode) init(impl interface{}, fs *filesystem, kuid auth.KUID, kgid auth
 	i.ctime = now
 	i.mtime = now
 	// i.nlink initialized by caller
-	i.watches = vfs.Watches{}
 	i.impl = impl
 }
 
@@ -761,9 +762,26 @@ func NewMemfd(mount *vfs.Mount, creds *auth.Credentials, allowSeals bool, name s
 	// Per Linux, mm/shmem.c:__shmem_file_setup(), memfd files are set up with
 	// FMODE_READ | FMODE_WRITE.
 	var fd regularFileFD
+	fd.Init(&inode.locks)
 	flags := uint32(linux.O_RDWR)
 	if err := fd.vfsfd.Init(&fd, flags, mount, &d.vfsd, &vfs.FileDescriptionOptions{}); err != nil {
 		return nil, err
 	}
 	return &fd.vfsfd, nil
+}
+
+// LockPOSIX implements vfs.FileDescriptionImpl.LockPOSIX.
+func (fd *fileDescription) LockPOSIX(ctx context.Context, uid fslock.UniqueID, t fslock.LockType, start, length uint64, whence int16, block fslock.Blocker) error {
+	return fd.Locks().LockPOSIX(ctx, &fd.vfsfd, uid, t, start, length, whence, block)
+}
+
+// UnlockPOSIX implements vfs.FileDescriptionImpl.UnlockPOSIX.
+func (fd *fileDescription) UnlockPOSIX(ctx context.Context, uid fslock.UniqueID, start, length uint64, whence int16) error {
+	return fd.Locks().UnlockPOSIX(ctx, &fd.vfsfd, uid, start, length, whence)
+}
+
+// Sync implements vfs.FileDescriptionImpl.Sync. It does nothing because all
+// filesystem state is in-memory.
+func (*fileDescription) Sync(context.Context) error {
+	return nil
 }

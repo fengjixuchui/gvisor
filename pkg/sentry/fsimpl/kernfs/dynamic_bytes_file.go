@@ -19,9 +19,9 @@ import (
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/context"
+	fslock "gvisor.dev/gvisor/pkg/sentry/fs/lock"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
-	"gvisor.dev/gvisor/pkg/sentry/vfs/lock"
 	"gvisor.dev/gvisor/pkg/syserror"
 	"gvisor.dev/gvisor/pkg/usermem"
 )
@@ -39,7 +39,7 @@ type DynamicBytesFile struct {
 	InodeNotDirectory
 	InodeNotSymlink
 
-	locks lock.FileLocks
+	locks vfs.FileLocks
 	data  vfs.DynamicBytesSource
 }
 
@@ -86,7 +86,7 @@ type DynamicBytesFD struct {
 }
 
 // Init initializes a DynamicBytesFD.
-func (fd *DynamicBytesFD) Init(m *vfs.Mount, d *vfs.Dentry, data vfs.DynamicBytesSource, locks *lock.FileLocks, flags uint32) error {
+func (fd *DynamicBytesFD) Init(m *vfs.Mount, d *vfs.Dentry, data vfs.DynamicBytesSource, locks *vfs.FileLocks, flags uint32) error {
 	fd.LockFD.Init(locks)
 	if err := fd.vfsfd.Init(fd, flags, m, d, &vfs.FileDescriptionOptions{}); err != nil {
 		return err
@@ -101,12 +101,12 @@ func (fd *DynamicBytesFD) Seek(ctx context.Context, offset int64, whence int32) 
 	return fd.DynamicBytesFileDescriptionImpl.Seek(ctx, offset, whence)
 }
 
-// Read implmenets vfs.FileDescriptionImpl.Read.
+// Read implements vfs.FileDescriptionImpl.Read.
 func (fd *DynamicBytesFD) Read(ctx context.Context, dst usermem.IOSequence, opts vfs.ReadOptions) (int64, error) {
 	return fd.DynamicBytesFileDescriptionImpl.Read(ctx, dst, opts)
 }
 
-// PRead implmenets vfs.FileDescriptionImpl.PRead.
+// PRead implements vfs.FileDescriptionImpl.PRead.
 func (fd *DynamicBytesFD) PRead(ctx context.Context, dst usermem.IOSequence, offset int64, opts vfs.ReadOptions) (int64, error) {
 	return fd.DynamicBytesFileDescriptionImpl.PRead(ctx, dst, offset, opts)
 }
@@ -134,4 +134,14 @@ func (fd *DynamicBytesFD) Stat(ctx context.Context, opts vfs.StatOptions) (linux
 func (fd *DynamicBytesFD) SetStat(context.Context, vfs.SetStatOptions) error {
 	// DynamicBytesFiles are immutable.
 	return syserror.EPERM
+}
+
+// LockPOSIX implements vfs.FileDescriptionImpl.LockPOSIX.
+func (fd *DynamicBytesFD) LockPOSIX(ctx context.Context, uid fslock.UniqueID, t fslock.LockType, start, length uint64, whence int16, block fslock.Blocker) error {
+	return fd.Locks().LockPOSIX(ctx, &fd.vfsfd, uid, t, start, length, whence, block)
+}
+
+// UnlockPOSIX implements vfs.FileDescriptionImpl.UnlockPOSIX.
+func (fd *DynamicBytesFD) UnlockPOSIX(ctx context.Context, uid fslock.UniqueID, start, length uint64, whence int16) error {
+	return fd.Locks().UnlockPOSIX(ctx, &fd.vfsfd, uid, start, length, whence)
 }

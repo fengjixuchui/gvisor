@@ -40,7 +40,7 @@ TEST_P(IPUnboundSocketTest, TtlDefault) {
   socklen_t get_sz = sizeof(get);
   EXPECT_THAT(getsockopt(socket->get(), IPPROTO_IP, IP_TTL, &get, &get_sz),
               SyscallSucceedsWithValue(0));
-  EXPECT_EQ(get, 64);
+  EXPECT_TRUE(get == 64 || get == 127);
   EXPECT_EQ(get_sz, sizeof(get));
 }
 
@@ -424,10 +424,6 @@ TEST_P(IPUnboundSocketTest, InsufficientBufferTOS) {
 
 TEST_P(IPUnboundSocketTest, ReuseAddrDefault) {
   auto socket = ASSERT_NO_ERRNO_AND_VALUE(NewSocket());
-
-  // FIXME(b/76031995): gVisor TCP sockets default to SO_REUSEADDR enabled.
-  SKIP_IF(IsRunningOnGvisor() &&
-          (GetParam().type & SOCK_STREAM) == SOCK_STREAM);
 
   int get = -1;
   socklen_t get_sz = sizeof(get);

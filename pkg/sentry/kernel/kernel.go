@@ -34,7 +34,6 @@ package kernel
 import (
 	"errors"
 	"fmt"
-	"io"
 	"path/filepath"
 	"sync/atomic"
 	"time"
@@ -73,6 +72,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/uniqueid"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
 	"gvisor.dev/gvisor/pkg/state"
+	"gvisor.dev/gvisor/pkg/state/wire"
 	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/tcpip"
 )
@@ -417,7 +417,7 @@ func (k *Kernel) Init(args InitKernelArgs) error {
 // SaveTo saves the state of k to w.
 //
 // Preconditions: The kernel must be paused throughout the call to SaveTo.
-func (k *Kernel) SaveTo(w io.Writer) error {
+func (k *Kernel) SaveTo(w wire.Writer) error {
 	saveStart := time.Now()
 	ctx := k.SupervisorContext()
 
@@ -452,9 +452,7 @@ func (k *Kernel) SaveTo(w io.Writer) error {
 		return err
 	}
 
-	// Ensure that all pending asynchronous work is complete:
-	//   - inode and mount release
-	//   - asynchronuous IO
+	// Ensure that all inode and mount release operations have completed.
 	fs.AsyncBarrier()
 
 	// Once all fs work has completed (flushed references have all been released),
@@ -475,18 +473,18 @@ func (k *Kernel) SaveTo(w io.Writer) error {
 	//
 	// N.B. This will also be saved along with the full kernel save below.
 	cpuidStart := time.Now()
-	if err := state.Save(k.SupervisorContext(), w, k.FeatureSet(), nil); err != nil {
+	if _, err := state.Save(k.SupervisorContext(), w, k.FeatureSet()); err != nil {
 		return err
 	}
 	log.Infof("CPUID save took [%s].", time.Since(cpuidStart))
 
 	// Save the kernel state.
 	kernelStart := time.Now()
-	var stats state.Stats
-	if err := state.Save(k.SupervisorContext(), w, k, &stats); err != nil {
+	stats, err := state.Save(k.SupervisorContext(), w, k)
+	if err != nil {
 		return err
 	}
-	log.Infof("Kernel save stats: %s", &stats)
+	log.Infof("Kernel save stats: %s", stats.String())
 	log.Infof("Kernel save took [%s].", time.Since(kernelStart))
 
 	// Save the memory file's state.
@@ -631,7 +629,7 @@ func (ts *TaskSet) unregisterEpollWaiters() {
 }
 
 // LoadFrom returns a new Kernel loaded from args.
-func (k *Kernel) LoadFrom(r io.Reader, net inet.Stack, clocks sentrytime.Clocks) error {
+func (k *Kernel) LoadFrom(r wire.Reader, net inet.Stack, clocks sentrytime.Clocks) error {
 	loadStart := time.Now()
 
 	initAppCores := k.applicationCores
@@ -642,7 +640,7 @@ func (k *Kernel) LoadFrom(r io.Reader, net inet.Stack, clocks sentrytime.Clocks)
 	// don't need to explicitly install it in the Kernel.
 	cpuidStart := time.Now()
 	var features cpuid.FeatureSet
-	if err := state.Load(k.SupervisorContext(), r, &features, nil); err != nil {
+	if _, err := state.Load(k.SupervisorContext(), r, &features); err != nil {
 		return err
 	}
 	log.Infof("CPUID load took [%s].", time.Since(cpuidStart))
@@ -657,11 +655,11 @@ func (k *Kernel) LoadFrom(r io.Reader, net inet.Stack, clocks sentrytime.Clocks)
 
 	// Load the kernel state.
 	kernelStart := time.Now()
-	var stats state.Stats
-	if err := state.Load(k.SupervisorContext(), r, k, &stats); err != nil {
+	stats, err := state.Load(k.SupervisorContext(), r, k)
+	if err != nil {
 		return err
 	}
-	log.Infof("Kernel load stats: %s", &stats)
+	log.Infof("Kernel load stats: %s", stats.String())
 	log.Infof("Kernel load took [%s].", time.Since(kernelStart))
 
 	// rootNetworkNamespace should be populated after loading the state file.
@@ -892,7 +890,7 @@ func (k *Kernel) CreateProcess(args CreateProcessArgs) (*ThreadGroup, ThreadID, 
 		if mntnsVFS2 == nil {
 			// MountNamespaceVFS2 adds a reference to the namespace, which is
 			// transferred to the new process.
-			mntnsVFS2 = k.GlobalInit().Leader().MountNamespaceVFS2()
+			mntnsVFS2 = k.globalInit.Leader().MountNamespaceVFS2()
 		}
 		// Get the root directory from the MountNamespace.
 		root := args.MountNamespaceVFS2.Root()
@@ -1249,13 +1247,15 @@ func (k *Kernel) Kill(es ExitStatus) {
 }
 
 // Pause requests that all tasks in k temporarily stop executing, and blocks
-// until all tasks in k have stopped. Multiple calls to Pause nest and require
-// an equal number of calls to Unpause to resume execution.
+// until all tasks and asynchronous I/O operations in k have stopped. Multiple
+// calls to Pause nest and require an equal number of calls to Unpause to
+// resume execution.
 func (k *Kernel) Pause() {
 	k.extMu.Lock()
 	k.tasks.BeginExternalStop()
 	k.extMu.Unlock()
 	k.tasks.runningGoroutines.Wait()
+	k.tasks.aioGoroutines.Wait()
 }
 
 // Unpause ends the effect of a previous call to Pause. If Unpause is called

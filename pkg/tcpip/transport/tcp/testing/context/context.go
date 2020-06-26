@@ -144,12 +144,12 @@ func New(t *testing.T, mtu uint32) *Context {
 	})
 
 	// Allow minimum send/receive buffer sizes to be 1 during tests.
-	if err := s.SetTransportProtocolOption(tcp.ProtocolNumber, tcp.SendBufferSizeOption{1, tcp.DefaultSendBufferSize, 10 * tcp.DefaultSendBufferSize}); err != nil {
-		t.Fatalf("SetTransportProtocolOption failed: %v", err)
+	if err := s.SetTransportProtocolOption(tcp.ProtocolNumber, tcp.SendBufferSizeOption{Min: 1, Default: tcp.DefaultSendBufferSize, Max: 10 * tcp.DefaultSendBufferSize}); err != nil {
+		t.Fatalf("SetTransportProtocolOption failed: %s", err)
 	}
 
-	if err := s.SetTransportProtocolOption(tcp.ProtocolNumber, tcp.ReceiveBufferSizeOption{1, tcp.DefaultReceiveBufferSize, 10 * tcp.DefaultReceiveBufferSize}); err != nil {
-		t.Fatalf("SetTransportProtocolOption failed: %v", err)
+	if err := s.SetTransportProtocolOption(tcp.ProtocolNumber, tcp.ReceiveBufferSizeOption{Min: 1, Default: tcp.DefaultReceiveBufferSize, Max: 10 * tcp.DefaultReceiveBufferSize}); err != nil {
+		t.Fatalf("SetTransportProtocolOption failed: %s", err)
 	}
 
 	// Increase minimum RTO in tests to avoid test flakes due to early

@@ -35,9 +35,9 @@ import (
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/fspath"
+	fslock "gvisor.dev/gvisor/pkg/sentry/fs/lock"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
-	"gvisor.dev/gvisor/pkg/sentry/vfs/lock"
 	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/syserror"
 )
@@ -415,7 +415,7 @@ type dentry struct {
 	devMinor uint32
 	ino      uint64
 
-	locks lock.FileLocks
+	locks vfs.FileLocks
 }
 
 // newDentry creates a new dentry. The dentry initially has no references; it
@@ -528,6 +528,11 @@ func (d *dentry) Watches() *vfs.Watches {
 	return nil
 }
 
+// OnZeroWatches implements vfs.DentryImpl.OnZeroWatches.
+//
+// TODO(gvisor.dev/issue/1479): Implement inotify.
+func (d *dentry) OnZeroWatches() {}
+
 // iterLayers invokes yield on each layer comprising d, from top to bottom. If
 // any call to yield returns false, iterLayer stops iteration.
 func (d *dentry) iterLayers(yield func(vd vfs.VirtualDentry, isUpper bool) bool) {
@@ -609,4 +614,14 @@ func (fd *fileDescription) filesystem() *filesystem {
 
 func (fd *fileDescription) dentry() *dentry {
 	return fd.vfsfd.Dentry().Impl().(*dentry)
+}
+
+// LockPOSIX implements vfs.FileDescriptionImpl.LockPOSIX.
+func (fd *fileDescription) LockPOSIX(ctx context.Context, uid fslock.UniqueID, t fslock.LockType, start, length uint64, whence int16, block fslock.Blocker) error {
+	return fd.Locks().LockPOSIX(ctx, &fd.vfsfd, uid, t, start, length, whence, block)
+}
+
+// UnlockPOSIX implements vfs.FileDescriptionImpl.UnlockPOSIX.
+func (fd *fileDescription) UnlockPOSIX(ctx context.Context, uid fslock.UniqueID, start, length uint64, whence int16) error {
+	return fd.Locks().UnlockPOSIX(ctx, &fd.vfsfd, uid, start, length, whence)
 }
