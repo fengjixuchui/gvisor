@@ -407,10 +407,10 @@ func (d *dentry) open(ctx context.Context, rp *vfs.ResolvingPath, opts *vfs.Open
 	case *regularFile:
 		var fd regularFileFD
 		fd.LockFD.Init(&d.inode.locks)
-		if err := fd.vfsfd.Init(&fd, opts.Flags, rp.Mount(), &d.vfsd, &vfs.FileDescriptionOptions{}); err != nil {
+		if err := fd.vfsfd.Init(&fd, opts.Flags, rp.Mount(), &d.vfsd, &vfs.FileDescriptionOptions{AllowDirectIO: true}); err != nil {
 			return nil, err
 		}
-		if opts.Flags&linux.O_TRUNC != 0 {
+		if !afterCreate && opts.Flags&linux.O_TRUNC != 0 {
 			if _, err := impl.truncate(0); err != nil {
 				return nil, err
 			}
@@ -423,7 +423,7 @@ func (d *dentry) open(ctx context.Context, rp *vfs.ResolvingPath, opts *vfs.Open
 		}
 		var fd directoryFD
 		fd.LockFD.Init(&d.inode.locks)
-		if err := fd.vfsfd.Init(&fd, opts.Flags, rp.Mount(), &d.vfsd, &vfs.FileDescriptionOptions{}); err != nil {
+		if err := fd.vfsfd.Init(&fd, opts.Flags, rp.Mount(), &d.vfsd, &vfs.FileDescriptionOptions{AllowDirectIO: true}); err != nil {
 			return nil, err
 		}
 		return &fd.vfsfd, nil
@@ -491,6 +491,9 @@ func (fs *filesystem) RenameAt(ctx context.Context, rp *vfs.ResolvingPath, oldPa
 	renamed, ok := oldParentDir.childMap[oldName]
 	if !ok {
 		return syserror.ENOENT
+	}
+	if err := oldParentDir.mayDelete(rp.Credentials(), renamed); err != nil {
+		return err
 	}
 	// Note that we don't need to call rp.CheckMount(), since if renamed is a
 	// mount point then we want to rename the mount point, not anything in the
@@ -606,6 +609,9 @@ func (fs *filesystem) RmdirAt(ctx context.Context, rp *vfs.ResolvingPath) error 
 	if !ok {
 		return syserror.ENOENT
 	}
+	if err := parentDir.mayDelete(rp.Credentials(), child); err != nil {
+		return err
+	}
 	childDir, ok := child.inode.impl.(*directory)
 	if !ok {
 		return syserror.ENOTDIR
@@ -715,6 +721,9 @@ func (fs *filesystem) UnlinkAt(ctx context.Context, rp *vfs.ResolvingPath) error
 	child, ok := parentDir.childMap[name]
 	if !ok {
 		return syserror.ENOENT
+	}
+	if err := parentDir.mayDelete(rp.Credentials(), child); err != nil {
+		return err
 	}
 	if child.inode.isDir() {
 		return syserror.EISDIR

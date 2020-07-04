@@ -794,9 +794,7 @@ func (d *dentry) updateFromP9Attrs(mask p9.AttrMask, attr *p9.Attr) {
 		atomic.StoreUint32(&d.nlink, uint32(attr.NLink))
 	}
 	if mask.Size {
-		d.dataMu.Lock()
-		atomic.StoreUint64(&d.size, attr.Size)
-		d.dataMu.Unlock()
+		d.updateFileSizeLocked(attr.Size)
 	}
 	d.metadataMu.Unlock()
 }
@@ -902,6 +900,12 @@ func (d *dentry) setStat(ctx context.Context, creds *auth.Credentials, stat *lin
 	}
 	d.metadataMu.Lock()
 	defer d.metadataMu.Unlock()
+	if stat.Mask&linux.STATX_SIZE != 0 {
+		// The size needs to be changed even when
+		// !d.cachedMetadataAuthoritative() because d.mappings has to be
+		// updated.
+		d.updateFileSizeLocked(stat.Size)
+	}
 	if !d.isSynthetic() {
 		if stat.Mask != 0 {
 			if err := d.file.setAttr(ctx, p9.SetAttrMask{
@@ -963,44 +967,50 @@ func (d *dentry) setStat(ctx context.Context, creds *auth.Credentials, stat *lin
 		stat.Mask |= linux.STATX_MTIME
 	}
 	atomic.StoreInt64(&d.ctime, now)
-	if stat.Mask&linux.STATX_SIZE != 0 {
-		d.dataMu.Lock()
-		oldSize := d.size
-		d.size = stat.Size
-		// d.dataMu must be unlocked to lock d.mapsMu and invalidate mappings
-		// below. This allows concurrent calls to Read/Translate/etc. These
-		// functions synchronize with truncation by refusing to use cache
-		// contents beyond the new d.size. (We are still holding d.metadataMu,
-		// so we can't race with Write or another truncate.)
-		d.dataMu.Unlock()
-		if d.size < oldSize {
-			oldpgend, _ := usermem.PageRoundUp(oldSize)
-			newpgend, _ := usermem.PageRoundUp(d.size)
-			if oldpgend != newpgend {
-				d.mapsMu.Lock()
-				d.mappings.Invalidate(memmap.MappableRange{newpgend, oldpgend}, memmap.InvalidateOpts{
-					// Compare Linux's mm/truncate.c:truncate_setsize() =>
-					// truncate_pagecache() =>
-					// mm/memory.c:unmap_mapping_range(evencows=1).
-					InvalidatePrivate: true,
-				})
-				d.mapsMu.Unlock()
-			}
-			// We are now guaranteed that there are no translations of
-			// truncated pages, and can remove them from the cache. Since
-			// truncated pages have been removed from the remote file, they
-			// should be dropped without being written back.
-			d.dataMu.Lock()
-			d.cache.Truncate(d.size, d.fs.mfp.MemoryFile())
-			d.dirty.KeepClean(memmap.MappableRange{d.size, oldpgend})
-			d.dataMu.Unlock()
-		}
-	}
 	return nil
+}
+
+// Preconditions: d.metadataMu must be locked.
+func (d *dentry) updateFileSizeLocked(newSize uint64) {
+	d.dataMu.Lock()
+	oldSize := d.size
+	d.size = newSize
+	// d.dataMu must be unlocked to lock d.mapsMu and invalidate mappings
+	// below. This allows concurrent calls to Read/Translate/etc. These
+	// functions synchronize with truncation by refusing to use cache
+	// contents beyond the new d.size. (We are still holding d.metadataMu,
+	// so we can't race with Write or another truncate.)
+	d.dataMu.Unlock()
+	if d.size < oldSize {
+		oldpgend, _ := usermem.PageRoundUp(oldSize)
+		newpgend, _ := usermem.PageRoundUp(d.size)
+		if oldpgend != newpgend {
+			d.mapsMu.Lock()
+			d.mappings.Invalidate(memmap.MappableRange{newpgend, oldpgend}, memmap.InvalidateOpts{
+				// Compare Linux's mm/truncate.c:truncate_setsize() =>
+				// truncate_pagecache() =>
+				// mm/memory.c:unmap_mapping_range(evencows=1).
+				InvalidatePrivate: true,
+			})
+			d.mapsMu.Unlock()
+		}
+		// We are now guaranteed that there are no translations of
+		// truncated pages, and can remove them from the cache. Since
+		// truncated pages have been removed from the remote file, they
+		// should be dropped without being written back.
+		d.dataMu.Lock()
+		d.cache.Truncate(d.size, d.fs.mfp.MemoryFile())
+		d.dirty.KeepClean(memmap.MappableRange{d.size, oldpgend})
+		d.dataMu.Unlock()
+	}
 }
 
 func (d *dentry) checkPermissions(creds *auth.Credentials, ats vfs.AccessTypes) error {
 	return vfs.GenericCheckPermissions(creds, ats, linux.FileMode(atomic.LoadUint32(&d.mode)), auth.KUID(atomic.LoadUint32(&d.uid)), auth.KGID(atomic.LoadUint32(&d.gid)))
+}
+
+func (d *dentry) mayDelete(creds *auth.Credentials, child *dentry) error {
+	return vfs.CheckDeleteSticky(creds, linux.FileMode(atomic.LoadUint32(&d.mode)), auth.KUID(atomic.LoadUint32(&child.uid)))
 }
 
 func dentryUIDFromP9UID(uid p9.UID) uint32 {

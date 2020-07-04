@@ -543,6 +543,16 @@ func (f *fileDescription) Release() {
 	// noop
 }
 
+// Allocate implements vfs.FileDescriptionImpl.
+func (f *fileDescription) Allocate(ctx context.Context, mode, offset, length uint64) error {
+	if !f.inode.seekable {
+		return syserror.ESPIPE
+	}
+
+	// TODO(gvisor.dev/issue/2923): Implement Allocate for non-pipe hostfds.
+	return syserror.EOPNOTSUPP
+}
+
 // PRead implements FileDescriptionImpl.
 func (f *fileDescription) PRead(ctx context.Context, dst usermem.IOSequence, offset int64, opts vfs.ReadOptions) (int64, error) {
 	i := f.inode
@@ -578,8 +588,10 @@ func (f *fileDescription) Read(ctx context.Context, dst usermem.IOSequence, opts
 }
 
 func readFromHostFD(ctx context.Context, hostFD int, dst usermem.IOSequence, offset int64, flags uint32) (int64, error) {
+	// Check that flags are supported.
+	//
 	// TODO(gvisor.dev/issue/2601): Support select preadv2 flags.
-	if flags != 0 {
+	if flags&^linux.RWF_HIPRI != 0 {
 		return 0, syserror.EOPNOTSUPP
 	}
 	reader := hostfd.GetReadWriterAt(int32(hostFD), offset, flags)

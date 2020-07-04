@@ -199,6 +199,7 @@ syscall_test(
 syscall_test(
     add_overlay = True,
     test = "//test/syscalls/linux:fallocate_test",
+    vfs2 = "True",
 )
 
 syscall_test(
@@ -288,6 +289,7 @@ syscall_test(
     size = "medium",
     add_overlay = True,
     test = "//test/syscalls/linux:ioctl_test",
+    vfs2 = "True",
 )
 
 syscall_test(
@@ -355,6 +357,7 @@ syscall_test(
     size = "medium",
     shard_count = 5,
     test = "//test/syscalls/linux:mmap_test",
+    vfs2 = "True",
 )
 
 syscall_test(
@@ -528,6 +531,7 @@ syscall_test(
 syscall_test(
     add_overlay = True,
     test = "//test/syscalls/linux:pwritev2_test",
+    vfs2 = "True",
 )
 
 syscall_test(
@@ -547,7 +551,7 @@ syscall_test(
 )
 
 syscall_test(
-    test = "//test/syscalls/linux:raw_socket_ipv4_test",
+    test = "//test/syscalls/linux:raw_socket_test",
     vfs2 = "True",
 )
 
@@ -942,6 +946,7 @@ syscall_test(
 syscall_test(
     add_overlay = True,
     test = "//test/syscalls/linux:sticky_test",
+    vfs2 = "True",
 )
 
 syscall_test(
@@ -959,6 +964,7 @@ syscall_test(
 syscall_test(
     add_overlay = True,
     test = "//test/syscalls/linux:sync_file_range_test",
+    vfs2 = "True",
 )
 
 syscall_test(

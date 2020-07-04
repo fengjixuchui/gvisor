@@ -748,9 +748,14 @@ cc_binary(
     linkstatic = 1,
     deps = [
         ":file_base",
+        ":socket_test_util",
         "//test/util:cleanup",
+        "//test/util:eventfd_util",
         "//test/util:file_descriptor",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/time",
         gtest,
+        "//test/util:posix_error",
         "//test/util:temp_path",
         "//test/util:test_main",
         "//test/util:test_util",
@@ -805,6 +810,7 @@ cc_binary(
         "//test/util:save_util",
         "//test/util:temp_path",
         "//test/util:test_util",
+        "//test/util:thread_util",
         "//test/util:timer_util",
     ],
 )
@@ -1800,9 +1806,9 @@ cc_binary(
 )
 
 cc_binary(
-    name = "raw_socket_ipv4_test",
+    name = "raw_socket_test",
     testonly = 1,
-    srcs = ["raw_socket_ipv4.cc"],
+    srcs = ["raw_socket.cc"],
     linkstatic = 1,
     deps = [
         ":socket_test_util",
@@ -3547,11 +3553,15 @@ cc_library(
     hdrs = ["udp_socket_test_cases.h"],
     defines = select_system(),
     deps = [
+        ":ip_socket_test_util",
         ":socket_test_util",
         ":unix_domain_socket_test_util",
         "@com_google_absl//absl/base:core_headers",
+        "@com_google_absl//absl/strings:str_format",
         "@com_google_absl//absl/time",
         gtest,
+        "//test/util:file_descriptor",
+        "//test/util:posix_error",
         "//test/util:test_main",
         "//test/util:test_util",
         "//test/util:thread_util",

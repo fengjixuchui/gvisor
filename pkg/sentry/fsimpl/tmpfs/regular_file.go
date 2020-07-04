@@ -274,14 +274,32 @@ func (fd *regularFileFD) Release() {
 	// noop
 }
 
+// Allocate implements vfs.FileDescriptionImpl.Allocate.
+func (fd *regularFileFD) Allocate(ctx context.Context, mode, offset, length uint64) error {
+	f := fd.inode().impl.(*regularFile)
+
+	f.inode.mu.Lock()
+	defer f.inode.mu.Unlock()
+	oldSize := f.size
+	size := offset + length
+	if oldSize >= size {
+		return nil
+	}
+	_, err := f.truncateLocked(size)
+	return err
+}
+
 // PRead implements vfs.FileDescriptionImpl.PRead.
 func (fd *regularFileFD) PRead(ctx context.Context, dst usermem.IOSequence, offset int64, opts vfs.ReadOptions) (int64, error) {
 	if offset < 0 {
 		return 0, syserror.EINVAL
 	}
 
-	// Check that flags are supported. Silently ignore RWF_HIPRI.
-	if opts.Flags&^linux.RWF_HIPRI != 0 {
+	// Check that flags are supported. RWF_DSYNC/RWF_SYNC can be ignored since
+	// all state is in-memory.
+	//
+	// TODO(gvisor.dev/issue/2601): Support select preadv2 flags.
+	if opts.Flags&^(linux.RWF_HIPRI|linux.RWF_DSYNC|linux.RWF_SYNC) != 0 {
 		return 0, syserror.EOPNOTSUPP
 	}
 
@@ -311,8 +329,11 @@ func (fd *regularFileFD) PWrite(ctx context.Context, src usermem.IOSequence, off
 		return 0, syserror.EINVAL
 	}
 
-	// Check that flags are supported. Silently ignore RWF_HIPRI.
-	if opts.Flags&^linux.RWF_HIPRI != 0 {
+	// Check that flags are supported. RWF_DSYNC/RWF_SYNC can be ignored since
+	// all state is in-memory.
+	//
+	// TODO(gvisor.dev/issue/2601): Support select preadv2 flags.
+	if opts.Flags&^(linux.RWF_HIPRI|linux.RWF_DSYNC|linux.RWF_SYNC) != 0 {
 		return 0, syserror.EOPNOTSUPP
 	}
 

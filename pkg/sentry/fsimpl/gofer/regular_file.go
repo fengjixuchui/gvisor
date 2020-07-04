@@ -24,6 +24,7 @@ import (
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/log"
+	"gvisor.dev/gvisor/pkg/p9"
 	"gvisor.dev/gvisor/pkg/safemem"
 	"gvisor.dev/gvisor/pkg/sentry/fs/fsutil"
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
@@ -67,13 +68,43 @@ func (fd *regularFileFD) OnClose(ctx context.Context) error {
 	return d.handle.file.flush(ctx)
 }
 
+// Allocate implements vfs.FileDescriptionImpl.Allocate.
+func (fd *regularFileFD) Allocate(ctx context.Context, mode, offset, length uint64) error {
+
+	d := fd.dentry()
+	d.metadataMu.Lock()
+	defer d.metadataMu.Unlock()
+
+	size := offset + length
+
+	// Allocating a smaller size is a noop.
+	if size <= d.size {
+		return nil
+	}
+
+	d.handleMu.Lock()
+	defer d.handleMu.Unlock()
+
+	err := d.handle.file.allocate(ctx, p9.ToAllocateMode(mode), offset, length)
+	if err != nil {
+		return err
+	}
+	d.size = size
+	if !d.cachedMetadataAuthoritative() {
+		d.touchCMtimeLocked()
+	}
+	return nil
+}
+
 // PRead implements vfs.FileDescriptionImpl.PRead.
 func (fd *regularFileFD) PRead(ctx context.Context, dst usermem.IOSequence, offset int64, opts vfs.ReadOptions) (int64, error) {
 	if offset < 0 {
 		return 0, syserror.EINVAL
 	}
 
-	// Check that flags are supported. Silently ignore RWF_HIPRI.
+	// Check that flags are supported.
+	//
+	// TODO(gvisor.dev/issue/2601): Support select preadv2 flags.
 	if opts.Flags&^linux.RWF_HIPRI != 0 {
 		return 0, syserror.EOPNOTSUPP
 	}
@@ -126,7 +157,9 @@ func (fd *regularFileFD) PWrite(ctx context.Context, src usermem.IOSequence, off
 		return 0, syserror.EINVAL
 	}
 
-	// Check that flags are supported. Silently ignore RWF_HIPRI.
+	// Check that flags are supported.
+	//
+	// TODO(gvisor.dev/issue/2601): Support select pwritev2 flags.
 	if opts.Flags&^linux.RWF_HIPRI != 0 {
 		return 0, syserror.EOPNOTSUPP
 	}
