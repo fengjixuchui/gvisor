@@ -145,7 +145,7 @@ func convertNetstackToBinary(stack *stack.Stack, tablename linux.TableName) (lin
 
 		// Each rule corresponds to an entry.
 		entry := linux.KernelIPTEntry{
-			IPTEntry: linux.IPTEntry{
+			Entry: linux.IPTEntry{
 				IP: linux.IPTIP{
 					Protocol: uint16(rule.Filter.Protocol),
 				},
@@ -153,20 +153,20 @@ func convertNetstackToBinary(stack *stack.Stack, tablename linux.TableName) (lin
 				TargetOffset: linux.SizeOfIPTEntry,
 			},
 		}
-		copy(entry.IPTEntry.IP.Dst[:], rule.Filter.Dst)
-		copy(entry.IPTEntry.IP.DstMask[:], rule.Filter.DstMask)
-		copy(entry.IPTEntry.IP.Src[:], rule.Filter.Src)
-		copy(entry.IPTEntry.IP.SrcMask[:], rule.Filter.SrcMask)
-		copy(entry.IPTEntry.IP.OutputInterface[:], rule.Filter.OutputInterface)
-		copy(entry.IPTEntry.IP.OutputInterfaceMask[:], rule.Filter.OutputInterfaceMask)
+		copy(entry.Entry.IP.Dst[:], rule.Filter.Dst)
+		copy(entry.Entry.IP.DstMask[:], rule.Filter.DstMask)
+		copy(entry.Entry.IP.Src[:], rule.Filter.Src)
+		copy(entry.Entry.IP.SrcMask[:], rule.Filter.SrcMask)
+		copy(entry.Entry.IP.OutputInterface[:], rule.Filter.OutputInterface)
+		copy(entry.Entry.IP.OutputInterfaceMask[:], rule.Filter.OutputInterfaceMask)
 		if rule.Filter.DstInvert {
-			entry.IPTEntry.IP.InverseFlags |= linux.IPT_INV_DSTIP
+			entry.Entry.IP.InverseFlags |= linux.IPT_INV_DSTIP
 		}
 		if rule.Filter.SrcInvert {
-			entry.IPTEntry.IP.InverseFlags |= linux.IPT_INV_SRCIP
+			entry.Entry.IP.InverseFlags |= linux.IPT_INV_SRCIP
 		}
 		if rule.Filter.OutputInterfaceInvert {
-			entry.IPTEntry.IP.InverseFlags |= linux.IPT_INV_VIA_OUT
+			entry.Entry.IP.InverseFlags |= linux.IPT_INV_VIA_OUT
 		}
 
 		for _, matcher := range rule.Matchers {
@@ -178,8 +178,8 @@ func convertNetstackToBinary(stack *stack.Stack, tablename linux.TableName) (lin
 				panic(fmt.Sprintf("matcher %T is not 64-bit aligned", matcher))
 			}
 			entry.Elems = append(entry.Elems, serialized...)
-			entry.NextOffset += uint16(len(serialized))
-			entry.TargetOffset += uint16(len(serialized))
+			entry.Entry.NextOffset += uint16(len(serialized))
+			entry.Entry.TargetOffset += uint16(len(serialized))
 		}
 
 		// Serialize and append the target.
@@ -188,11 +188,11 @@ func convertNetstackToBinary(stack *stack.Stack, tablename linux.TableName) (lin
 			panic(fmt.Sprintf("target %T is not 64-bit aligned", rule.Target))
 		}
 		entry.Elems = append(entry.Elems, serialized...)
-		entry.NextOffset += uint16(len(serialized))
+		entry.Entry.NextOffset += uint16(len(serialized))
 
 		nflog("convert to binary: adding entry: %+v", entry)
 
-		entries.Size += uint32(entry.NextOffset)
+		entries.Size += uint32(entry.Entry.NextOffset)
 		entries.Entrytable = append(entries.Entrytable, entry)
 		info.NumEntries++
 	}
@@ -342,10 +342,10 @@ func SetEntries(stk *stack.Stack, optVal []byte) *syserr.Error {
 	// TODO(gvisor.dev/issue/170): Support other tables.
 	var table stack.Table
 	switch replace.Name.String() {
-	case stack.TablenameFilter:
+	case stack.FilterTable:
 		table = stack.EmptyFilterTable()
-	case stack.TablenameNat:
-		table = stack.EmptyNatTable()
+	case stack.NATTable:
+		table = stack.EmptyNATTable()
 	default:
 		nflog("we don't yet support writing to the %q table (gvisor.dev/issue/170)", replace.Name.String())
 		return syserr.ErrInvalidArgument
@@ -431,6 +431,8 @@ func SetEntries(stk *stack.Stack, optVal []byte) *syserr.Error {
 	for hook, _ := range replace.HookEntry {
 		if table.ValidHooks()&(1<<hook) != 0 {
 			hk := hookFromLinux(hook)
+			table.BuiltinChains[hk] = stack.HookUnset
+			table.Underflows[hk] = stack.HookUnset
 			for offset, ruleIdx := range offsets {
 				if offset == replace.HookEntry[hook] {
 					table.BuiltinChains[hk] = ruleIdx
@@ -456,8 +458,7 @@ func SetEntries(stk *stack.Stack, optVal []byte) *syserr.Error {
 
 	// Add the user chains.
 	for ruleIdx, rule := range table.Rules {
-		target, ok := rule.Target.(stack.UserChainTarget)
-		if !ok {
+		if _, ok := rule.Target.(stack.UserChainTarget); !ok {
 			continue
 		}
 
@@ -473,7 +474,6 @@ func SetEntries(stk *stack.Stack, optVal []byte) *syserr.Error {
 			nflog("user chain's first node must have no matchers")
 			return syserr.ErrInvalidArgument
 		}
-		table.UserChains[target.Name] = ruleIdx + 1
 	}
 
 	// Set each jump to point to the appropriate rule. Right now they hold byte
@@ -499,7 +499,10 @@ func SetEntries(stk *stack.Stack, optVal []byte) *syserr.Error {
 	// Since we only support modifying the INPUT, PREROUTING and OUTPUT chain right now,
 	// make sure all other chains point to ACCEPT rules.
 	for hook, ruleIdx := range table.BuiltinChains {
-		if hook == stack.Forward || hook == stack.Postrouting {
+		if hook := stack.Hook(hook); hook == stack.Forward || hook == stack.Postrouting {
+			if ruleIdx == stack.HookUnset {
+				continue
+			}
 			if !isUnconditionalAccept(table.Rules[ruleIdx]) {
 				nflog("hook %d is unsupported.", hook)
 				return syserr.ErrInvalidArgument
@@ -512,9 +515,7 @@ func SetEntries(stk *stack.Stack, optVal []byte) *syserr.Error {
 	// - There are no chains without an unconditional final rule.
 	// - There are no chains without an unconditional underflow rule.
 
-	stk.IPTables().ReplaceTable(replace.Name.String(), table)
-
-	return nil
+	return syserr.TranslateNetstackError(stk.IPTables().ReplaceTable(replace.Name.String(), table))
 }
 
 // parseMatchers parses 0 or more matchers from optVal. optVal should contain

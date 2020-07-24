@@ -14,6 +14,7 @@
 package stack
 
 import (
+	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/buffer"
 )
@@ -24,7 +25,7 @@ import (
 // multiple endpoints. Clone() should be called in such cases so that
 // modifications to the Data field do not affect other copies.
 type PacketBuffer struct {
-	_ noCopy
+	_ sync.NoCopy
 
 	// PacketBufferEntry is used to build an intrusive list of
 	// PacketBuffers.
@@ -78,6 +79,10 @@ type PacketBuffer struct {
 	// NatDone indicates if the packet has been manipulated as per NAT
 	// iptables rule.
 	NatDone bool
+
+	// PktType indicates the SockAddrLink.PacketType of the packet as defined in
+	// https://www.man7.org/linux/man-pages/man7/packet.7.html.
+	PktType tcpip.PacketType
 }
 
 // Clone makes a copy of pk. It clones the Data field, which creates a new
@@ -102,14 +107,3 @@ func (pk *PacketBuffer) Clone() *PacketBuffer {
 		NatDone:               pk.NatDone,
 	}
 }
-
-// noCopy may be embedded into structs which must not be copied
-// after the first use.
-//
-// See https://golang.org/issues/8005#issuecomment-190753527
-// for details.
-type noCopy struct{}
-
-// Lock is a no-op used by -copylocks checker from `go vet`.
-func (*noCopy) Lock()   {}
-func (*noCopy) Unlock() {}

@@ -192,7 +192,7 @@ func (e ErrSaveRejection) Error() string {
 	return "save rejected due to unsupported networking state: " + e.Err.Error()
 }
 
-// A Clock provides the current time.
+// A Clock provides the current time and schedules work for execution.
 //
 // Times returned by a Clock should always be used for application-visible
 // time. Only monotonic times should be used for netstack internal timekeeping.
@@ -203,6 +203,31 @@ type Clock interface {
 
 	// NowMonotonic returns a monotonic time value.
 	NowMonotonic() int64
+
+	// AfterFunc waits for the duration to elapse and then calls f in its own
+	// goroutine. It returns a Timer that can be used to cancel the call using
+	// its Stop method.
+	AfterFunc(d time.Duration, f func()) Timer
+}
+
+// Timer represents a single event. A Timer must be created with
+// Clock.AfterFunc.
+type Timer interface {
+	// Stop prevents the Timer from firing. It returns true if the call stops the
+	// timer, false if the timer has already expired or been stopped.
+	//
+	// If Stop returns false, then the timer has already expired and the function
+	// f of Clock.AfterFunc(d, f) has been started in its own goroutine; Stop
+	// does not wait for f to complete before returning. If the caller needs to
+	// know whether f is completed, it must coordinate with f explicitly.
+	Stop() bool
+
+	// Reset changes the timer to expire after duration d.
+	//
+	// Reset should be invoked only on stopped or expired timers. If the timer is
+	// known to have expired, Reset can be used directly. Otherwise, the caller
+	// must coordinate with the function f of Clock.AfterFunc(d, f).
+	Reset(d time.Duration)
 }
 
 // Address is a byte slice cast as a string that represents the address of a
@@ -314,6 +339,28 @@ type ShutdownFlags int
 const (
 	ShutdownRead ShutdownFlags = 1 << iota
 	ShutdownWrite
+)
+
+// PacketType is used to indicate the destination of the packet.
+type PacketType uint8
+
+const (
+	// PacketHost indicates a packet addressed to the local host.
+	PacketHost PacketType = iota
+
+	// PacketOtherHost indicates an outgoing packet addressed to
+	// another host caught by a NIC in promiscuous mode.
+	PacketOtherHost
+
+	// PacketOutgoing for a packet originating from the local host
+	// that is looped back to a packet socket.
+	PacketOutgoing
+
+	// PacketBroadcast indicates a link layer broadcast packet.
+	PacketBroadcast
+
+	// PacketMulticast indicates a link layer multicast packet.
+	PacketMulticast
 )
 
 // FullAddress represents a full transport node address, as required by the
@@ -549,6 +596,28 @@ type Endpoint interface {
 	SetOwner(owner PacketOwner)
 }
 
+// LinkPacketInfo holds Link layer information for a received packet.
+//
+// +stateify savable
+type LinkPacketInfo struct {
+	// Protocol is the NetworkProtocolNumber for the packet.
+	Protocol NetworkProtocolNumber
+
+	// PktType is used to indicate the destination of the packet.
+	PktType PacketType
+}
+
+// PacketEndpoint are additional methods that are only implemented by Packet
+// endpoints.
+type PacketEndpoint interface {
+	// ReadPacket reads a datagram/packet from the endpoint and optionally
+	// returns the sender and additional LinkPacketInfo.
+	//
+	// This method does not block if there is no data pending. It will also
+	// either return an error or data, never both.
+	ReadPacket(*FullAddress, *LinkPacketInfo) (buffer.View, ControlMessages, *Error)
+}
+
 // EndpointInfo is the interface implemented by each endpoint info struct.
 type EndpointInfo interface {
 	// IsEndpointInfo is an empty method to implement the tcpip.EndpointInfo
@@ -648,6 +717,11 @@ const (
 	// whether an IPv6 socket is to be restricted to sending and receiving
 	// IPv6 packets only.
 	V6OnlyOption
+
+	// IPHdrIncludedOption is used by SetSockOpt to indicate for a raw
+	// endpoint that all packets being written have an IP header and the
+	// endpoint should not attach an IP header.
+	IPHdrIncludedOption
 )
 
 // SockOptInt represents socket options which values have the int type.
@@ -672,6 +746,13 @@ const (
 	// current Maximum Segment Size(MSS) value as specified using the
 	// TCP_MAXSEG option.
 	MaxSegOption
+
+	// MTUDiscoverOption is used to set/get the path MTU discovery setting.
+	//
+	// NOTE: Setting this option to any other value than PMTUDiscoveryDont
+	// is not supported and will fail as such, and getting this option will
+	// always return PMTUDiscoveryDont.
+	MTUDiscoverOption
 
 	// MulticastTTLOption is used by SetSockOptInt/GetSockOptInt to control
 	// the default TTL value for multicast messages. The default is 1.
@@ -714,6 +795,24 @@ const (
 	TCPWindowClampOption
 )
 
+const (
+	// PMTUDiscoveryWant is a setting of the MTUDiscoverOption to use
+	// per-route settings.
+	PMTUDiscoveryWant int = iota
+
+	// PMTUDiscoveryDont is a setting of the MTUDiscoverOption to disable
+	// path MTU discovery.
+	PMTUDiscoveryDont
+
+	// PMTUDiscoveryDo is a setting of the MTUDiscoverOption to always do
+	// path MTU discovery.
+	PMTUDiscoveryDo
+
+	// PMTUDiscoveryProbe is a setting of the MTUDiscoverOption to set DF
+	// but ignore path MTU.
+	PMTUDiscoveryProbe
+)
+
 // ErrorOption is used in GetSockOpt to specify that the last error reported by
 // the endpoint should be cleared and returned.
 type ErrorOption struct{}
@@ -752,7 +851,7 @@ type CongestionControlOption string
 // control algorithms.
 type AvailableCongestionControlOption string
 
-// buffer moderation.
+// ModerateReceiveBufferOption is used by buffer moderation.
 type ModerateReceiveBufferOption bool
 
 // TCPLingerTimeoutOption is used by SetSockOpt/GetSockOpt to set/get the
@@ -825,7 +924,10 @@ type OutOfBandInlineOption int
 // a default TTL.
 type DefaultTTLOption uint8
 
-//
+// SocketDetachFilterOption is used by SetSockOpt to detach a previously attached
+// classic BPF filter on a given endpoint.
+type SocketDetachFilterOption int
+
 // IPPacketInfo is the message structure for IP_PKTINFO.
 //
 // +stateify savable
@@ -1214,6 +1316,9 @@ type UDPStats struct {
 
 	// ChecksumErrors is the number of datagrams dropped due to bad checksums.
 	ChecksumErrors *StatCounter
+
+	// InvalidSourceAddress is the number of invalid sourced datagrams dropped.
+	InvalidSourceAddress *StatCounter
 }
 
 // Stats holds statistics about the networking stack.

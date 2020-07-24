@@ -15,8 +15,10 @@
 package iptables
 
 import (
+	"context"
 	"fmt"
 	"net"
+	"reflect"
 	"testing"
 
 	"gvisor.dev/gvisor/pkg/test/dockerutil"
@@ -37,8 +39,9 @@ func singleTest(t *testing.T, test TestCase) {
 		t.Fatalf("no test found with name %q. Has it been registered?", test.Name())
 	}
 
-	d := dockerutil.MakeDocker(t)
-	defer d.CleanUp()
+	ctx := context.Background()
+	d := dockerutil.MakeContainer(ctx, t)
+	defer d.CleanUp(ctx)
 
 	// Create and start the container.
 	opts := dockerutil.RunOpts{
@@ -46,12 +49,12 @@ func singleTest(t *testing.T, test TestCase) {
 		CapAdd: []string{"NET_ADMIN"},
 	}
 	d.CopyFiles(&opts, "/runner", "test/iptables/runner/runner")
-	if err := d.Spawn(opts, "/runner/runner", "-name", test.Name()); err != nil {
+	if err := d.Spawn(ctx, opts, "/runner/runner", "-name", test.Name()); err != nil {
 		t.Fatalf("docker run failed: %v", err)
 	}
 
 	// Get the container IP.
-	ip, err := d.FindIP()
+	ip, err := d.FindIP(ctx)
 	if err != nil {
 		t.Fatalf("failed to get container IP: %v", err)
 	}
@@ -69,7 +72,7 @@ func singleTest(t *testing.T, test TestCase) {
 	// Wait for the final statement. This structure has the side effect
 	// that all container logs will appear within the individual test
 	// context.
-	if _, err := d.WaitForOutput(TerminalStatement, TestTimeout); err != nil {
+	if _, err := d.WaitForOutput(ctx, TerminalStatement, TestTimeout); err != nil {
 		t.Fatalf("test failed: %v", err)
 	}
 }
@@ -260,6 +263,13 @@ func TestNATPreRedirectTCPPort(t *testing.T) {
 	singleTest(t, NATPreRedirectTCPPort{})
 }
 
+func TestNATPreRedirectTCPOutgoing(t *testing.T) {
+	singleTest(t, NATPreRedirectTCPOutgoing{})
+}
+
+func TestNATOutRedirectTCPIncoming(t *testing.T) {
+	singleTest(t, NATOutRedirectTCPIncoming{})
+}
 func TestNATOutRedirectUDPPort(t *testing.T) {
 	singleTest(t, NATOutRedirectUDPPort{})
 }
@@ -314,4 +324,29 @@ func TestInputSource(t *testing.T) {
 
 func TestInputInvertSource(t *testing.T) {
 	singleTest(t, FilterInputInvertSource{})
+}
+
+func TestFilterAddrs(t *testing.T) {
+	tcs := []struct {
+		ipv6  bool
+		addrs []string
+		want  []string
+	}{
+		{
+			ipv6:  false,
+			addrs: []string{"192.168.0.1", "192.168.0.2/24", "::1", "::2/128"},
+			want:  []string{"192.168.0.1", "192.168.0.2"},
+		},
+		{
+			ipv6:  true,
+			addrs: []string{"192.168.0.1", "192.168.0.2/24", "::1", "::2/128"},
+			want:  []string{"::1", "::2"},
+		},
+	}
+
+	for _, tc := range tcs {
+		if got := filterAddrs(tc.addrs, tc.ipv6); !reflect.DeepEqual(got, tc.want) {
+			t.Errorf("%v with IPv6 %t: got %v, but wanted %v", tc.addrs, tc.ipv6, got, tc.want)
+		}
+	}
 }

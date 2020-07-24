@@ -107,6 +107,10 @@ func (c *context) DeliverNetworkPacket(remote tcpip.LinkAddress, local tcpip.Lin
 	c.ch <- packetInfo{remote, protocol, pkt}
 }
 
+func (c *context) DeliverOutboundPacket(remote tcpip.LinkAddress, local tcpip.LinkAddress, protocol tcpip.NetworkProtocolNumber, pkt *stack.PacketBuffer) {
+	panic("unimplemented")
+}
+
 func TestNoEthernetProperties(t *testing.T) {
 	c := newContext(t, &Options{MTU: mtu})
 	defer c.cleanup()
@@ -498,5 +502,82 @@ func TestRecvMMsgDispatcherCapLength(t *testing.T) {
 			t.Errorf("Test %q failed when calling capViews(%d, %v). Got %v. Want %v", c.comment, c.n, c.config, lengths, c.wantLengths)
 		}
 
+	}
+}
+
+// fakeNetworkDispatcher delivers packets to pkts.
+type fakeNetworkDispatcher struct {
+	pkts []*stack.PacketBuffer
+}
+
+func (d *fakeNetworkDispatcher) DeliverNetworkPacket(remote, local tcpip.LinkAddress, protocol tcpip.NetworkProtocolNumber, pkt *stack.PacketBuffer) {
+	d.pkts = append(d.pkts, pkt)
+}
+
+func (d *fakeNetworkDispatcher) DeliverOutboundPacket(remote, local tcpip.LinkAddress, protocol tcpip.NetworkProtocolNumber, pkt *stack.PacketBuffer) {
+	panic("unimplemented")
+}
+
+func TestDispatchPacketFormat(t *testing.T) {
+	for _, test := range []struct {
+		name          string
+		newDispatcher func(fd int, e *endpoint) (linkDispatcher, error)
+	}{
+		{
+			name:          "readVDispatcher",
+			newDispatcher: newReadVDispatcher,
+		},
+		{
+			name:          "recvMMsgDispatcher",
+			newDispatcher: newRecvMMsgDispatcher,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			// Create a socket pair to send/recv.
+			fds, err := syscall.Socketpair(syscall.AF_UNIX, syscall.SOCK_DGRAM, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer syscall.Close(fds[0])
+			defer syscall.Close(fds[1])
+
+			data := []byte{
+				// Ethernet header.
+				1, 2, 3, 4, 5, 60,
+				1, 2, 3, 4, 5, 61,
+				8, 0,
+				// Mock network header.
+				40, 41, 42, 43,
+			}
+			err = syscall.Sendmsg(fds[1], data, nil, nil, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			// Create and run dispatcher once.
+			sink := &fakeNetworkDispatcher{}
+			d, err := test.newDispatcher(fds[0], &endpoint{
+				hdrSize:    header.EthernetMinimumSize,
+				dispatcher: sink,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if ok, err := d.dispatch(); !ok || err != nil {
+				t.Fatalf("d.dispatch() = %v, %v", ok, err)
+			}
+
+			// Verify packet.
+			if got, want := len(sink.pkts), 1; got != want {
+				t.Fatalf("len(sink.pkts) = %d, want %d", got, want)
+			}
+			pkt := sink.pkts[0]
+			if got, want := len(pkt.LinkHeader), header.EthernetMinimumSize; got != want {
+				t.Errorf("len(pkt.LinkHeader) = %d, want %d", got, want)
+			}
+			if got, want := pkt.Data.Size(), 4; got != want {
+				t.Errorf("pkt.Data.Size() = %d, want %d", got, want)
+			}
+		})
 	}
 }

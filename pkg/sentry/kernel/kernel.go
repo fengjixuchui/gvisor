@@ -81,6 +81,10 @@ import (
 // easy access everywhere. To be removed once VFS2 becomes the default.
 var VFS2Enabled = false
 
+// FUSEEnabled is set to true when FUSE is enabled. Added as a global for allow
+// easy access everywhere. To be removed once FUSE is completed.
+var FUSEEnabled = false
+
 // Kernel represents an emulated Linux kernel. It must be initialized by calling
 // Init() or LoadFrom().
 //
@@ -1463,6 +1467,11 @@ func (k *Kernel) NowMonotonic() int64 {
 		panic("Kernel.NowMonotonic: " + err.Error())
 	}
 	return now
+}
+
+// AfterFunc implements tcpip.Clock.AfterFunc.
+func (k *Kernel) AfterFunc(d time.Duration, f func()) tcpip.Timer {
+	return ktime.TcpipAfterFunc(k.realtimeClock, d, f)
 }
 
 // SetMemoryFile sets Kernel.mf. SetMemoryFile must be called before Init or

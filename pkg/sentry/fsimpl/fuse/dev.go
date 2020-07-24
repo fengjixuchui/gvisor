@@ -18,6 +18,7 @@ import (
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/devtmpfs"
+	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
 	"gvisor.dev/gvisor/pkg/syserror"
 	"gvisor.dev/gvisor/pkg/usermem"
@@ -30,6 +31,10 @@ type fuseDevice struct{}
 
 // Open implements vfs.Device.Open.
 func (fuseDevice) Open(ctx context.Context, mnt *vfs.Mount, vfsd *vfs.Dentry, opts vfs.OpenOptions) (*vfs.FileDescription, error) {
+	if !kernel.FUSEEnabled {
+		return nil, syserror.ENOENT
+	}
+
 	var fd DeviceFD
 	if err := fd.vfsfd.Init(&fd, opts.Flags, mnt, vfsd, &vfs.FileDescriptionOptions{
 		UseDentryMetadata: true,
@@ -46,6 +51,9 @@ type DeviceFD struct {
 	vfs.DentryMetadataFileDescriptionImpl
 	vfs.NoLockFD
 
+	// mounted specifies whether a FUSE filesystem was mounted using the DeviceFD.
+	mounted bool
+
 	// TODO(gvisor.dev/issue/2987): Add all the data structures needed to enqueue
 	// and deque requests, control synchronization and establish communication
 	// between the FUSE kernel module and the /dev/fuse character device.
@@ -56,26 +64,51 @@ func (fd *DeviceFD) Release() {}
 
 // PRead implements vfs.FileDescriptionImpl.PRead.
 func (fd *DeviceFD) PRead(ctx context.Context, dst usermem.IOSequence, offset int64, opts vfs.ReadOptions) (int64, error) {
+	// Operations on /dev/fuse don't make sense until a FUSE filesystem is mounted.
+	if !fd.mounted {
+		return 0, syserror.EPERM
+	}
+
 	return 0, syserror.ENOSYS
 }
 
 // Read implements vfs.FileDescriptionImpl.Read.
 func (fd *DeviceFD) Read(ctx context.Context, dst usermem.IOSequence, opts vfs.ReadOptions) (int64, error) {
+	// Operations on /dev/fuse don't make sense until a FUSE filesystem is mounted.
+	if !fd.mounted {
+		return 0, syserror.EPERM
+	}
+
 	return 0, syserror.ENOSYS
 }
 
 // PWrite implements vfs.FileDescriptionImpl.PWrite.
 func (fd *DeviceFD) PWrite(ctx context.Context, src usermem.IOSequence, offset int64, opts vfs.WriteOptions) (int64, error) {
+	// Operations on /dev/fuse don't make sense until a FUSE filesystem is mounted.
+	if !fd.mounted {
+		return 0, syserror.EPERM
+	}
+
 	return 0, syserror.ENOSYS
 }
 
 // Write implements vfs.FileDescriptionImpl.Write.
 func (fd *DeviceFD) Write(ctx context.Context, src usermem.IOSequence, opts vfs.WriteOptions) (int64, error) {
+	// Operations on /dev/fuse don't make sense until a FUSE filesystem is mounted.
+	if !fd.mounted {
+		return 0, syserror.EPERM
+	}
+
 	return 0, syserror.ENOSYS
 }
 
 // Seek implements vfs.FileDescriptionImpl.Seek.
 func (fd *DeviceFD) Seek(ctx context.Context, offset int64, whence int32) (int64, error) {
+	// Operations on /dev/fuse don't make sense until a FUSE filesystem is mounted.
+	if !fd.mounted {
+		return 0, syserror.EPERM
+	}
+
 	return 0, syserror.ENOSYS
 }
 

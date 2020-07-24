@@ -612,6 +612,13 @@ func (e *endpoint) SetSockOptBool(opt tcpip.SockOptBool, v bool) *tcpip.Error {
 // SetSockOptInt implements tcpip.Endpoint.SetSockOptInt.
 func (e *endpoint) SetSockOptInt(opt tcpip.SockOptInt, v int) *tcpip.Error {
 	switch opt {
+	case tcpip.MTUDiscoverOption:
+		// Return not supported if the value is not disabling path
+		// MTU discovery.
+		if v != tcpip.PMTUDiscoveryDont {
+			return tcpip.ErrNotSupported
+		}
+
 	case tcpip.MulticastTTLOption:
 		e.mu.Lock()
 		e.multicastTTL = uint8(v)
@@ -809,6 +816,9 @@ func (e *endpoint) SetSockOpt(opt interface{}) *tcpip.Error {
 		e.mu.Lock()
 		e.bindToDevice = id
 		e.mu.Unlock()
+
+	case tcpip.SocketDetachFilterOption:
+		return nil
 	}
 	return nil
 }
@@ -905,6 +915,10 @@ func (e *endpoint) GetSockOptInt(opt tcpip.SockOptInt) (int, *tcpip.Error) {
 		v := int(e.sendTOS)
 		e.mu.RUnlock()
 		return v, nil
+
+	case tcpip.MTUDiscoverOption:
+		// The only supported setting is path MTU discovery disabled.
+		return tcpip.PMTUDiscoveryDont, nil
 
 	case tcpip.MulticastTTLOption:
 		e.mu.Lock()
@@ -1366,6 +1380,15 @@ func (e *endpoint) HandlePacket(r *stack.Route, id stack.TransportEndpointID, pk
 		return
 	}
 
+	// Never receive from a multicast address.
+	if header.IsV4MulticastAddress(id.RemoteAddress) ||
+		header.IsV6MulticastAddress(id.RemoteAddress) {
+		e.stack.Stats().UDP.InvalidSourceAddress.Increment()
+		e.stack.Stats().IP.InvalidSourceAddressesReceived.Increment()
+		e.stats.ReceiveErrors.MalformedPacketsReceived.Increment()
+		return
+	}
+
 	// Verify checksum unless RX checksum offload is enabled.
 	// On IPv4, UDP checksum is optional, and a zero value means
 	// the transmitter omitted the checksum generation (RFC768).
@@ -1384,10 +1407,10 @@ func (e *endpoint) HandlePacket(r *stack.Route, id stack.TransportEndpointID, pk
 		}
 	}
 
-	e.rcvMu.Lock()
 	e.stack.Stats().UDP.PacketsReceived.Increment()
 	e.stats.PacketsReceived.Increment()
 
+	e.rcvMu.Lock()
 	// Drop the packet if our buffer is currently full.
 	if !e.rcvReady || e.rcvClosed {
 		e.rcvMu.Unlock()
@@ -1428,7 +1451,7 @@ func (e *endpoint) HandlePacket(r *stack.Route, id stack.TransportEndpointID, pk
 		packet.tos, _ = header.IPv6(pkt.NetworkHeader).TOS()
 	}
 
-	packet.timestamp = e.stack.NowNanoseconds()
+	packet.timestamp = e.stack.Clock().NowNanoseconds()
 
 	e.rcvMu.Unlock()
 

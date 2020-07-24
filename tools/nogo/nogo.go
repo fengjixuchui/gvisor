@@ -20,6 +20,7 @@ package nogo
 
 import (
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"go/ast"
@@ -54,6 +55,7 @@ type pkgConfig struct {
 	FactMap    map[string]string
 	FactOutput string
 	Objdump    string
+	StdZip     string
 }
 
 // loadFacts finds and loads facts per FactMap.
@@ -89,8 +91,9 @@ func (c *pkgConfig) shouldInclude(path string) (bool, error) {
 // pass when a given package is not available.
 type importer struct {
 	pkgConfig
-	fset  *token.FileSet
-	cache map[string]*types.Package
+	fset    *token.FileSet
+	cache   map[string]*types.Package
+	lastErr error
 }
 
 // Import implements types.Importer.Import.
@@ -109,12 +112,13 @@ func (i *importer) Import(path string) (*types.Package, error) {
 	if !ok {
 		// Not found in the import path. Attempt to find the package
 		// via the standard library.
-		rc, err = findStdPkg(path, i.GOOS, i.GOARCH)
+		rc, err = i.findStdPkg(path)
 	} else {
 		// Open the file.
 		rc, err = os.Open(realPath)
 	}
 	if err != nil {
+		i.lastErr = err
 		return nil, err
 	}
 	defer rc.Close()
@@ -127,6 +131,9 @@ func (i *importer) Import(path string) (*types.Package, error) {
 
 	return gcexportdata.Read(r, i.fset, i.cache, path)
 }
+
+// ErrSkip indicates the package should be skipped.
+var ErrSkip = errors.New("skipped")
 
 // checkPackage runs all analyzers.
 //
@@ -172,14 +179,14 @@ func checkPackage(config pkgConfig) ([]string, error) {
 		Selections: make(map[*ast.SelectorExpr]*types.Selection),
 	}
 	types, err := typeConfig.Check(config.ImportPath, imp.fset, syntax, typesInfo)
-	if err != nil {
-		return nil, fmt.Errorf("error checking types: %v", err)
+	if err != nil && imp.lastErr != ErrSkip {
+		return nil, fmt.Errorf("error checking types: %w", err)
 	}
 
 	// Load all package facts.
 	facts, err := facts.Decode(types, config.loadFacts)
 	if err != nil {
-		return nil, fmt.Errorf("error decoding facts: %v", err)
+		return nil, fmt.Errorf("error decoding facts: %w", err)
 	}
 
 	// Set the binary global for use.
@@ -247,6 +254,9 @@ func checkPackage(config pkgConfig) ([]string, error) {
 
 	// Visit all analysis recursively.
 	for a, _ := range analyzerConfig {
+		if imp.lastErr == ErrSkip {
+			continue // No local analysis.
+		}
 		if err := visit(a); err != nil {
 			return nil, err // Already has context.
 		}

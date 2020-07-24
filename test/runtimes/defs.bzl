@@ -20,7 +20,7 @@ def _runtime_test_impl(ctx):
     runner = ctx.actions.declare_file("%s-executer" % ctx.label.name)
     runner_content = "\n".join([
         "#!/bin/bash",
-        "%s %s\n" % (ctx.files._runner[0].short_path, " ".join(args)),
+        "%s %s $@\n" % (ctx.files._runner[0].short_path, " ".join(args)),
     ])
     ctx.actions.write(runner, runner_content, is_executable = True)
 
@@ -65,6 +65,7 @@ def runtime_test(name, **kwargs):
             "local",
             "manual",
         ],
+        size = "enormous",
         **kwargs
     )
 

@@ -277,7 +277,7 @@ func (fs *filesystem) MknodAt(ctx context.Context, rp *vfs.ResolvingPath, opts v
 		creds := rp.Credentials()
 		var childInode *inode
 		switch opts.Mode.FileType() {
-		case 0, linux.S_IFREG:
+		case linux.S_IFREG:
 			childInode = fs.newRegularFile(creds.EffectiveKUID, creds.EffectiveKGID, opts.Mode)
 		case linux.S_IFIFO:
 			childInode = fs.newNamedPipe(creds.EffectiveKUID, creds.EffectiveKGID, opts.Mode)
@@ -649,7 +649,7 @@ func (fs *filesystem) SetStatAt(ctx context.Context, rp *vfs.ResolvingPath, opts
 		fs.mu.RUnlock()
 		return err
 	}
-	if err := d.inode.setStat(ctx, rp.Credentials(), &opts.Stat); err != nil {
+	if err := d.inode.setStat(ctx, rp.Credentials(), &opts); err != nil {
 		fs.mu.RUnlock()
 		return err
 	}

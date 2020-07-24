@@ -1200,15 +1200,13 @@ func (n *NIC) DeliverNetworkPacket(remote, local tcpip.LinkAddress, protocol tcp
 
 	// Are any packet sockets listening for this network protocol?
 	packetEPs := n.mu.packetEPs[protocol]
-	// Check whether there are packet sockets listening for every protocol.
-	// If we received a packet with protocol EthernetProtocolAll, then the
-	// previous for loop will have handled it.
-	if protocol != header.EthernetProtocolAll {
-		packetEPs = append(packetEPs, n.mu.packetEPs[header.EthernetProtocolAll]...)
-	}
+	// Add any other packet sockets that maybe listening for all protocols.
+	packetEPs = append(packetEPs, n.mu.packetEPs[header.EthernetProtocolAll]...)
 	n.mu.RUnlock()
 	for _, ep := range packetEPs {
-		ep.HandlePacket(n.id, local, protocol, pkt.Clone())
+		p := pkt.Clone()
+		p.PktType = tcpip.PacketHost
+		ep.HandlePacket(n.id, local, protocol, p)
 	}
 
 	if netProto.Number() == header.IPv4ProtocolNumber || netProto.Number() == header.IPv6ProtocolNumber {
@@ -1311,6 +1309,24 @@ func (n *NIC) DeliverNetworkPacket(remote, local tcpip.LinkAddress, protocol tcp
 	}
 }
 
+// DeliverOutboundPacket implements NetworkDispatcher.DeliverOutboundPacket.
+func (n *NIC) DeliverOutboundPacket(remote, local tcpip.LinkAddress, protocol tcpip.NetworkProtocolNumber, pkt *PacketBuffer) {
+	n.mu.RLock()
+	// We do not deliver to protocol specific packet endpoints as on Linux
+	// only ETH_P_ALL endpoints get outbound packets.
+	// Add any other packet sockets that maybe listening for all protocols.
+	packetEPs := n.mu.packetEPs[header.EthernetProtocolAll]
+	n.mu.RUnlock()
+	for _, ep := range packetEPs {
+		p := pkt.Clone()
+		p.PktType = tcpip.PacketOutgoing
+		// Add the link layer header as outgoing packets are intercepted
+		// before the link layer header is created.
+		n.linkEP.AddHeader(local, remote, protocol, p)
+		ep.HandlePacket(n.id, local, protocol, p)
+	}
+}
+
 func (n *NIC) forwardPacket(r *Route, protocol tcpip.NetworkProtocolNumber, pkt *PacketBuffer) {
 	// TODO(b/143425874) Decrease the TTL field in forwarded packets.
 	// TODO(b/151227689): Avoid copying the packet when forwarding. We can do this
@@ -1358,16 +1374,19 @@ func (n *NIC) DeliverTransportPacket(r *Route, protocol tcpip.TransportProtocolN
 	// TransportHeader is nil only when pkt is an ICMP packet or was reassembled
 	// from fragments.
 	if pkt.TransportHeader == nil {
-		// TODO(gvisor.dev/issue/170): ICMP packets don't have their
-		// TransportHeader fields set. See icmp/protocol.go:protocol.Parse for a
+		// TODO(gvisor.dev/issue/170): ICMP packets don't have their TransportHeader
+		// fields set yet, parse it here. See icmp/protocol.go:protocol.Parse for a
 		// full explanation.
 		if protocol == header.ICMPv4ProtocolNumber || protocol == header.ICMPv6ProtocolNumber {
+			// ICMP packets may be longer, but until icmp.Parse is implemented, here
+			// we parse it using the minimum size.
 			transHeader, ok := pkt.Data.PullUp(transProto.MinimumPacketSize())
 			if !ok {
 				n.stack.stats.MalformedRcvdPackets.Increment()
 				return
 			}
 			pkt.TransportHeader = transHeader
+			pkt.Data.TrimFront(len(pkt.TransportHeader))
 		} else {
 			// This is either a bad packet or was re-assembled from fragments.
 			transProto.Parse(pkt)

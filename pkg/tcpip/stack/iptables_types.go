@@ -78,18 +78,20 @@ const (
 )
 
 // IPTables holds all the tables for a netstack.
+//
+// +stateify savable
 type IPTables struct {
 	// mu protects tables, priorities, and modified.
 	mu sync.RWMutex
 
-	// tables maps table names to tables. User tables have arbitrary names.
-	// mu needs to be locked for accessing.
-	tables map[string]Table
+	// tables maps tableIDs to tables. Holds builtin tables only, not user
+	// tables. mu must be locked for accessing.
+	tables [numTables]Table
 
 	// priorities maps each hook to a list of table names. The order of the
 	// list is the order in which each table should be visited for that
 	// hook. mu needs to be locked for accessing.
-	priorities map[Hook][]string
+	priorities [NumHooks][]tableID
 
 	// modified is whether tables have been modified at least once. It is
 	// used to elide the iptables performance overhead for workloads that
@@ -97,31 +99,34 @@ type IPTables struct {
 	modified bool
 
 	connections ConnTrack
+
+	// reaperDone can be signalled to stop the reaper goroutine.
+	reaperDone chan struct{}
 }
 
 // A Table defines a set of chains and hooks into the network stack. It is
 // really just a list of rules.
+//
+// +stateify savable
 type Table struct {
 	// Rules holds the rules that make up the table.
 	Rules []Rule
 
 	// BuiltinChains maps builtin chains to their entrypoint rule in Rules.
-	BuiltinChains map[Hook]int
+	BuiltinChains [NumHooks]int
 
 	// Underflows maps builtin chains to their underflow rule in Rules
 	// (i.e. the rule to execute if the chain returns without a verdict).
-	Underflows map[Hook]int
-
-	// UserChains holds user-defined chains for the keyed by name. Users
-	// can give their chains arbitrary names.
-	UserChains map[string]int
+	Underflows [NumHooks]int
 }
 
 // ValidHooks returns a bitmap of the builtin hooks for the given table.
 func (table *Table) ValidHooks() uint32 {
 	hooks := uint32(0)
-	for hook := range table.BuiltinChains {
-		hooks |= 1 << hook
+	for hook, ruleIdx := range table.BuiltinChains {
+		if ruleIdx != HookUnset {
+			hooks |= 1 << hook
+		}
 	}
 	return hooks
 }
@@ -130,6 +135,8 @@ func (table *Table) ValidHooks() uint32 {
 // contains zero or more matchers, each of which is a specification of which
 // packets this rule applies to. If there are no matchers in the rule, it
 // applies to any packet.
+//
+// +stateify savable
 type Rule struct {
 	// Filter holds basic IP filtering fields common to every rule.
 	Filter IPHeaderFilter
@@ -142,6 +149,8 @@ type Rule struct {
 }
 
 // IPHeaderFilter holds basic IP filtering data common to every rule.
+//
+// +stateify savable
 type IPHeaderFilter struct {
 	// Protocol matches the transport protocol.
 	Protocol tcpip.TransportProtocolNumber

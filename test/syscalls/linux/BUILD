@@ -943,6 +943,7 @@ cc_binary(
         "//test/util:eventfd_util",
         "//test/util:file_descriptor",
         "//test/util:fs_util",
+        "@com_google_absl//absl/container:node_hash_set",
         "@com_google_absl//absl/strings",
         gtest,
         "//test/util:posix_error",
@@ -1330,6 +1331,7 @@ cc_binary(
     name = "packet_socket_raw_test",
     testonly = 1,
     srcs = ["packet_socket_raw.cc"],
+    defines = select_system(),
     linkstatic = 1,
     deps = [
         ":socket_test_util",
@@ -1809,6 +1811,7 @@ cc_binary(
     name = "raw_socket_test",
     testonly = 1,
     srcs = ["raw_socket.cc"],
+    defines = select_system(),
     linkstatic = 1,
     deps = [
         ":socket_test_util",
@@ -3407,6 +3410,7 @@ cc_binary(
     name = "tcp_socket_test",
     testonly = 1,
     srcs = ["tcp_socket.cc"],
+    defines = select_system(),
     linkstatic = 1,
     deps = [
         ":socket_test_util",

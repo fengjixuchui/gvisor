@@ -13,6 +13,9 @@
 // limitations under the License.
 
 #include <linux/capability.h>
+#ifndef __fuchsia__
+#include <linux/filter.h>
+#endif  // __fuchsia__
 #include <netinet/in.h>
 #include <netinet/ip.h>
 #include <netinet/ip6.h>
@@ -21,6 +24,7 @@
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <unistd.h>
+
 #include <algorithm>
 
 #include "gtest/gtest.h"
@@ -256,6 +260,27 @@ TEST_P(RawSocketTest, SendWithoutConnectFails) {
   constexpr char kBuf[] = "Endgame was good";
   ASSERT_THAT(send(s_, kBuf, sizeof(kBuf), 0),
               SyscallFailsWithErrno(EDESTADDRREQ));
+}
+
+// Wildcard Bind.
+TEST_P(RawSocketTest, BindToWildcard) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_NET_RAW)));
+  struct sockaddr_storage addr;
+  addr = {};
+
+  // We don't set ports because raw sockets don't have a notion of ports.
+  if (Family() == AF_INET) {
+    struct sockaddr_in* sin = reinterpret_cast<struct sockaddr_in*>(&addr);
+    sin->sin_family = AF_INET;
+    sin->sin_addr.s_addr = htonl(INADDR_ANY);
+  } else {
+    struct sockaddr_in6* sin6 = reinterpret_cast<struct sockaddr_in6*>(&addr);
+    sin6->sin6_family = AF_INET6;
+    sin6->sin6_addr = in6addr_any;
+  }
+
+  ASSERT_THAT(bind(s_, reinterpret_cast<struct sockaddr*>(&addr_), AddrLen()),
+              SyscallSucceeds());
 }
 
 // Bind to localhost.
@@ -790,10 +815,30 @@ void RawSocketTest::ReceiveBufFrom(int sock, char* recv_buf,
   ASSERT_NO_FATAL_FAILURE(RecvNoCmsg(sock, recv_buf, recv_buf_len));
 }
 
-INSTANTIATE_TEST_SUITE_P(AllInetTests, RawSocketTest,
-                         ::testing::Combine(
-                             ::testing::Values(IPPROTO_TCP, IPPROTO_UDP),
-                             ::testing::Values(AF_INET, AF_INET6)));
+#ifndef __fuchsia__
+
+TEST_P(RawSocketTest, SetSocketDetachFilterNoInstalledFilter) {
+  // TODO(gvisor.dev/2746): Support SO_ATTACH_FILTER/SO_DETACH_FILTER.
+  if (IsRunningOnGvisor()) {
+    constexpr int val = 0;
+    ASSERT_THAT(setsockopt(s_, SOL_SOCKET, SO_DETACH_FILTER, &val, sizeof(val)),
+                SyscallSucceeds());
+    return;
+  }
+
+  constexpr int val = 0;
+  ASSERT_THAT(setsockopt(s_, SOL_SOCKET, SO_DETACH_FILTER, &val, sizeof(val)),
+              SyscallFailsWithErrno(ENOENT));
+}
+
+TEST_P(RawSocketTest, GetSocketDetachFilter) {
+  int val = 0;
+  socklen_t val_len = sizeof(val);
+  ASSERT_THAT(getsockopt(s_, SOL_SOCKET, SO_DETACH_FILTER, &val, &val_len),
+              SyscallFailsWithErrno(ENOPROTOOPT));
+}
+
+#endif  //  __fuchsia__
 
 // AF_INET6+SOCK_RAW+IPPROTO_RAW sockets can be created, but not written to.
 TEST(RawSocketTest, IPv6ProtoRaw) {
@@ -812,6 +857,11 @@ TEST(RawSocketTest, IPv6ProtoRaw) {
                      reinterpret_cast<struct sockaddr*>(&sin6), sizeof(sin6)),
               SyscallFailsWithErrno(EINVAL));
 }
+
+INSTANTIATE_TEST_SUITE_P(
+    AllInetTests, RawSocketTest,
+    ::testing::Combine(::testing::Values(IPPROTO_TCP, IPPROTO_UDP),
+                       ::testing::Values(AF_INET, AF_INET6)));
 
 }  // namespace
 

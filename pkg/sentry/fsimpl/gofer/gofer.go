@@ -602,8 +602,14 @@ type dentry struct {
 	// returned by the server. dirents is protected by dirMu.
 	dirents []vfs.Dirent
 
-	// Cached metadata; protected by metadataMu and accessed using atomic
-	// memory operations unless otherwise specified.
+	// Cached metadata; protected by metadataMu.
+	// To access:
+	//   - In situations where consistency is not required (like stat), these
+	//     can be accessed using atomic operations only (without locking).
+	//   - Lock metadataMu and can access without atomic operations.
+	// To mutate:
+	//   - Lock metadataMu and use atomic operations to update because we might
+	//     have atomic readers that don't hold the lock.
 	metadataMu sync.Mutex
 	ino        inodeNumber // immutable
 	mode       uint32      // type is immutable, perms are mutable
@@ -616,7 +622,7 @@ type dentry struct {
 	ctime int64
 	btime int64
 	// File size, protected by both metadataMu and dataMu (i.e. both must be
-	// locked to mutate it).
+	// locked to mutate it; locking either is sufficient to access it).
 	size uint64
 
 	// nlink counts the number of hard links to this dentry. It's updated and
@@ -779,8 +785,8 @@ func (d *dentry) cachedMetadataAuthoritative() bool {
 
 // updateFromP9Attrs is called to update d's metadata after an update from the
 // remote filesystem.
-func (d *dentry) updateFromP9Attrs(mask p9.AttrMask, attr *p9.Attr) {
-	d.metadataMu.Lock()
+// Precondition: d.metadataMu must be locked.
+func (d *dentry) updateFromP9AttrsLocked(mask p9.AttrMask, attr *p9.Attr) {
 	if mask.Mode {
 		if got, want := uint32(attr.Mode.FileType()), d.fileType(); got != want {
 			d.metadataMu.Unlock()
@@ -816,7 +822,6 @@ func (d *dentry) updateFromP9Attrs(mask p9.AttrMask, attr *p9.Attr) {
 	if mask.Size {
 		d.updateFileSizeLocked(attr.Size)
 	}
-	d.metadataMu.Unlock()
 }
 
 // Preconditions: !d.isSynthetic()
@@ -828,6 +833,10 @@ func (d *dentry) updateFromGetattr(ctx context.Context) error {
 		file            p9file
 		handleMuRLocked bool
 	)
+	// d.metadataMu must be locked *before* we getAttr so that we do not end up
+	// updating stale attributes in d.updateFromP9AttrsLocked().
+	d.metadataMu.Lock()
+	defer d.metadataMu.Unlock()
 	d.handleMu.RLock()
 	if !d.handle.file.isNil() {
 		file = d.handle.file
@@ -843,7 +852,7 @@ func (d *dentry) updateFromGetattr(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	d.updateFromP9Attrs(attrMask, &attr)
+	d.updateFromP9AttrsLocked(attrMask, &attr)
 	return nil
 }
 
@@ -879,7 +888,8 @@ func (d *dentry) statTo(stat *linux.Statx) {
 	stat.DevMinor = d.fs.devMinor
 }
 
-func (d *dentry) setStat(ctx context.Context, creds *auth.Credentials, stat *linux.Statx, mnt *vfs.Mount) error {
+func (d *dentry) setStat(ctx context.Context, creds *auth.Credentials, opts *vfs.SetStatOptions, mnt *vfs.Mount) error {
+	stat := &opts.Stat
 	if stat.Mask == 0 {
 		return nil
 	}
@@ -887,7 +897,7 @@ func (d *dentry) setStat(ctx context.Context, creds *auth.Credentials, stat *lin
 		return syserror.EPERM
 	}
 	mode := linux.FileMode(atomic.LoadUint32(&d.mode))
-	if err := vfs.CheckSetStat(ctx, creds, stat, mode, auth.KUID(atomic.LoadUint32(&d.uid)), auth.KGID(atomic.LoadUint32(&d.gid))); err != nil {
+	if err := vfs.CheckSetStat(ctx, creds, opts, mode, auth.KUID(atomic.LoadUint32(&d.uid)), auth.KGID(atomic.LoadUint32(&d.gid))); err != nil {
 		return err
 	}
 	if err := mnt.CheckBeginWrite(); err != nil {
@@ -904,14 +914,14 @@ func (d *dentry) setStat(ctx context.Context, creds *auth.Credentials, stat *lin
 
 		// Prepare for truncate.
 		if stat.Mask&linux.STATX_SIZE != 0 {
-			switch d.mode & linux.S_IFMT {
-			case linux.S_IFREG:
+			switch mode.FileType() {
+			case linux.ModeRegular:
 				if !setLocalMtime {
 					// Truncate updates mtime.
 					setLocalMtime = true
 					stat.Mtime.Nsec = linux.UTIME_NOW
 				}
-			case linux.S_IFDIR:
+			case linux.ModeDirectory:
 				return syserror.EISDIR
 			default:
 				return syserror.EINVAL
@@ -928,6 +938,17 @@ func (d *dentry) setStat(ctx context.Context, creds *auth.Credentials, stat *lin
 	}
 	if !d.isSynthetic() {
 		if stat.Mask != 0 {
+			if stat.Mask&linux.STATX_SIZE != 0 {
+				// Check whether to allow a truncate request to be made.
+				switch d.mode & linux.S_IFMT {
+				case linux.S_IFREG:
+					// Allow.
+				case linux.S_IFDIR:
+					return syserror.EISDIR
+				default:
+					return syserror.EINVAL
+				}
+			}
 			if err := d.file.setAttr(ctx, p9.SetAttrMask{
 				Permissions:        stat.Mask&linux.STATX_MODE != 0,
 				UID:                stat.Mask&linux.STATX_UID != 0,
@@ -994,7 +1015,7 @@ func (d *dentry) setStat(ctx context.Context, creds *auth.Credentials, stat *lin
 func (d *dentry) updateFileSizeLocked(newSize uint64) {
 	d.dataMu.Lock()
 	oldSize := d.size
-	d.size = newSize
+	atomic.StoreUint64(&d.size, newSize)
 	// d.dataMu must be unlocked to lock d.mapsMu and invalidate mappings
 	// below. This allows concurrent calls to Read/Translate/etc. These
 	// functions synchronize with truncation by refusing to use cache
@@ -1340,8 +1361,8 @@ func (d *dentry) removexattr(ctx context.Context, creds *auth.Credentials, name 
 // Extended attributes in the user.* namespace are only supported for regular
 // files and directories.
 func (d *dentry) userXattrSupported() bool {
-	filetype := linux.S_IFMT & atomic.LoadUint32(&d.mode)
-	return filetype == linux.S_IFREG || filetype == linux.S_IFDIR
+	filetype := linux.FileMode(atomic.LoadUint32(&d.mode)).FileType()
+	return filetype == linux.ModeRegular || filetype == linux.ModeDirectory
 }
 
 // Preconditions: !d.isSynthetic(). d.isRegularFile() || d.isDir().
@@ -1489,7 +1510,7 @@ func (fd *fileDescription) Stat(ctx context.Context, opts vfs.StatOptions) (linu
 
 // SetStat implements vfs.FileDescriptionImpl.SetStat.
 func (fd *fileDescription) SetStat(ctx context.Context, opts vfs.SetStatOptions) error {
-	if err := fd.dentry().setStat(ctx, auth.CredentialsFromContext(ctx), &opts.Stat, fd.vfsfd.Mount()); err != nil {
+	if err := fd.dentry().setStat(ctx, auth.CredentialsFromContext(ctx), &opts, fd.vfsfd.Mount()); err != nil {
 		return err
 	}
 	if ev := vfs.InotifyEventFromStatMask(opts.Stat.Mask); ev != 0 {

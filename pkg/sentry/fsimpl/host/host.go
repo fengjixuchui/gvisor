@@ -259,7 +259,7 @@ func (i *inode) Mode() linux.FileMode {
 }
 
 // Stat implements kernfs.Inode.
-func (i *inode) Stat(vfsfs *vfs.Filesystem, opts vfs.StatOptions) (linux.Statx, error) {
+func (i *inode) Stat(ctx context.Context, vfsfs *vfs.Filesystem, opts vfs.StatOptions) (linux.Statx, error) {
 	if opts.Mask&linux.STATX__RESERVED != 0 {
 		return linux.Statx{}, syserror.EINVAL
 	}
@@ -373,7 +373,7 @@ func (i *inode) fstat(fs *filesystem) (linux.Statx, error) {
 
 // SetStat implements kernfs.Inode.
 func (i *inode) SetStat(ctx context.Context, fs *vfs.Filesystem, creds *auth.Credentials, opts vfs.SetStatOptions) error {
-	s := opts.Stat
+	s := &opts.Stat
 
 	m := s.Mask
 	if m == 0 {
@@ -386,7 +386,7 @@ func (i *inode) SetStat(ctx context.Context, fs *vfs.Filesystem, creds *auth.Cre
 	if err := syscall.Fstat(i.hostFD, &hostStat); err != nil {
 		return err
 	}
-	if err := vfs.CheckSetStat(ctx, creds, &s, linux.FileMode(hostStat.Mode&linux.PermissionsMask), auth.KUID(hostStat.Uid), auth.KGID(hostStat.Gid)); err != nil {
+	if err := vfs.CheckSetStat(ctx, creds, &opts, linux.FileMode(hostStat.Mode), auth.KUID(hostStat.Uid), auth.KGID(hostStat.Gid)); err != nil {
 		return err
 	}
 
@@ -396,6 +396,9 @@ func (i *inode) SetStat(ctx context.Context, fs *vfs.Filesystem, creds *auth.Cre
 		}
 	}
 	if m&linux.STATX_SIZE != 0 {
+		if hostStat.Mode&linux.S_IFMT != linux.S_IFREG {
+			return syserror.EINVAL
+		}
 		if err := syscall.Ftruncate(i.hostFD, int64(s.Size)); err != nil {
 			return err
 		}
@@ -534,8 +537,8 @@ func (f *fileDescription) SetStat(ctx context.Context, opts vfs.SetStatOptions) 
 }
 
 // Stat implements vfs.FileDescriptionImpl.
-func (f *fileDescription) Stat(_ context.Context, opts vfs.StatOptions) (linux.Statx, error) {
-	return f.inode.Stat(f.vfsfd.Mount().Filesystem(), opts)
+func (f *fileDescription) Stat(ctx context.Context, opts vfs.StatOptions) (linux.Statx, error) {
+	return f.inode.Stat(ctx, f.vfsfd.Mount().Filesystem(), opts)
 }
 
 // Release implements vfs.FileDescriptionImpl.

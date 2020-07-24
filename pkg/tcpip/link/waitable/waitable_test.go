@@ -19,6 +19,7 @@ import (
 
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/buffer"
+	"gvisor.dev/gvisor/pkg/tcpip/header"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
 )
 
@@ -37,6 +38,10 @@ type countedEndpoint struct {
 
 func (e *countedEndpoint) DeliverNetworkPacket(remote, local tcpip.LinkAddress, protocol tcpip.NetworkProtocolNumber, pkt *stack.PacketBuffer) {
 	e.dispatchCount++
+}
+
+func (e *countedEndpoint) DeliverOutboundPacket(remote, local tcpip.LinkAddress, protocol tcpip.NetworkProtocolNumber, pkt *stack.PacketBuffer) {
+	panic("unimplemented")
 }
 
 func (e *countedEndpoint) Attach(dispatcher stack.NetworkDispatcher) {
@@ -81,8 +86,18 @@ func (e *countedEndpoint) WriteRawPacket(buffer.VectorisedView) *tcpip.Error {
 	return nil
 }
 
+// ARPHardwareType implements stack.LinkEndpoint.ARPHardwareType.
+func (*countedEndpoint) ARPHardwareType() header.ARPHardwareType {
+	panic("unimplemented")
+}
+
 // Wait implements stack.LinkEndpoint.Wait.
 func (*countedEndpoint) Wait() {}
+
+// AddHeader implements stack.LinkEndpoint.AddHeader.
+func (e *countedEndpoint) AddHeader(local, remote tcpip.LinkAddress, protocol tcpip.NetworkProtocolNumber, pkt *stack.PacketBuffer) {
+	panic("unimplemented")
+}
 
 func TestWaitWrite(t *testing.T) {
 	ep := &countedEndpoint{}

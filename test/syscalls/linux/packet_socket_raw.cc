@@ -14,6 +14,9 @@
 
 #include <arpa/inet.h>
 #include <linux/capability.h>
+#ifndef __fuchsia__
+#include <linux/filter.h>
+#endif  // __fuchsia__
 #include <linux/if_arp.h>
 #include <linux/if_packet.h>
 #include <net/ethernet.h>
@@ -197,6 +200,7 @@ TEST_P(RawPacketTest, Receive) {
   EXPECT_EQ(src.sll_family, AF_PACKET);
   EXPECT_EQ(src.sll_ifindex, GetLoopbackIndex());
   EXPECT_EQ(src.sll_halen, ETH_ALEN);
+  EXPECT_EQ(ntohs(src.sll_protocol), ETH_P_IP);
   // This came from the loopback device, so the address is all 0s.
   for (int i = 0; i < src.sll_halen; i++) {
     EXPECT_EQ(src.sll_addr[i], 0);
@@ -555,6 +559,95 @@ TEST_P(RawPacketTest, SetSocketSendBuf) {
 
   ASSERT_EQ(quarter_sz, val);
 }
+
+TEST_P(RawPacketTest, GetSocketError) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_NET_RAW)));
+
+  int val = 0;
+  socklen_t val_len = sizeof(val);
+  ASSERT_THAT(getsockopt(s_, SOL_SOCKET, SO_ERROR, &val, &val_len),
+              SyscallSucceeds());
+  ASSERT_EQ(val, 0);
+}
+
+TEST_P(RawPacketTest, GetSocketErrorBind) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_NET_RAW)));
+
+  {
+    // Bind to the loopback device.
+    struct sockaddr_ll bind_addr = {};
+    bind_addr.sll_family = AF_PACKET;
+    bind_addr.sll_protocol = htons(GetParam());
+    bind_addr.sll_ifindex = GetLoopbackIndex();
+
+    ASSERT_THAT(bind(s_, reinterpret_cast<struct sockaddr*>(&bind_addr),
+                     sizeof(bind_addr)),
+                SyscallSucceeds());
+
+    // SO_ERROR should return no errors.
+    int val = 0;
+    socklen_t val_len = sizeof(val);
+    ASSERT_THAT(getsockopt(s_, SOL_SOCKET, SO_ERROR, &val, &val_len),
+                SyscallSucceeds());
+    ASSERT_EQ(val, 0);
+  }
+
+  {
+    // Now try binding to an invalid interface.
+    struct sockaddr_ll bind_addr = {};
+    bind_addr.sll_family = AF_PACKET;
+    bind_addr.sll_protocol = htons(GetParam());
+    bind_addr.sll_ifindex = 0xffff;  // Just pick a really large number.
+
+    // Binding should fail with EINVAL
+    ASSERT_THAT(bind(s_, reinterpret_cast<struct sockaddr*>(&bind_addr),
+                     sizeof(bind_addr)),
+                SyscallFailsWithErrno(ENODEV));
+
+    // SO_ERROR does not return error when the device is invalid.
+    // On Linux there is just one odd ball condition where this can return
+    // an error where the device was valid and then removed or disabled
+    // between the first check for index and the actual registration of
+    // the packet endpoint. On Netstack this is not possible as the stack
+    // global mutex is held during registration and check.
+    int val = 0;
+    socklen_t val_len = sizeof(val);
+    ASSERT_THAT(getsockopt(s_, SOL_SOCKET, SO_ERROR, &val, &val_len),
+                SyscallSucceeds());
+    ASSERT_EQ(val, 0);
+  }
+}
+
+#ifndef __fuchsia__
+
+TEST_P(RawPacketTest, SetSocketDetachFilterNoInstalledFilter) {
+  // TODO(gvisor.dev/2746): Support SO_ATTACH_FILTER/SO_DETACH_FILTER.
+  //
+  // gVisor returns no error on SO_DETACH_FILTER even if there is no filter
+  // attached unlike linux which does return ENOENT in such cases. This is
+  // because gVisor doesn't support SO_ATTACH_FILTER and just silently returns
+  // success.
+  if (IsRunningOnGvisor()) {
+    constexpr int val = 0;
+    ASSERT_THAT(setsockopt(s_, SOL_SOCKET, SO_DETACH_FILTER, &val, sizeof(val)),
+                SyscallSucceeds());
+    return;
+  }
+  constexpr int val = 0;
+  ASSERT_THAT(setsockopt(s_, SOL_SOCKET, SO_DETACH_FILTER, &val, sizeof(val)),
+              SyscallFailsWithErrno(ENOENT));
+}
+
+TEST_P(RawPacketTest, GetSocketDetachFilter) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_NET_RAW)));
+
+  int val = 0;
+  socklen_t val_len = sizeof(val);
+  ASSERT_THAT(getsockopt(s_, SOL_SOCKET, SO_DETACH_FILTER, &val, &val_len),
+              SyscallFailsWithErrno(ENOPROTOOPT));
+}
+
+#endif  // __fuchsia__
 
 INSTANTIATE_TEST_SUITE_P(AllInetTests, RawPacketTest,
                          ::testing::Values(ETH_P_IP, ETH_P_ALL));
