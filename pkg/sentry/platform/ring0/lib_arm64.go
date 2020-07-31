@@ -20,13 +20,13 @@ package ring0
 func CPACREL1() (value uintptr)
 
 // FPCR returns the value of FPCR register.
-func FPCR() (value uintptr)
+func GetFPCR() (value uintptr)
 
 // SetFPCR writes the FPCR value.
 func SetFPCR(value uintptr)
 
 // FPSR returns the value of FPSR register.
-func FPSR() (value uintptr)
+func GetFPSR() (value uintptr)
 
 // SetFPSR writes the FPSR value.
 func SetFPSR(value uintptr)
@@ -37,3 +37,16 @@ func SaveVRegs(*byte)
 
 // LoadVRegs loads V0-V31 registers.
 func LoadVRegs(*byte)
+
+// GetTLS returns the value of TPIDR_EL0 register.
+func GetTLS() (value uint64)
+
+// SetTLS writes the TPIDR_EL0 value.
+func SetTLS(value uint64)
+
+// Init sets function pointers based on architectural features.
+//
+// This must be called prior to using ring0.
+func Init() {
+	rewriteVectors()
+}

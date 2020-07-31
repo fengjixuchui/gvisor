@@ -23,23 +23,7 @@ import (
 	"gvisor.dev/gvisor/pkg/usermem"
 )
 
-func statFromAttrs(t *kernel.Task, sattr fs.StableAttr, uattr fs.UnstableAttr) linux.Stat {
-	return linux.Stat{
-		Dev:     sattr.DeviceID,
-		Ino:     sattr.InodeID,
-		Nlink:   uattr.Links,
-		Mode:    sattr.Type.LinuxType() | uint32(uattr.Perms.LinuxMode()),
-		UID:     uint32(uattr.Owner.UID.In(t.UserNamespace()).OrOverflow()),
-		GID:     uint32(uattr.Owner.GID.In(t.UserNamespace()).OrOverflow()),
-		Rdev:    uint64(linux.MakeDeviceID(sattr.DeviceFileMajor, sattr.DeviceFileMinor)),
-		Size:    uattr.Size,
-		Blksize: sattr.BlockSize,
-		Blocks:  uattr.Usage / 512,
-		ATime:   uattr.AccessTime.Timespec(),
-		MTime:   uattr.ModificationTime.Timespec(),
-		CTime:   uattr.StatusChangeTime.Timespec(),
-	}
-}
+// LINT.IfChange
 
 // Stat implements linux syscall stat(2).
 func Stat(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error) {
@@ -154,7 +138,10 @@ func Statx(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.Syscall
 	mask := args[3].Uint()
 	statxAddr := args[4].Pointer()
 
-	if mask&linux.STATX__RESERVED > 0 {
+	if mask&linux.STATX__RESERVED != 0 {
+		return 0, nil, syserror.EINVAL
+	}
+	if flags&^(linux.AT_SYMLINK_NOFOLLOW|linux.AT_EMPTY_PATH|linux.AT_STATX_SYNC_TYPE) != 0 {
 		return 0, nil, syserror.EINVAL
 	}
 	if flags&linux.AT_STATX_SYNC_TYPE == linux.AT_STATX_SYNC_TYPE {
@@ -299,3 +286,5 @@ func statfsImpl(t *kernel.Task, d *fs.Dirent, addr usermem.Addr) error {
 	_, err = t.CopyOut(addr, &statfs)
 	return err
 }
+
+// LINT.ThenChange(vfs2/stat.go)

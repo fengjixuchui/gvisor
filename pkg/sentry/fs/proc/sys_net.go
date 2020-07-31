@@ -80,7 +80,7 @@ func newTCPMemInode(ctx context.Context, msrc *fs.MountSource, s inet.Stack, dir
 }
 
 // Truncate implements fs.InodeOperations.Truncate.
-func (tcpMemInode) Truncate(context.Context, *fs.Inode, int64) error {
+func (*tcpMemInode) Truncate(context.Context, *fs.Inode, int64) error {
 	return nil
 }
 
@@ -196,7 +196,7 @@ func newTCPSackInode(ctx context.Context, msrc *fs.MountSource, s inet.Stack) *f
 }
 
 // Truncate implements fs.InodeOperations.Truncate.
-func (tcpSack) Truncate(context.Context, *fs.Inode, int64) error {
+func (*tcpSack) Truncate(context.Context, *fs.Inode, int64) error {
 	return nil
 }
 
@@ -357,7 +357,9 @@ func (p *proc) newSysNetIPv4Dir(ctx context.Context, msrc *fs.MountSource, s ine
 
 func (p *proc) newSysNetDir(ctx context.Context, msrc *fs.MountSource) *fs.Inode {
 	var contents map[string]*fs.Inode
-	if s := p.k.NetworkStack(); s != nil {
+	// TODO(gvisor.dev/issue/1833): Support for using the network stack in the
+	// network namespace of the calling process.
+	if s := p.k.RootNetworkNamespace().Stack(); s != nil {
 		contents = map[string]*fs.Inode{
 			"ipv4": p.newSysNetIPv4Dir(ctx, msrc, s),
 			"core": p.newSysNetCore(ctx, msrc, s),

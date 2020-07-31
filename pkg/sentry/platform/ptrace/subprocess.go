@@ -24,6 +24,7 @@ import (
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/procid"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
+	"gvisor.dev/gvisor/pkg/sentry/memmap"
 	"gvisor.dev/gvisor/pkg/sentry/platform"
 	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/usermem"
@@ -63,7 +64,7 @@ type thread struct {
 	// initRegs are the initial registers for the first thread.
 	//
 	// These are used for the register set for system calls.
-	initRegs syscall.PtraceRegs
+	initRegs arch.Registers
 }
 
 // threadPool is a collection of threads.
@@ -317,7 +318,7 @@ const (
 )
 
 func (t *thread) dumpAndPanic(message string) {
-	var regs syscall.PtraceRegs
+	var regs arch.Registers
 	message += "\n"
 	if err := t.getRegs(&regs); err == nil {
 		message += dumpRegs(&regs)
@@ -332,7 +333,7 @@ func (t *thread) unexpectedStubExit() {
 	msg, err := t.getEventMessage()
 	status := syscall.WaitStatus(msg)
 	if status.Signaled() && status.Signal() == syscall.SIGKILL {
-		// SIGKILL can be only sent by an user or OOM-killer. In both
+		// SIGKILL can be only sent by a user or OOM-killer. In both
 		// these cases, we don't need to panic. There is no reasons to
 		// think that something wrong in gVisor.
 		log.Warningf("The ptrace stub process %v has been killed by SIGKILL.", t.tgid)
@@ -423,7 +424,7 @@ func (t *thread) init() {
 // This is _not_ for use by application system calls, rather it is for use when
 // a system call must be injected into the remote context (e.g. mmap, munmap).
 // Note that clones are handled separately.
-func (t *thread) syscall(regs *syscall.PtraceRegs) (uintptr, error) {
+func (t *thread) syscall(regs *arch.Registers) (uintptr, error) {
 	// Set registers.
 	if err := t.setRegs(regs); err != nil {
 		panic(fmt.Sprintf("ptrace set regs failed: %v", err))
@@ -461,7 +462,7 @@ func (t *thread) syscall(regs *syscall.PtraceRegs) (uintptr, error) {
 // syscallIgnoreInterrupt ignores interrupts on the system call thread and
 // restarts the syscall if the kernel indicates that should happen.
 func (t *thread) syscallIgnoreInterrupt(
-	initRegs *syscall.PtraceRegs,
+	initRegs *arch.Registers,
 	sysno uintptr,
 	args ...arch.SyscallArgument) (uintptr, error) {
 	for {
@@ -506,6 +507,9 @@ func (s *subprocess) switchToApp(c *context, ac arch.Context) bool {
 	regs := &ac.StateData().Regs
 	t.resetSysemuRegs(regs)
 
+	// Extract TLS register
+	tls := uint64(ac.TLS())
+
 	// Check for interrupts, and ensure that future interrupts will signal t.
 	if !c.interrupt.Enable(t) {
 		// Pending interrupt; simulate.
@@ -525,6 +529,9 @@ func (s *subprocess) switchToApp(c *context, ac arch.Context) bool {
 	}
 	if err := t.setFPRegs(fpState, uint64(fpLen), useXsave); err != nil {
 		panic(fmt.Sprintf("ptrace set fpregs (%+v) failed: %v", fpState, err))
+	}
+	if err := t.setTLS(&tls); err != nil {
+		panic(fmt.Sprintf("ptrace set tls (%+v) failed: %v", tls, err))
 	}
 
 	for {
@@ -554,6 +561,12 @@ func (s *subprocess) switchToApp(c *context, ac arch.Context) bool {
 		}
 		if err := t.getFPRegs(fpState, uint64(fpLen), useXsave); err != nil {
 			panic(fmt.Sprintf("ptrace get fpregs failed: %v", err))
+		}
+		if err := t.getTLS(&tls); err != nil {
+			panic(fmt.Sprintf("ptrace get tls failed: %v", err))
+		}
+		if !ac.SetTLS(uintptr(tls)) {
+			panic(fmt.Sprintf("tls value %v is invalid", tls))
 		}
 
 		// Is it a system call?
@@ -604,7 +617,7 @@ func (s *subprocess) syscall(sysno uintptr, args ...arch.SyscallArgument) (uintp
 }
 
 // MapFile implements platform.AddressSpace.MapFile.
-func (s *subprocess) MapFile(addr usermem.Addr, f platform.File, fr platform.FileRange, at usermem.AccessType, precommit bool) error {
+func (s *subprocess) MapFile(addr usermem.Addr, f memmap.File, fr memmap.FileRange, at usermem.AccessType, precommit bool) error {
 	var flags int
 	if precommit {
 		flags |= syscall.MAP_POPULATE

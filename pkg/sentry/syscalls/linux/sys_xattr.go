@@ -25,6 +25,8 @@ import (
 	"gvisor.dev/gvisor/pkg/usermem"
 )
 
+// LINT.IfChange
+
 // GetXattr implements linux syscall getxattr(2).
 func GetXattr(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error) {
 	return getXattrFromPath(t, args, true)
@@ -205,7 +207,11 @@ func setXattr(t *kernel.Task, d *fs.Dirent, nameAddr, valueAddr usermem.Addr, si
 		return syserror.EOPNOTSUPP
 	}
 
-	return d.Inode.SetXattr(t, d, name, value, flags)
+	if err := d.Inode.SetXattr(t, d, name, value, flags); err != nil {
+		return err
+	}
+	d.InotifyEvent(linux.IN_ATTRIB, 0)
+	return nil
 }
 
 func copyInXattrName(t *kernel.Task, nameAddr usermem.Addr) (string, error) {
@@ -416,5 +422,11 @@ func removeXattr(t *kernel.Task, d *fs.Dirent, nameAddr usermem.Addr) error {
 		return syserror.EOPNOTSUPP
 	}
 
-	return d.Inode.RemoveXattr(t, d, name)
+	if err := d.Inode.RemoveXattr(t, d, name); err != nil {
+		return err
+	}
+	d.InotifyEvent(linux.IN_ATTRIB, 0)
+	return nil
 }
+
+// LINT.ThenChange(vfs2/xattr.go)

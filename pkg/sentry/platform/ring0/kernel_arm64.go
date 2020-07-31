@@ -16,6 +16,14 @@
 
 package ring0
 
+// HaltAndResume halts execution and point the pointer to the resume function.
+//go:nosplit
+func HaltAndResume()
+
+// HaltEl1SvcAndResume calls Hooks.KernelSyscall and resume.
+//go:nosplit
+func HaltEl1SvcAndResume()
+
 // init initializes architecture-specific state.
 func (k *Kernel) init(opts KernelOpts) {
 	// Save the root page tables.
@@ -50,7 +58,13 @@ func (c *CPU) SwitchToUser(switchOpts SwitchOpts) (vector Vector) {
 
 	regs.Pstate &= ^uint64(UserFlagsClear)
 	regs.Pstate |= UserFlagsSet
+
+	SetTLS(regs.TPIDR_EL0)
+
 	kernelExitToEl0()
+
+	regs.TPIDR_EL0 = GetTLS()
+
 	vector = c.vecCode
 
 	// Perform the switch.

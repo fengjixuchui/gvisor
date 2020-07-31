@@ -45,7 +45,6 @@ import (
 	ktime "gvisor.dev/gvisor/pkg/sentry/kernel/time"
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
-	"gvisor.dev/gvisor/pkg/sentry/platform"
 	"gvisor.dev/gvisor/pkg/sentry/usage"
 	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/syserror"
@@ -370,7 +369,7 @@ type Shm struct {
 
 	// fr is the offset into mfp.MemoryFile() that backs this contents of this
 	// segment. Immutable.
-	fr platform.FileRange
+	fr memmap.FileRange
 
 	// mu protects all fields below.
 	mu sync.Mutex `state:"nosave"`
@@ -461,7 +460,7 @@ func (s *Shm) AddMapping(ctx context.Context, _ memmap.MappingSpace, _ usermem.A
 func (s *Shm) RemoveMapping(ctx context.Context, _ memmap.MappingSpace, _ usermem.AddrRange, _ uint64, _ bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	// TODO(b/38173783): RemoveMapping may be called during task exit, when ctx
+	// RemoveMapping may be called during task exit, when ctx
 	// is context.Background. Gracefully handle missing clocks. Failing to
 	// update the detach time in these cases is ok, since no one can observe the
 	// omission.

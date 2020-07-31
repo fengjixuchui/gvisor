@@ -20,6 +20,8 @@ import (
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/fspath"
+	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
+	"gvisor.dev/gvisor/pkg/sentry/socket/unix/transport"
 )
 
 // A Filesystem is a tree of nodes represented by Dentries, which forms part of
@@ -40,19 +42,28 @@ type Filesystem struct {
 	// immutable.
 	vfs *VirtualFilesystem
 
+	// fsType is the FilesystemType of this Filesystem.
+	fsType FilesystemType
+
 	// impl is the FilesystemImpl associated with this Filesystem. impl is
 	// immutable. This should be the last field in Dentry.
 	impl FilesystemImpl
 }
 
 // Init must be called before first use of fs.
-func (fs *Filesystem) Init(vfsObj *VirtualFilesystem, impl FilesystemImpl) {
+func (fs *Filesystem) Init(vfsObj *VirtualFilesystem, fsType FilesystemType, impl FilesystemImpl) {
 	fs.refs = 1
 	fs.vfs = vfsObj
+	fs.fsType = fsType
 	fs.impl = impl
 	vfsObj.filesystemsMu.Lock()
 	vfsObj.filesystems[fs] = struct{}{}
 	vfsObj.filesystemsMu.Unlock()
+}
+
+// FilesystemType returns the FilesystemType for this Filesystem.
+func (fs *Filesystem) FilesystemType() FilesystemType {
+	return fs.fsType
 }
 
 // VirtualFilesystem returns the containing VirtualFilesystem.
@@ -143,6 +154,9 @@ type FilesystemImpl interface {
 	// Sync "causes all pending modifications to filesystem metadata and cached
 	// file data to be written to the underlying [filesystem]", as by syncfs(2).
 	Sync(ctx context.Context) error
+
+	// AccessAt checks whether a user with creds can access the file at rp.
+	AccessAt(ctx context.Context, rp *ResolvingPath, creds *auth.Credentials, ats AccessTypes) error
 
 	// GetDentryAt returns a Dentry representing the file at rp. A reference is
 	// taken on the returned Dentry.
@@ -332,7 +346,10 @@ type FilesystemImpl interface {
 	// ENOTEMPTY.
 	//
 	// Preconditions: !rp.Done(). For the final path component in rp,
-	// !rp.ShouldFollowSymlink(). oldName is not "." or "..".
+	// !rp.ShouldFollowSymlink(). oldParentVD.Dentry() was obtained from a
+	// previous call to
+	// oldParentVD.Mount().Filesystem().Impl().GetParentDentryAt(). oldName is
+	// not "." or "..".
 	//
 	// Postconditions: If RenameAt returns an error returned by
 	// ResolvingPath.Resolve*(), then !rp.Done().
@@ -362,7 +379,9 @@ type FilesystemImpl interface {
 	// ResolvingPath.Resolve*(), then !rp.Done().
 	RmdirAt(ctx context.Context, rp *ResolvingPath) error
 
-	// SetStatAt updates metadata for the file at the given path.
+	// SetStatAt updates metadata for the file at the given path. Implementations
+	// are responsible for checking if the operation can be performed
+	// (see vfs.CheckSetStat() for common checks).
 	//
 	// Errors:
 	//
@@ -424,9 +443,14 @@ type FilesystemImpl interface {
 	// Errors:
 	//
 	// - If extended attributes are not supported by the filesystem,
-	// ListxattrAt returns nil. (See FileDescription.Listxattr for an
-	// explanation.)
-	ListxattrAt(ctx context.Context, rp *ResolvingPath) ([]string, error)
+	// ListxattrAt returns ENOTSUP.
+	//
+	// - If the size of the list (including a NUL terminating byte after every
+	// entry) would exceed size, ERANGE may be returned. Note that
+	// implementations are free to ignore size entirely and return without
+	// error). In all cases, if size is 0, the list should be returned without
+	// error, regardless of size.
+	ListxattrAt(ctx context.Context, rp *ResolvingPath, size uint64) ([]string, error)
 
 	// GetxattrAt returns the value associated with the given extended
 	// attribute for the file at rp.
@@ -435,7 +459,15 @@ type FilesystemImpl interface {
 	//
 	// - If extended attributes are not supported by the filesystem, GetxattrAt
 	// returns ENOTSUP.
-	GetxattrAt(ctx context.Context, rp *ResolvingPath, name string) (string, error)
+	//
+	// - If an extended attribute named opts.Name does not exist, ENODATA is
+	// returned.
+	//
+	// - If the size of the return value exceeds opts.Size, ERANGE may be
+	// returned (note that implementations are free to ignore opts.Size entirely
+	// and return without error). In all cases, if opts.Size is 0, the value
+	// should be returned without error, regardless of size.
+	GetxattrAt(ctx context.Context, rp *ResolvingPath, opts GetxattrOptions) (string, error)
 
 	// SetxattrAt changes the value associated with the given extended
 	// attribute for the file at rp.
@@ -444,6 +476,10 @@ type FilesystemImpl interface {
 	//
 	// - If extended attributes are not supported by the filesystem, SetxattrAt
 	// returns ENOTSUP.
+	//
+	// - If XATTR_CREATE is set in opts.Flag and opts.Name already exists,
+	// EEXIST is returned. If XATTR_REPLACE is set and opts.Name does not exist,
+	// ENODATA is returned.
 	SetxattrAt(ctx context.Context, rp *ResolvingPath, opts SetxattrOptions) error
 
 	// RemovexattrAt removes the given extended attribute from the file at rp.
@@ -452,7 +488,20 @@ type FilesystemImpl interface {
 	//
 	// - If extended attributes are not supported by the filesystem,
 	// RemovexattrAt returns ENOTSUP.
+	//
+	// - If name does not exist, ENODATA is returned.
 	RemovexattrAt(ctx context.Context, rp *ResolvingPath, name string) error
+
+	// BoundEndpointAt returns the Unix socket endpoint bound at the path rp.
+	//
+	// Errors:
+	//
+	// - If the file does not have write permissions, then BoundEndpointAt
+	// returns EACCES.
+	//
+	// - If a non-socket file exists at rp, then BoundEndpointAt returns
+	// ECONNREFUSED.
+	BoundEndpointAt(ctx context.Context, rp *ResolvingPath, opts BoundEndpointOptions) (transport.BoundEndpoint, error)
 
 	// PrependPath prepends a path from vd to vd.Mount().Root() to b.
 	//
@@ -475,8 +524,6 @@ type FilesystemImpl interface {
 	//
 	// Preconditions: vd.Mount().Filesystem().Impl() == this FilesystemImpl.
 	PrependPath(ctx context.Context, vfsroot, vd VirtualDentry, b *fspath.Builder) error
-
-	// TODO: inotify_add_watch(); bind()
 }
 
 // PrependPathAtVFSRootError is returned by implementations of

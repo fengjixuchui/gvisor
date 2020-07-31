@@ -191,8 +191,9 @@ var DirentType = abi.ValueSet{
 
 // Values for preadv2/pwritev2.
 const (
-	// Note: gVisor does not implement the RWF_HIPRI feature, but the flag is
-	// accepted as a valid flag argument for preadv2/pwritev2.
+	// NOTE(b/120162627): gVisor does not implement the RWF_HIPRI feature, but
+	// the flag is accepted as a valid flag argument for preadv2/pwritev2 and
+	// silently ignored.
 	RWF_HIPRI = 0x00000001
 	RWF_DSYNC = 0x00000002
 	RWF_SYNC  = 0x00000004
@@ -241,6 +242,8 @@ const (
 )
 
 // Statx represents struct statx.
+//
+// +marshal
 type Statx struct {
 	Mask           uint32
 	Blksize        uint32
@@ -264,6 +267,9 @@ type Statx struct {
 	DevMinor       uint32
 }
 
+// SizeOfStatx is the size of a Statx struct.
+var SizeOfStatx = binary.Size(Statx{})
+
 // FileMode represents a mode_t.
 type FileMode uint16
 
@@ -280,6 +286,11 @@ func (m FileMode) FileType() FileMode {
 // ExtraBits returns everything but the file type and permission bits.
 func (m FileMode) ExtraBits() FileMode {
 	return m &^ (PermissionsMask | FileTypeMask)
+}
+
+// IsDir returns true if file type represents a directory.
+func (m FileMode) IsDir() bool {
+	return m.FileType() == S_IFDIR
 }
 
 // String returns a string representation of m.

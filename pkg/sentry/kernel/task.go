@@ -37,6 +37,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/usage"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
 	"gvisor.dev/gvisor/pkg/sync"
+	"gvisor.dev/gvisor/pkg/syserror"
 	"gvisor.dev/gvisor/pkg/usermem"
 	"gvisor.dev/gvisor/pkg/waiter"
 )
@@ -66,6 +67,21 @@ type Task struct {
 	// If runState is nil, the task goroutine should exit or has exited.
 	// runState is exclusive to the task goroutine.
 	runState taskRunState
+
+	// taskWorkCount represents the current size of the task work queue. It is
+	// used to avoid acquiring taskWorkMu when the queue is empty.
+	//
+	// Must accessed with atomic memory operations.
+	taskWorkCount int32
+
+	// taskWorkMu protects taskWork.
+	taskWorkMu sync.Mutex `state:"nosave"`
+
+	// taskWork is a queue of work to be executed before resuming user execution.
+	// It is similar to the task_work mechanism in Linux.
+	//
+	// taskWork is exclusive to the task goroutine.
+	taskWork []TaskWorker
 
 	// haveSyscallReturn is true if tc.Arch().Return() represents a value
 	// returned by a syscall (or set by ptrace after a syscall).
@@ -483,16 +499,13 @@ type Task struct {
 	// bit.
 	//
 	// numaPolicy and numaNodeMask are protected by mu.
-	numaPolicy   int32
+	numaPolicy   linux.NumaPolicy
 	numaNodeMask uint64
 
-	// If netns is true, the task is in a non-root network namespace. Network
-	// namespaces aren't currently implemented in full; being in a network
-	// namespace simply prevents the task from observing any network devices
-	// (including loopback) or using abstract socket addresses (see unix(7)).
+	// netns is the task's network namespace. netns is never nil.
 	//
-	// netns is protected by mu. netns is owned by the task goroutine.
-	netns bool
+	// netns is protected by mu.
+	netns *inet.Namespace
 
 	// If rseqPreempted is true, before the next call to p.Switch(),
 	// interrupt rseq critical regions as defined by rseqAddr and
@@ -551,6 +564,10 @@ type Task struct {
 	//
 	// futexWaiter is exclusive to the task goroutine.
 	futexWaiter *futex.Waiter `state:"nosave"`
+
+	// robustList is a pointer to the head of the tasks's robust futex
+	// list.
+	robustList usermem.Addr
 
 	// startTime is the real time at which the task started. It is set when
 	// a Task is created or invokes execve(2).
@@ -779,6 +796,15 @@ func (t *Task) NewFDs(fd int32, files []*fs.File, flags FDFlags) ([]int32, error
 	return t.fdTable.NewFDs(t, fd, files, flags)
 }
 
+// NewFDsVFS2 is a convenience wrapper for t.FDTable().NewFDsVFS2.
+//
+// This automatically passes the task as the context.
+//
+// Precondition: same as FDTable.
+func (t *Task) NewFDsVFS2(fd int32, files []*vfs.FileDescription, flags FDFlags) ([]int32, error) {
+	return t.fdTable.NewFDsVFS2(t, fd, files, flags)
+}
+
 // NewFDFrom is a convenience wrapper for t.FDTable().NewFDs with a single file.
 //
 // This automatically passes the task as the context.
@@ -792,6 +818,15 @@ func (t *Task) NewFDFrom(fd int32, file *fs.File, flags FDFlags) (int32, error) 
 	return fds[0], nil
 }
 
+// NewFDFromVFS2 is a convenience wrapper for t.FDTable().NewFDVFS2.
+//
+// This automatically passes the task as the context.
+//
+// Precondition: same as FDTable.Get.
+func (t *Task) NewFDFromVFS2(fd int32, file *vfs.FileDescription, flags FDFlags) (int32, error) {
+	return t.fdTable.NewFDVFS2(t, fd, file, flags)
+}
+
 // NewFDAt is a convenience wrapper for t.FDTable().NewFDAt.
 //
 // This automatically passes the task as the context.
@@ -799,6 +834,15 @@ func (t *Task) NewFDFrom(fd int32, file *fs.File, flags FDFlags) (int32, error) 
 // Precondition: same as FDTable.
 func (t *Task) NewFDAt(fd int32, file *fs.File, flags FDFlags) error {
 	return t.fdTable.NewFDAt(t, fd, file, flags)
+}
+
+// NewFDAtVFS2 is a convenience wrapper for t.FDTable().NewFDAtVFS2.
+//
+// This automatically passes the task as the context.
+//
+// Precondition: same as FDTable.
+func (t *Task) NewFDAtVFS2(fd int32, file *vfs.FileDescription, flags FDFlags) error {
+	return t.fdTable.NewFDAtVFS2(t, fd, file, flags)
 }
 
 // WithMuLocked executes f with t.mu locked.
@@ -831,4 +875,31 @@ func (t *Task) AbstractSockets() *AbstractSocketNamespace {
 // ContainerID returns t's container ID.
 func (t *Task) ContainerID() string {
 	return t.containerID
+}
+
+// OOMScoreAdj gets the task's thread group's OOM score adjustment.
+func (t *Task) OOMScoreAdj() int32 {
+	return atomic.LoadInt32(&t.tg.oomScoreAdj)
+}
+
+// SetOOMScoreAdj sets the task's thread group's OOM score adjustment. The
+// value should be between -1000 and 1000 inclusive.
+func (t *Task) SetOOMScoreAdj(adj int32) error {
+	if adj > 1000 || adj < -1000 {
+		return syserror.EINVAL
+	}
+	atomic.StoreInt32(&t.tg.oomScoreAdj, adj)
+	return nil
+}
+
+// UID returns t's uid.
+// TODO(gvisor.dev/issue/170): This method is not namespaced yet.
+func (t *Task) UID() uint32 {
+	return uint32(t.Credentials().EffectiveKUID)
+}
+
+// GID returns t's gid.
+// TODO(gvisor.dev/issue/170): This method is not namespaced yet.
+func (t *Task) GID() uint32 {
+	return uint32(t.Credentials().EffectiveKGID)
 }

@@ -31,6 +31,7 @@ type EpollInstance struct {
 	vfsfd FileDescription
 	FileDescriptionDefaultImpl
 	DentryMetadataFileDescriptionImpl
+	NoLockFD
 
 	// q holds waiters on this EpollInstance.
 	q waiter.Queue
@@ -99,6 +100,8 @@ func (vfs *VirtualFilesystem) NewEpollInstanceFD() (*FileDescription, error) {
 		interest: make(map[epollInterestKey]*epollInterest),
 	}
 	if err := ep.vfsfd.Init(ep, linux.O_RDWR, vd.Mount(), vd.Dentry(), &FileDescriptionOptions{
+		DenyPRead:         true,
+		DenyPWrite:        true,
 		UseDentryMetadata: true,
 	}); err != nil {
 		return nil, err
@@ -183,13 +186,14 @@ func (ep *EpollInstance) AddInterest(file *FileDescription, num int32, event lin
 	}
 
 	// Register interest in file.
-	mask := event.Events | linux.EPOLLERR | linux.EPOLLRDHUP
+	mask := event.Events | linux.EPOLLERR | linux.EPOLLHUP
 	epi := &epollInterest{
 		epoll:    ep,
 		key:      key,
 		mask:     mask,
 		userData: event.Data,
 	}
+	epi.waiter.Callback = epi
 	ep.interest[key] = epi
 	wmask := waiter.EventMaskFromLinux(mask)
 	file.EventRegister(&epi.waiter, wmask)
@@ -202,6 +206,9 @@ func (ep *EpollInstance) AddInterest(file *FileDescription, num int32, event lin
 	// Add epi to file.epolls so that it is removed when the last
 	// FileDescription reference is dropped.
 	file.epollMu.Lock()
+	if file.epolls == nil {
+		file.epolls = make(map[*epollInterest]struct{})
+	}
 	file.epolls[epi] = struct{}{}
 	file.epollMu.Unlock()
 
@@ -250,7 +257,7 @@ func (ep *EpollInstance) ModifyInterest(file *FileDescription, num int32, event 
 	}
 
 	// Update epi for the next call to ep.ReadEvents().
-	mask := event.Events | linux.EPOLLERR | linux.EPOLLRDHUP
+	mask := event.Events | linux.EPOLLERR | linux.EPOLLHUP
 	ep.mu.Lock()
 	epi.mask = mask
 	epi.userData = event.Data

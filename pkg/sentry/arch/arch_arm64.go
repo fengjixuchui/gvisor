@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// +build arm64
+
 package arch
 
 import (
@@ -53,6 +55,11 @@ const (
 	preferredPIELoadAddr usermem.Addr = maxAddr64 / 6 * 5
 )
 
+var (
+	// CPUIDInstruction doesn't exist on ARM64.
+	CPUIDInstruction = []byte{}
+)
+
 // These constants are selected as heuristics to help make the Platform's
 // potentially limited address space conform as closely to Linux as possible.
 const (
@@ -68,6 +75,7 @@ const (
 // context64 represents an ARM64 context.
 type context64 struct {
 	State
+	sigFPState []aarch64FPState // fpstate to be restored on sigreturn.
 }
 
 // Arch implements Context.Arch.
@@ -75,10 +83,19 @@ func (c *context64) Arch() Arch {
 	return ARM64
 }
 
+func (c *context64) copySigFPState() []aarch64FPState {
+	var sigfps []aarch64FPState
+	for _, s := range c.sigFPState {
+		sigfps = append(sigfps, s.fork())
+	}
+	return sigfps
+}
+
 // Fork returns an exact copy of this context.
 func (c *context64) Fork() Context {
 	return &context64{
-		State: c.State.Fork(),
+		State:      c.State.Fork(),
+		sigFPState: c.copySigFPState(),
 	}
 }
 
@@ -125,16 +142,17 @@ func (c *context64) SetStack(value uintptr) {
 
 // TLS returns the current TLS pointer.
 func (c *context64) TLS() uintptr {
-	// TODO(gvisor.dev/issue/1238): TLS is not supported.
-	// MRS_TPIDR_EL0
-	return 0
+	return uintptr(c.Regs.TPIDR_EL0)
 }
 
 // SetTLS sets the current TLS pointer. Returns false if value is invalid.
 func (c *context64) SetTLS(value uintptr) bool {
-	// TODO(gvisor.dev/issue/1238): TLS is not supported.
-	// MSR_TPIDR_EL0
-	return false
+	if value >= uintptr(maxAddr64) {
+		return false
+	}
+
+	c.Regs.TPIDR_EL0 = uint64(value)
+	return true
 }
 
 // SetOldRSeqInterruptedIP implements Context.SetOldRSeqInterruptedIP.

@@ -42,6 +42,7 @@ const (
 
 // endpoint implements stack.NetworkEndpoint.
 type endpoint struct {
+	protocol      *protocol
 	nicID         tcpip.NICID
 	linkEP        stack.LinkEndpoint
 	linkAddrCache stack.LinkAddressCache
@@ -79,22 +80,26 @@ func (e *endpoint) MaxHeaderLength() uint16 {
 
 func (e *endpoint) Close() {}
 
-func (e *endpoint) WritePacket(*stack.Route, *stack.GSO, stack.NetworkHeaderParams, tcpip.PacketBuffer) *tcpip.Error {
+func (e *endpoint) WritePacket(*stack.Route, *stack.GSO, stack.NetworkHeaderParams, *stack.PacketBuffer) *tcpip.Error {
 	return tcpip.ErrNotSupported
+}
+
+// NetworkProtocolNumber implements stack.NetworkEndpoint.NetworkProtocolNumber.
+func (e *endpoint) NetworkProtocolNumber() tcpip.NetworkProtocolNumber {
+	return e.protocol.Number()
 }
 
 // WritePackets implements stack.NetworkEndpoint.WritePackets.
-func (e *endpoint) WritePackets(*stack.Route, *stack.GSO, []tcpip.PacketBuffer, stack.NetworkHeaderParams) (int, *tcpip.Error) {
+func (e *endpoint) WritePackets(*stack.Route, *stack.GSO, stack.PacketBufferList, stack.NetworkHeaderParams) (int, *tcpip.Error) {
 	return 0, tcpip.ErrNotSupported
 }
 
-func (e *endpoint) WriteHeaderIncludedPacket(r *stack.Route, pkt tcpip.PacketBuffer) *tcpip.Error {
+func (e *endpoint) WriteHeaderIncludedPacket(r *stack.Route, pkt *stack.PacketBuffer) *tcpip.Error {
 	return tcpip.ErrNotSupported
 }
 
-func (e *endpoint) HandlePacket(r *stack.Route, pkt tcpip.PacketBuffer) {
-	v := pkt.Data.First()
-	h := header.ARP(v)
+func (e *endpoint) HandlePacket(r *stack.Route, pkt *stack.PacketBuffer) {
+	h := header.ARP(pkt.NetworkHeader)
 	if !h.IsValid() {
 		return
 	}
@@ -113,7 +118,7 @@ func (e *endpoint) HandlePacket(r *stack.Route, pkt tcpip.PacketBuffer) {
 		copy(packet.ProtocolAddressSender(), h.ProtocolAddressTarget())
 		copy(packet.HardwareAddressTarget(), h.HardwareAddressSender())
 		copy(packet.ProtocolAddressTarget(), h.ProtocolAddressSender())
-		e.linkEP.WritePacket(r, nil /* gso */, ProtocolNumber, tcpip.PacketBuffer{
+		e.linkEP.WritePacket(r, nil /* gso */, ProtocolNumber, &stack.PacketBuffer{
 			Header: hdr,
 		})
 		fallthrough // also fill the cache from requests
@@ -142,21 +147,25 @@ func (p *protocol) NewEndpoint(nicID tcpip.NICID, addrWithPrefix tcpip.AddressWi
 		return nil, tcpip.ErrBadLocalAddress
 	}
 	return &endpoint{
+		protocol:      p,
 		nicID:         nicID,
 		linkEP:        sender,
 		linkAddrCache: linkAddrCache,
 	}, nil
 }
 
-// LinkAddressProtocol implements stack.LinkAddressResolver.
+// LinkAddressProtocol implements stack.LinkAddressResolver.LinkAddressProtocol.
 func (*protocol) LinkAddressProtocol() tcpip.NetworkProtocolNumber {
 	return header.IPv4ProtocolNumber
 }
 
-// LinkAddressRequest implements stack.LinkAddressResolver.
-func (*protocol) LinkAddressRequest(addr, localAddr tcpip.Address, linkEP stack.LinkEndpoint) *tcpip.Error {
+// LinkAddressRequest implements stack.LinkAddressResolver.LinkAddressRequest.
+func (*protocol) LinkAddressRequest(addr, localAddr tcpip.Address, remoteLinkAddr tcpip.LinkAddress, linkEP stack.LinkEndpoint) *tcpip.Error {
 	r := &stack.Route{
-		RemoteLinkAddress: broadcastMAC,
+		RemoteLinkAddress: remoteLinkAddr,
+	}
+	if len(r.RemoteLinkAddress) == 0 {
+		r.RemoteLinkAddress = header.EthernetBroadcastAddress
 	}
 
 	hdr := buffer.NewPrependable(int(linkEP.MaxHeaderLength()) + header.ARPSize)
@@ -167,15 +176,15 @@ func (*protocol) LinkAddressRequest(addr, localAddr tcpip.Address, linkEP stack.
 	copy(h.ProtocolAddressSender(), localAddr)
 	copy(h.ProtocolAddressTarget(), addr)
 
-	return linkEP.WritePacket(r, nil /* gso */, ProtocolNumber, tcpip.PacketBuffer{
+	return linkEP.WritePacket(r, nil /* gso */, ProtocolNumber, &stack.PacketBuffer{
 		Header: hdr,
 	})
 }
 
-// ResolveStaticAddress implements stack.LinkAddressResolver.
+// ResolveStaticAddress implements stack.LinkAddressResolver.ResolveStaticAddress.
 func (*protocol) ResolveStaticAddress(addr tcpip.Address) (tcpip.LinkAddress, bool) {
 	if addr == header.IPv4Broadcast {
-		return broadcastMAC, true
+		return header.EthernetBroadcastAddress, true
 	}
 	if header.IsV4MulticastAddress(addr) {
 		return header.EthernetAddressFromMulticastIPv4Address(addr), true
@@ -183,17 +192,32 @@ func (*protocol) ResolveStaticAddress(addr tcpip.Address) (tcpip.LinkAddress, bo
 	return tcpip.LinkAddress([]byte(nil)), false
 }
 
-// SetOption implements NetworkProtocol.
-func (p *protocol) SetOption(option interface{}) *tcpip.Error {
+// SetOption implements stack.NetworkProtocol.SetOption.
+func (*protocol) SetOption(option interface{}) *tcpip.Error {
 	return tcpip.ErrUnknownProtocolOption
 }
 
-// Option implements NetworkProtocol.
-func (p *protocol) Option(option interface{}) *tcpip.Error {
+// Option implements stack.NetworkProtocol.Option.
+func (*protocol) Option(option interface{}) *tcpip.Error {
 	return tcpip.ErrUnknownProtocolOption
 }
 
-var broadcastMAC = tcpip.LinkAddress([]byte{0xff, 0xff, 0xff, 0xff, 0xff, 0xff})
+// Close implements stack.TransportProtocol.Close.
+func (*protocol) Close() {}
+
+// Wait implements stack.TransportProtocol.Wait.
+func (*protocol) Wait() {}
+
+// Parse implements stack.NetworkProtocol.Parse.
+func (*protocol) Parse(pkt *stack.PacketBuffer) (proto tcpip.TransportProtocolNumber, hasTransportHdr bool, ok bool) {
+	hdr, ok := pkt.Data.PullUp(header.ARPSize)
+	if !ok {
+		return 0, false, false
+	}
+	pkt.NetworkHeader = hdr
+	pkt.Data.TrimFront(header.ARPSize)
+	return 0, false, true
+}
 
 // NewProtocol returns an ARP network protocol.
 func NewProtocol() stack.NetworkProtocol {

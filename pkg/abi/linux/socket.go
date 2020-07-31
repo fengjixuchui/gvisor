@@ -134,6 +134,15 @@ const (
 	SHUT_RDWR = 2
 )
 
+// Packet types from <linux/if_packet.h>
+const (
+	PACKET_HOST      = 0 // To us
+	PACKET_BROADCAST = 1 // To all
+	PACKET_MULTICAST = 2 // To group
+	PACKET_OTHERHOST = 3 // To someone else
+	PACKET_OUTGOING  = 4 // Outgoing of any type
+)
+
 // Socket options from socket.h.
 const (
 	SO_DEBUG                 = 1
@@ -225,6 +234,8 @@ const (
 const SockAddrMax = 128
 
 // InetAddr is struct in_addr, from uapi/linux/in.h.
+//
+// +marshal
 type InetAddr [4]byte
 
 // SockAddrInet is struct sockaddr_in, from uapi/linux/in.h.
@@ -294,6 +305,8 @@ func (s *SockAddrUnix) implementsSockAddr()    {}
 func (s *SockAddrNetlink) implementsSockAddr() {}
 
 // Linger is struct linger, from include/linux/socket.h.
+//
+// +marshal
 type Linger struct {
 	OnOff  int32
 	Linger int32
@@ -308,6 +321,8 @@ const SizeOfLinger = 8
 // the end of this struct or within existing unusued space, so its size grows
 // over time. The current iteration is based on linux v4.17. New versions are
 // always backwards compatible.
+//
+// +marshal
 type TCPInfo struct {
 	State       uint8
 	CaState     uint8
@@ -405,6 +420,8 @@ var SizeOfControlMessageHeader = int(binary.Size(ControlMessageHeader{}))
 // A ControlMessageCredentials is an SCM_CREDENTIALS socket control message.
 //
 // ControlMessageCredentials represents struct ucred from linux/socket.h.
+//
+// +marshal
 type ControlMessageCredentials struct {
 	PID int32
 	UID uint32

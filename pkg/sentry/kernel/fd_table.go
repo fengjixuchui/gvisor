@@ -29,6 +29,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/limits"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
 	"gvisor.dev/gvisor/pkg/sync"
+	"gvisor.dev/gvisor/pkg/syserror"
 )
 
 // FDFlags define flags for an individual descriptor.
@@ -80,9 +81,6 @@ type FDTable struct {
 	refs.AtomicRefCount
 	k *Kernel
 
-	// uid is a unique identifier.
-	uid uint64
-
 	// mu protects below.
 	mu sync.Mutex `state:"nosave"`
 
@@ -130,7 +128,7 @@ func (f *FDTable) loadDescriptorTable(m map[int32]descriptor) {
 // drop drops the table reference.
 func (f *FDTable) drop(file *fs.File) {
 	// Release locks.
-	file.Dirent.Inode.LockCtx.Posix.UnlockRegion(lock.UniqueID(f.uid), lock.LockRange{0, lock.LockEOF})
+	file.Dirent.Inode.LockCtx.Posix.UnlockRegion(f, lock.LockRange{0, lock.LockEOF})
 
 	// Send inotify events.
 	d := file.Dirent
@@ -151,24 +149,27 @@ func (f *FDTable) drop(file *fs.File) {
 
 // dropVFS2 drops the table reference.
 func (f *FDTable) dropVFS2(file *vfs.FileDescription) {
-	// TODO(gvisor.dev/issue/1480): Release locks.
-	// TODO(gvisor.dev/issue/1479): Send inotify events.
+	// Release any POSIX lock possibly held by the FDTable. Range {0, 0} means the
+	// entire file.
+	err := file.UnlockPOSIX(context.Background(), f, 0, 0, linux.SEEK_SET)
+	if err != nil && err != syserror.ENOLCK {
+		panic(fmt.Sprintf("UnlockPOSIX failed: %v", err))
+	}
 
-	// Drop the table reference.
+	// Generate inotify events.
+	ev := uint32(linux.IN_CLOSE_NOWRITE)
+	if file.IsWritable() {
+		ev = linux.IN_CLOSE_WRITE
+	}
+	file.Dentry().InotifyWithParent(ev, 0, vfs.PathEvent)
+
+	// Drop the table's reference.
 	file.DecRef()
-}
-
-// ID returns a unique identifier for this FDTable.
-func (f *FDTable) ID() uint64 {
-	return f.uid
 }
 
 // NewFDTable allocates a new FDTable that may be used by tasks in k.
 func (k *Kernel) NewFDTable() *FDTable {
-	f := &FDTable{
-		k:   k,
-		uid: atomic.AddUint64(&k.fdMapUids, 1),
-	}
+	f := &FDTable{k: k}
 	f.init()
 	return f
 }
@@ -191,10 +192,12 @@ func (f *FDTable) Size() int {
 	return int(size)
 }
 
-// forEach iterates over all non-nil files.
+// forEach iterates over all non-nil files in sorted order.
 //
 // It is the caller's responsibility to acquire an appropriate lock.
 func (f *FDTable) forEach(fn func(fd int32, file *fs.File, fileVFS2 *vfs.FileDescription, flags FDFlags)) {
+	// retries tracks the number of failed TryIncRef attempts for the same FD.
+	retries := 0
 	fd := int32(0)
 	for {
 		file, fileVFS2, flags, ok := f.getAll(fd)
@@ -204,17 +207,26 @@ func (f *FDTable) forEach(fn func(fd int32, file *fs.File, fileVFS2 *vfs.FileDes
 		switch {
 		case file != nil:
 			if !file.TryIncRef() {
+				retries++
+				if retries > 1000 {
+					panic(fmt.Sprintf("File in FD table has been destroyed. FD: %d, File: %+v, FileOps: %+v", fd, file, file.FileOperations))
+				}
 				continue // Race caught.
 			}
 			fn(fd, file, nil, flags)
 			file.DecRef()
 		case fileVFS2 != nil:
 			if !fileVFS2.TryIncRef() {
+				retries++
+				if retries > 1000 {
+					panic(fmt.Sprintf("File in FD table has been destroyed. FD: %d, File: %+v, Impl: %+v", fd, fileVFS2, fileVFS2.Impl()))
+				}
 				continue // Race caught.
 			}
 			fn(fd, nil, fileVFS2, flags)
 			fileVFS2.DecRef()
 		}
+		retries = 0
 		fd++
 	}
 }
@@ -296,6 +308,105 @@ func (f *FDTable) NewFDs(ctx context.Context, fd int32, files []*fs.File, flags 
 	return fds, nil
 }
 
+// NewFDsVFS2 allocates new FDs guaranteed to be the lowest number available
+// greater than or equal to the fd parameter. All files will share the set
+// flags. Success is guaranteed to be all or none.
+func (f *FDTable) NewFDsVFS2(ctx context.Context, fd int32, files []*vfs.FileDescription, flags FDFlags) (fds []int32, err error) {
+	if fd < 0 {
+		// Don't accept negative FDs.
+		return nil, syscall.EINVAL
+	}
+
+	// Default limit.
+	end := int32(math.MaxInt32)
+
+	// Ensure we don't get past the provided limit.
+	if limitSet := limits.FromContext(ctx); limitSet != nil {
+		lim := limitSet.Get(limits.NumberOfFiles)
+		if lim.Cur != limits.Infinity {
+			end = int32(lim.Cur)
+		}
+		if fd >= end {
+			return nil, syscall.EMFILE
+		}
+	}
+
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	// From f.next to find available fd.
+	if fd < f.next {
+		fd = f.next
+	}
+
+	// Install all entries.
+	for i := fd; i < end && len(fds) < len(files); i++ {
+		if d, _, _ := f.getVFS2(i); d == nil {
+			f.setVFS2(i, files[len(fds)], flags) // Set the descriptor.
+			fds = append(fds, i)                 // Record the file descriptor.
+		}
+	}
+
+	// Failure? Unwind existing FDs.
+	if len(fds) < len(files) {
+		for _, i := range fds {
+			f.setVFS2(i, nil, FDFlags{}) // Zap entry.
+		}
+		return nil, syscall.EMFILE
+	}
+
+	if fd == f.next {
+		// Update next search start position.
+		f.next = fds[len(fds)-1] + 1
+	}
+
+	return fds, nil
+}
+
+// NewFDVFS2 allocates a file descriptor greater than or equal to minfd for
+// the given file description. If it succeeds, it takes a reference on file.
+func (f *FDTable) NewFDVFS2(ctx context.Context, minfd int32, file *vfs.FileDescription, flags FDFlags) (int32, error) {
+	if minfd < 0 {
+		// Don't accept negative FDs.
+		return -1, syscall.EINVAL
+	}
+
+	// Default limit.
+	end := int32(math.MaxInt32)
+
+	// Ensure we don't get past the provided limit.
+	if limitSet := limits.FromContext(ctx); limitSet != nil {
+		lim := limitSet.Get(limits.NumberOfFiles)
+		if lim.Cur != limits.Infinity {
+			end = int32(lim.Cur)
+		}
+		if minfd >= end {
+			return -1, syscall.EMFILE
+		}
+	}
+
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	// From f.next to find available fd.
+	fd := minfd
+	if fd < f.next {
+		fd = f.next
+	}
+	for fd < end {
+		if d, _, _ := f.getVFS2(fd); d == nil {
+			f.setVFS2(fd, file, flags)
+			if fd == f.next {
+				// Update next search start position.
+				f.next = fd + 1
+			}
+			return fd, nil
+		}
+		fd++
+	}
+	return -1, syscall.EMFILE
+}
+
 // NewFDAt sets the file reference for the given FD. If there is an active
 // reference for that FD, the ref count for that existing reference is
 // decremented.
@@ -316,9 +427,6 @@ func (f *FDTable) newFDAt(ctx context.Context, fd int32, file *fs.File, fileVFS2
 		return syscall.EBADF
 	}
 
-	f.mu.Lock()
-	defer f.mu.Unlock()
-
 	// Check the limit for the provided file.
 	if limitSet := limits.FromContext(ctx); limitSet != nil {
 		if lim := limitSet.Get(limits.NumberOfFiles); lim.Cur != limits.Infinity && uint64(fd) >= lim.Cur {
@@ -327,6 +435,8 @@ func (f *FDTable) newFDAt(ctx context.Context, fd int32, file *fs.File, fileVFS2
 	}
 
 	// Install the entry.
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.setAll(fd, file, fileVFS2, flags)
 	return nil
 }
@@ -351,6 +461,29 @@ func (f *FDTable) SetFlags(fd int32, flags FDFlags) error {
 
 	// Update the flags.
 	f.set(fd, file, flags)
+	return nil
+}
+
+// SetFlagsVFS2 sets the flags for the given file descriptor.
+//
+// True is returned iff flags were changed.
+func (f *FDTable) SetFlagsVFS2(fd int32, flags FDFlags) error {
+	if fd < 0 {
+		// Don't accept negative FDs.
+		return syscall.EBADF
+	}
+
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	file, _, _ := f.getVFS2(fd)
+	if file == nil {
+		// No file found.
+		return syscall.EBADF
+	}
+
+	// Update the flags.
+	f.setVFS2(fd, file, flags)
 	return nil
 }
 
@@ -404,7 +537,10 @@ func (f *FDTable) GetVFS2(fd int32) (*vfs.FileDescription, FDFlags) {
 	}
 }
 
-// GetFDs returns a list of valid fds.
+// GetFDs returns a sorted list of valid fds.
+//
+// Precondition: The caller must be running on the task goroutine, or Task.mu
+// must be locked.
 func (f *FDTable) GetFDs() []int32 {
 	fds := make([]int32, 0, int(atomic.LoadInt32(&f.used)))
 	f.forEach(func(fd int32, _ *fs.File, _ *vfs.FileDescription, _ FDFlags) {
@@ -479,7 +615,9 @@ func (f *FDTable) Remove(fd int32) (*fs.File, *vfs.FileDescription) {
 	case orig2 != nil:
 		orig2.IncRef()
 	}
-	f.setAll(fd, nil, nil, FDFlags{}) // Zap entry.
+	if orig != nil || orig2 != nil {
+		f.setAll(fd, nil, nil, FDFlags{}) // Zap entry.
+	}
 	return orig, orig2
 }
 

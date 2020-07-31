@@ -19,9 +19,8 @@ import (
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/binary"
-	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
-	"gvisor.dev/gvisor/pkg/tcpip/iptables"
+	"gvisor.dev/gvisor/pkg/tcpip/stack"
 	"gvisor.dev/gvisor/pkg/usermem"
 )
 
@@ -40,7 +39,7 @@ func (tcpMarshaler) name() string {
 }
 
 // marshal implements matchMaker.marshal.
-func (tcpMarshaler) marshal(mr iptables.Matcher) []byte {
+func (tcpMarshaler) marshal(mr stack.Matcher) []byte {
 	matcher := mr.(*TCPMatcher)
 	xttcp := linux.XTTCP{
 		SourcePortStart:      matcher.sourcePortStart,
@@ -53,7 +52,7 @@ func (tcpMarshaler) marshal(mr iptables.Matcher) []byte {
 }
 
 // unmarshal implements matchMaker.unmarshal.
-func (tcpMarshaler) unmarshal(buf []byte, filter iptables.IPHeaderFilter) (iptables.Matcher, error) {
+func (tcpMarshaler) unmarshal(buf []byte, filter stack.IPHeaderFilter) (stack.Matcher, error) {
 	if len(buf) < linux.SizeOfXTTCP {
 		return nil, fmt.Errorf("buf has insufficient size for TCP match: %d", len(buf))
 	}
@@ -97,7 +96,7 @@ func (*TCPMatcher) Name() string {
 }
 
 // Match implements Matcher.Match.
-func (tm *TCPMatcher) Match(hook iptables.Hook, pkt tcpip.PacketBuffer, interfaceName string) (bool, bool) {
+func (tm *TCPMatcher) Match(hook stack.Hook, pkt *stack.PacketBuffer, interfaceName string) (bool, bool) {
 	netHeader := header.IPv4(pkt.NetworkHeader)
 
 	if netHeader.TransportProtocol() != header.TCPProtocolNumber {
@@ -112,22 +111,10 @@ func (tm *TCPMatcher) Match(hook iptables.Hook, pkt tcpip.PacketBuffer, interfac
 		return false, false
 	}
 
-	// Now we need the transport header. However, this may not have been set
-	// yet.
-	// TODO(gvisor.dev/issue/170): Parsing the transport header should
-	// ultimately be moved into the iptables.Check codepath as matchers are
-	// added.
-	var tcpHeader header.TCP
-	if pkt.TransportHeader != nil {
-		tcpHeader = header.TCP(pkt.TransportHeader)
-	} else {
-		// The TCP header hasn't been parsed yet. We have to do it here.
-		if len(pkt.Data.First()) < header.TCPMinimumSize {
-			// There's no valid TCP header here, so we hotdrop the
-			// packet.
-			return false, true
-		}
-		tcpHeader = header.TCP(pkt.Data.First())
+	tcpHeader := header.TCP(pkt.TransportHeader)
+	if len(tcpHeader) < header.TCPMinimumSize {
+		// There's no valid TCP header here, so we drop the packet immediately.
+		return false, true
 	}
 
 	// Check whether the source and destination ports are within the

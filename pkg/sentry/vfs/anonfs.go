@@ -21,6 +21,7 @@ import (
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/fspath"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
+	"gvisor.dev/gvisor/pkg/sentry/socket/unix/transport"
 	"gvisor.dev/gvisor/pkg/syserror"
 	"gvisor.dev/gvisor/pkg/usermem"
 )
@@ -41,7 +42,27 @@ func (vfs *VirtualFilesystem) NewAnonVirtualDentry(name string) VirtualDentry {
 	}
 }
 
-const anonfsBlockSize = usermem.PageSize // via fs/libfs.c:pseudo_fs_fill_super()
+const (
+	anonfsBlockSize = usermem.PageSize // via fs/libfs.c:pseudo_fs_fill_super()
+
+	// Mode, UID, and GID for a generic anonfs file.
+	anonFileMode = 0600 // no type is correct
+	anonFileUID  = auth.RootKUID
+	anonFileGID  = auth.RootKGID
+)
+
+// anonFilesystemType implements FilesystemType.
+type anonFilesystemType struct{}
+
+// GetFilesystem implements FilesystemType.GetFilesystem.
+func (anonFilesystemType) GetFilesystem(context.Context, *VirtualFilesystem, *auth.Credentials, string, GetFilesystemOptions) (*Filesystem, *Dentry, error) {
+	panic("cannot instaniate an anon filesystem")
+}
+
+// Name implemenents FilesystemType.Name.
+func (anonFilesystemType) Name() string {
+	return "none"
+}
 
 // anonFilesystem is the implementation of FilesystemImpl that backs
 // VirtualDentries returned by VirtualFilesystem.NewAnonVirtualDentry().
@@ -67,6 +88,14 @@ func (fs *anonFilesystem) Release() {
 // Sync implements FilesystemImpl.Sync.
 func (fs *anonFilesystem) Sync(ctx context.Context) error {
 	return nil
+}
+
+// AccessAt implements vfs.Filesystem.Impl.AccessAt.
+func (fs *anonFilesystem) AccessAt(ctx context.Context, rp *ResolvingPath, creds *auth.Credentials, ats AccessTypes) error {
+	if !rp.Done() {
+		return syserror.ENOTDIR
+	}
+	return GenericCheckPermissions(creds, ats, anonFileMode, anonFileUID, anonFileGID)
 }
 
 // GetDentryAt implements FilesystemImpl.GetDentryAt.
@@ -167,13 +196,13 @@ func (fs *anonFilesystem) StatAt(ctx context.Context, rp *ResolvingPath, opts St
 		Mask:     linux.STATX_TYPE | linux.STATX_MODE | linux.STATX_NLINK | linux.STATX_UID | linux.STATX_GID | linux.STATX_INO | linux.STATX_SIZE | linux.STATX_BLOCKS,
 		Blksize:  anonfsBlockSize,
 		Nlink:    1,
-		UID:      uint32(auth.RootKUID),
-		GID:      uint32(auth.RootKGID),
-		Mode:     0600, // no type is correct
+		UID:      uint32(anonFileUID),
+		GID:      uint32(anonFileGID),
+		Mode:     anonFileMode,
 		Ino:      1,
 		Size:     0,
 		Blocks:   0,
-		DevMajor: 0,
+		DevMajor: linux.UNNAMED_MAJOR,
 		DevMinor: fs.devMinor,
 	}, nil
 }
@@ -205,8 +234,19 @@ func (fs *anonFilesystem) UnlinkAt(ctx context.Context, rp *ResolvingPath) error
 	return syserror.EPERM
 }
 
+// BoundEndpointAt implements FilesystemImpl.BoundEndpointAt.
+func (fs *anonFilesystem) BoundEndpointAt(ctx context.Context, rp *ResolvingPath, opts BoundEndpointOptions) (transport.BoundEndpoint, error) {
+	if !rp.Final() {
+		return nil, syserror.ENOTDIR
+	}
+	if err := GenericCheckPermissions(rp.Credentials(), MayWrite, anonFileMode, anonFileUID, anonFileGID); err != nil {
+		return nil, err
+	}
+	return nil, syserror.ECONNREFUSED
+}
+
 // ListxattrAt implements FilesystemImpl.ListxattrAt.
-func (fs *anonFilesystem) ListxattrAt(ctx context.Context, rp *ResolvingPath) ([]string, error) {
+func (fs *anonFilesystem) ListxattrAt(ctx context.Context, rp *ResolvingPath, size uint64) ([]string, error) {
 	if !rp.Done() {
 		return nil, syserror.ENOTDIR
 	}
@@ -214,7 +254,7 @@ func (fs *anonFilesystem) ListxattrAt(ctx context.Context, rp *ResolvingPath) ([
 }
 
 // GetxattrAt implements FilesystemImpl.GetxattrAt.
-func (fs *anonFilesystem) GetxattrAt(ctx context.Context, rp *ResolvingPath, name string) (string, error) {
+func (fs *anonFilesystem) GetxattrAt(ctx context.Context, rp *ResolvingPath, opts GetxattrOptions) (string, error) {
 	if !rp.Done() {
 		return "", syserror.ENOTDIR
 	}
@@ -257,3 +297,18 @@ func (d *anonDentry) TryIncRef() bool {
 func (d *anonDentry) DecRef() {
 	// no-op
 }
+
+// InotifyWithParent implements DentryImpl.InotifyWithParent.
+//
+// Although Linux technically supports inotify on pseudo filesystems (inotify
+// is implemented at the vfs layer), it is not particularly useful. It is left
+// unimplemented until someone actually needs it.
+func (d *anonDentry) InotifyWithParent(events, cookie uint32, et EventType) {}
+
+// Watches implements DentryImpl.Watches.
+func (d *anonDentry) Watches() *Watches {
+	return nil
+}
+
+// OnZeroWatches implements Dentry.OnZeroWatches.
+func (d *anonDentry) OnZeroWatches() {}

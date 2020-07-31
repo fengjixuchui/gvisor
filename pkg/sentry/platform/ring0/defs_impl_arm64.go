@@ -1,13 +1,13 @@
 package ring0
 
 import (
-	"io"
-	"reflect"
-	"syscall"
+	"gvisor.dev/gvisor/pkg/sentry/arch"
+	"gvisor.dev/gvisor/pkg/sentry/platform/ring0/pagetables"
 
 	"fmt"
-	"gvisor.dev/gvisor/pkg/sentry/platform/ring0/pagetables"
 	"gvisor.dev/gvisor/pkg/usermem"
+	"io"
+	"reflect"
 )
 
 // Useful bits.
@@ -21,26 +21,27 @@ const (
 	_PTE_PGT_BASE = 0x7000
 	_PTE_PGT_SIZE = 0x1000
 
-	_PSR_MODE_EL0t = 0x0
-	_PSR_MODE_EL1t = 0x4
-	_PSR_MODE_EL1h = 0x5
-	_PSR_EL_MASK   = 0xf
-
-	_PSR_D_BIT = 0x200
-	_PSR_A_BIT = 0x100
-	_PSR_I_BIT = 0x80
-	_PSR_F_BIT = 0x40
+	_PSR_D_BIT = 0x00000200
+	_PSR_A_BIT = 0x00000100
+	_PSR_I_BIT = 0x00000080
+	_PSR_F_BIT = 0x00000040
 )
 
 const (
+	// PSR bits
+	PSR_MODE_EL0t = 0x00000000
+	PSR_MODE_EL1t = 0x00000004
+	PSR_MODE_EL1h = 0x00000005
+	PSR_MODE_MASK = 0x0000000f
+
 	// KernelFlagsSet should always be set in the kernel.
-	KernelFlagsSet = _PSR_MODE_EL1h
+	KernelFlagsSet = PSR_MODE_EL1h
 
 	// UserFlagsSet are always set in userspace.
-	UserFlagsSet = _PSR_MODE_EL0t
+	UserFlagsSet = PSR_MODE_EL0t
 
-	KernelFlagsClear = _PSR_EL_MASK
-	UserFlagsClear   = _PSR_EL_MASK
+	KernelFlagsClear = PSR_MODE_MASK
+	UserFlagsClear   = PSR_MODE_MASK
 
 	PsrDefaultSet = _PSR_D_BIT | _PSR_A_BIT | _PSR_I_BIT | _PSR_F_BIT
 )
@@ -154,7 +155,7 @@ type CPU struct {
 
 	// registers is a set of registers; these may be used on kernel system
 	// calls and exceptions via the Registers function.
-	registers syscall.PtraceRegs
+	registers arch.Registers
 
 	// hooks are kernel hooks.
 	hooks Hooks
@@ -165,14 +166,14 @@ type CPU struct {
 // This is explicitly safe to call during KernelException and KernelSyscall.
 //
 //go:nosplit
-func (c *CPU) Registers() *syscall.PtraceRegs {
+func (c *CPU) Registers() *arch.Registers {
 	return &c.registers
 }
 
 // SwitchOpts are passed to the Switch function.
 type SwitchOpts struct {
 	// Registers are the user register state.
-	Registers *syscall.PtraceRegs
+	Registers *arch.Registers
 
 	// FloatingPointState is a byte pointer where floating point state is
 	// saved and restored.
@@ -294,6 +295,12 @@ func (c *CPU) SetAppAddr(value uintptr) {
 	c.appAddr = value
 }
 
+// GetLazyVFP returns the value of cpacr_el1.
+//go:nosplit
+func (c *CPU) GetLazyVFP() (value uintptr) {
+	return c.lazyVFP
+}
+
 // SwitchArchOpts are embedded in SwitchOpts.
 type SwitchArchOpts struct {
 	// UserASID indicates that the application ASID to be used on switch,
@@ -370,7 +377,7 @@ func Emit(w io.Writer) {
 	fmt.Fprintf(w, "#define Syscall 0x%02x\n", Syscall)
 	fmt.Fprintf(w, "#define VirtualizationException 0x%02x\n", VirtualizationException)
 
-	p := &syscall.PtraceRegs{}
+	p := &arch.Registers{}
 	fmt.Fprintf(w, "\n// Ptrace registers.\n")
 	fmt.Fprintf(w, "#define PTRACE_R0       0x%02x\n", reflect.ValueOf(&p.Regs[0]).Pointer()-reflect.ValueOf(p).Pointer())
 	fmt.Fprintf(w, "#define PTRACE_R1       0x%02x\n", reflect.ValueOf(&p.Regs[1]).Pointer()-reflect.ValueOf(p).Pointer())

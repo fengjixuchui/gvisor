@@ -15,8 +15,11 @@
 package kernel
 
 import (
+	"sync/atomic"
+
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/bpf"
+	"gvisor.dev/gvisor/pkg/sentry/inet"
 	"gvisor.dev/gvisor/pkg/syserror"
 	"gvisor.dev/gvisor/pkg/usermem"
 )
@@ -54,8 +57,7 @@ type SharingOptions struct {
 	NewUserNamespace bool
 
 	// If NewNetworkNamespace is true, the task should have an independent
-	// network namespace. (Note that network namespaces are not really
-	// implemented; see comment on Task.netns for details.)
+	// network namespace.
 	NewNetworkNamespace bool
 
 	// If NewFiles is true, the task should use an independent file descriptor
@@ -199,6 +201,11 @@ func (t *Task) Clone(opts *CloneOptions) (ThreadID, *SyscallControl, error) {
 		ipcns = NewIPCNamespace(userns)
 	}
 
+	netns := t.NetworkNamespace()
+	if opts.NewNetworkNamespace {
+		netns = inet.NewNamespace(netns)
+	}
+
 	// TODO(b/63601033): Implement CLONE_NEWNS.
 	mntnsVFS2 := t.mountNamespaceVFS2
 	if mntnsVFS2 != nil {
@@ -255,6 +262,7 @@ func (t *Task) Clone(opts *CloneOptions) (ThreadID, *SyscallControl, error) {
 			sh = sh.Fork()
 		}
 		tg = t.k.NewThreadGroup(tg.mounts, pidns, sh, opts.TerminationSignal, tg.limits.GetCopy())
+		tg.oomScoreAdj = atomic.LoadInt32(&t.tg.oomScoreAdj)
 		rseqAddr = t.rseqAddr
 		rseqSignature = t.rseqSignature
 	}
@@ -268,7 +276,7 @@ func (t *Task) Clone(opts *CloneOptions) (ThreadID, *SyscallControl, error) {
 		FDTable:                 fdTable,
 		Credentials:             creds,
 		Niceness:                t.Niceness(),
-		NetworkNamespaced:       t.netns,
+		NetworkNamespace:        netns,
 		AllowedCPUMask:          t.CPUMask(),
 		UTSNamespace:            utsns,
 		IPCNamespace:            ipcns,
@@ -282,9 +290,6 @@ func (t *Task) Clone(opts *CloneOptions) (ThreadID, *SyscallControl, error) {
 		cfg.Parent = t
 	} else {
 		cfg.InheritParent = t
-	}
-	if opts.NewNetworkNamespace {
-		cfg.NetworkNamespaced = true
 	}
 	nt, err := t.tg.pidns.owner.NewTask(cfg)
 	if err != nil {
@@ -482,7 +487,7 @@ func (t *Task) Unshare(opts *SharingOptions) error {
 			t.mu.Unlock()
 			return syserror.EPERM
 		}
-		t.netns = true
+		t.netns = inet.NewNamespace(t.netns)
 	}
 	if opts.NewUTSNamespace {
 		if !haveCapSysAdmin {

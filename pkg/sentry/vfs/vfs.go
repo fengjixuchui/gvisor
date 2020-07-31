@@ -24,6 +24,9 @@
 //           Locks acquired by FilesystemImpls between Prepare{Delete,Rename}Dentry and Commit{Delete,Rename*}Dentry
 //         VirtualFilesystem.filesystemsMu
 //       EpollInstance.mu
+//		   Inotify.mu
+// 		     Watches.mu
+//  		     Inotify.evMu
 // VirtualFilesystem.fsTypesMu
 //
 // Locking Dentry.mu in multiple Dentries requires holding
@@ -38,6 +41,7 @@ import (
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/fspath"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
+	"gvisor.dev/gvisor/pkg/sentry/socket/unix/transport"
 	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/syserror"
 )
@@ -81,6 +85,10 @@ type VirtualFilesystem struct {
 	// mountpoints is analogous to Linux's mountpoint_hashtable.
 	mountpoints map[*Dentry]map[*Mount]struct{}
 
+	// lastMountID is the last allocated mount ID. lastMountID is accessed
+	// using atomic memory operations.
+	lastMountID uint64
+
 	// anonMount is a Mount, not included in mounts or mountpoints,
 	// representing an anonFilesystem. anonMount is used to back
 	// VirtualDentries returned by VirtualFilesystem.NewAnonVirtualDentry().
@@ -115,6 +123,9 @@ type VirtualFilesystem struct {
 
 // Init initializes a new VirtualFilesystem with no mounts or FilesystemTypes.
 func (vfs *VirtualFilesystem) Init() error {
+	if vfs.mountpoints != nil {
+		panic("VFS already initialized")
+	}
 	vfs.mountpoints = make(map[*Dentry]map[*Mount]struct{})
 	vfs.devices = make(map[devTuple]*registeredDevice)
 	vfs.anonBlockDevMinorNext = 1
@@ -126,17 +137,23 @@ func (vfs *VirtualFilesystem) Init() error {
 	// Construct vfs.anonMount.
 	anonfsDevMinor, err := vfs.GetAnonBlockDevMinor()
 	if err != nil {
-		return err
+		// This shouldn't be possible since anonBlockDevMinorNext was
+		// initialized to 1 above (no device numbers have been allocated yet).
+		panic(fmt.Sprintf("VirtualFilesystem.Init: device number allocation for anonfs failed: %v", err))
 	}
 	anonfs := anonFilesystem{
 		devMinor: anonfsDevMinor,
 	}
-	anonfs.vfsfs.Init(vfs, &anonfs)
-	vfs.anonMount = &Mount{
-		vfs:  vfs,
-		fs:   &anonfs.vfsfs,
-		refs: 1,
+	anonfs.vfsfs.Init(vfs, &anonFilesystemType{}, &anonfs)
+	defer anonfs.vfsfs.DecRef()
+	anonMount, err := vfs.NewDisconnectedMount(&anonfs.vfsfs, nil, &MountOptions{})
+	if err != nil {
+		// We should not be passing any MountOptions that would cause
+		// construction of this mount to fail.
+		panic(fmt.Sprintf("VirtualFilesystem.Init: anonfs mount failed: %v", err))
 	}
+	vfs.anonMount = anonMount
+
 	return nil
 }
 
@@ -166,6 +183,23 @@ type PathOperation struct {
 	// path component represents a symbolic link, the symbolic link should be
 	// followed.
 	FollowFinalSymlink bool
+}
+
+// AccessAt checks whether a user with creds has access to the file at
+// the given path.
+func (vfs *VirtualFilesystem) AccessAt(ctx context.Context, creds *auth.Credentials, ats AccessTypes, pop *PathOperation) error {
+	rp := vfs.getResolvingPath(creds, pop)
+	for {
+		err := rp.mount.fs.impl.AccessAt(ctx, rp, creds, ats)
+		if err == nil {
+			vfs.putResolvingPath(rp)
+			return nil
+		}
+		if !rp.handleError(err) {
+			vfs.putResolvingPath(rp)
+			return err
+		}
+	}
 }
 
 // GetDentryAt returns a VirtualDentry representing the given path, at which a
@@ -207,7 +241,7 @@ func (vfs *VirtualFilesystem) getParentDirAndName(ctx context.Context, creds *au
 		}
 		if checkInvariants {
 			if rp.canHandleError(err) && rp.Done() {
-				panic(fmt.Sprintf("%T.GetParentDentryAt() consumed all path components and returned %T", rp.mount.fs.impl, err))
+				panic(fmt.Sprintf("%T.GetParentDentryAt() consumed all path components and returned %v", rp.mount.fs.impl, err))
 			}
 		}
 		if !rp.handleError(err) {
@@ -248,7 +282,7 @@ func (vfs *VirtualFilesystem) LinkAt(ctx context.Context, creds *auth.Credential
 		}
 		if checkInvariants {
 			if rp.canHandleError(err) && rp.Done() {
-				panic(fmt.Sprintf("%T.LinkAt() consumed all path components and returned %T", rp.mount.fs.impl, err))
+				panic(fmt.Sprintf("%T.LinkAt() consumed all path components and returned %v", rp.mount.fs.impl, err))
 			}
 		}
 		if !rp.handleError(err) {
@@ -284,7 +318,7 @@ func (vfs *VirtualFilesystem) MkdirAt(ctx context.Context, creds *auth.Credentia
 		}
 		if checkInvariants {
 			if rp.canHandleError(err) && rp.Done() {
-				panic(fmt.Sprintf("%T.MkdirAt() consumed all path components and returned %T", rp.mount.fs.impl, err))
+				panic(fmt.Sprintf("%T.MkdirAt() consumed all path components and returned %v", rp.mount.fs.impl, err))
 			}
 		}
 		if !rp.handleError(err) {
@@ -311,13 +345,13 @@ func (vfs *VirtualFilesystem) MknodAt(ctx context.Context, creds *auth.Credentia
 	rp := vfs.getResolvingPath(creds, pop)
 	for {
 		err := rp.mount.fs.impl.MknodAt(ctx, rp, *opts)
-		if err != nil {
+		if err == nil {
 			vfs.putResolvingPath(rp)
 			return nil
 		}
 		if checkInvariants {
 			if rp.canHandleError(err) && rp.Done() {
-				panic(fmt.Sprintf("%T.MknodAt() consumed all path components and returned %T", rp.mount.fs.impl, err))
+				panic(fmt.Sprintf("%T.MknodAt() consumed all path components and returned %v", rp.mount.fs.impl, err))
 			}
 		}
 		if !rp.handleError(err) {
@@ -332,14 +366,11 @@ func (vfs *VirtualFilesystem) MknodAt(ctx context.Context, creds *auth.Credentia
 func (vfs *VirtualFilesystem) OpenAt(ctx context.Context, creds *auth.Credentials, pop *PathOperation, opts *OpenOptions) (*FileDescription, error) {
 	// Remove:
 	//
-	// - O_LARGEFILE, which we always report in FileDescription status flags
-	// since only 64-bit architectures are supported at this time.
-	//
 	// - O_CLOEXEC, which affects file descriptors and therefore must be
 	// handled outside of VFS.
 	//
 	// - Unknown flags.
-	opts.Flags &= linux.O_ACCMODE | linux.O_CREAT | linux.O_EXCL | linux.O_NOCTTY | linux.O_TRUNC | linux.O_APPEND | linux.O_NONBLOCK | linux.O_DSYNC | linux.O_ASYNC | linux.O_DIRECT | linux.O_DIRECTORY | linux.O_NOFOLLOW | linux.O_NOATIME | linux.O_SYNC | linux.O_PATH | linux.O_TMPFILE
+	opts.Flags &= linux.O_ACCMODE | linux.O_CREAT | linux.O_EXCL | linux.O_NOCTTY | linux.O_TRUNC | linux.O_APPEND | linux.O_NONBLOCK | linux.O_DSYNC | linux.O_ASYNC | linux.O_DIRECT | linux.O_LARGEFILE | linux.O_DIRECTORY | linux.O_NOFOLLOW | linux.O_NOATIME | linux.O_SYNC | linux.O_PATH | linux.O_TMPFILE
 	// Linux's __O_SYNC (which we call linux.O_SYNC) implies O_DSYNC.
 	if opts.Flags&linux.O_SYNC != 0 {
 		opts.Flags |= linux.O_DSYNC
@@ -379,25 +410,25 @@ func (vfs *VirtualFilesystem) OpenAt(ctx context.Context, creds *auth.Credential
 		if err == nil {
 			vfs.putResolvingPath(rp)
 
-			// TODO(gvisor.dev/issue/1193): Move inside fsimpl to avoid another call
-			// to FileDescription.Stat().
 			if opts.FileExec {
+				if fd.Mount().Flags.NoExec {
+					fd.DecRef()
+					return nil, syserror.EACCES
+				}
+
 				// Only a regular file can be executed.
 				stat, err := fd.Stat(ctx, StatOptions{Mask: linux.STATX_TYPE})
 				if err != nil {
+					fd.DecRef()
 					return nil, err
 				}
-				if stat.Mask&linux.STATX_TYPE != 0 {
-					// This shouldn't happen, but if type can't be retrieved, file can't
-					// be executed.
-					return nil, syserror.EACCES
-				}
-				if t := linux.FileMode(stat.Mode).FileType(); t != linux.ModeRegular {
-					ctx.Infof("%q is not a regular file: %v", pop.Path, t)
+				if stat.Mask&linux.STATX_TYPE == 0 || stat.Mode&linux.S_IFMT != linux.S_IFREG {
+					fd.DecRef()
 					return nil, syserror.EACCES
 				}
 			}
 
+			fd.Dentry().InotifyWithParent(linux.IN_OPEN, 0, PathEvent)
 			return fd, nil
 		}
 		if !rp.handleError(err) {
@@ -472,7 +503,7 @@ func (vfs *VirtualFilesystem) RenameAt(ctx context.Context, creds *auth.Credenti
 		}
 		if checkInvariants {
 			if rp.canHandleError(err) && rp.Done() {
-				panic(fmt.Sprintf("%T.RenameAt() consumed all path components and returned %T", rp.mount.fs.impl, err))
+				panic(fmt.Sprintf("%T.RenameAt() consumed all path components and returned %v", rp.mount.fs.impl, err))
 			}
 		}
 		if !rp.handleError(err) {
@@ -505,7 +536,7 @@ func (vfs *VirtualFilesystem) RmdirAt(ctx context.Context, creds *auth.Credentia
 		}
 		if checkInvariants {
 			if rp.canHandleError(err) && rp.Done() {
-				panic(fmt.Sprintf("%T.RmdirAt() consumed all path components and returned %T", rp.mount.fs.impl, err))
+				panic(fmt.Sprintf("%T.RmdirAt() consumed all path components and returned %v", rp.mount.fs.impl, err))
 			}
 		}
 		if !rp.handleError(err) {
@@ -586,7 +617,7 @@ func (vfs *VirtualFilesystem) SymlinkAt(ctx context.Context, creds *auth.Credent
 		}
 		if checkInvariants {
 			if rp.canHandleError(err) && rp.Done() {
-				panic(fmt.Sprintf("%T.SymlinkAt() consumed all path components and returned %T", rp.mount.fs.impl, err))
+				panic(fmt.Sprintf("%T.SymlinkAt() consumed all path components and returned %v", rp.mount.fs.impl, err))
 			}
 		}
 		if !rp.handleError(err) {
@@ -618,7 +649,7 @@ func (vfs *VirtualFilesystem) UnlinkAt(ctx context.Context, creds *auth.Credenti
 		}
 		if checkInvariants {
 			if rp.canHandleError(err) && rp.Done() {
-				panic(fmt.Sprintf("%T.UnlinkAt() consumed all path components and returned %T", rp.mount.fs.impl, err))
+				panic(fmt.Sprintf("%T.UnlinkAt() consumed all path components and returned %v", rp.mount.fs.impl, err))
 			}
 		}
 		if !rp.handleError(err) {
@@ -628,12 +659,39 @@ func (vfs *VirtualFilesystem) UnlinkAt(ctx context.Context, creds *auth.Credenti
 	}
 }
 
-// ListxattrAt returns all extended attribute names for the file at the given
-// path.
-func (vfs *VirtualFilesystem) ListxattrAt(ctx context.Context, creds *auth.Credentials, pop *PathOperation) ([]string, error) {
+// BoundEndpointAt gets the bound endpoint at the given path, if one exists.
+func (vfs *VirtualFilesystem) BoundEndpointAt(ctx context.Context, creds *auth.Credentials, pop *PathOperation, opts *BoundEndpointOptions) (transport.BoundEndpoint, error) {
+	if !pop.Path.Begin.Ok() {
+		if pop.Path.Absolute {
+			return nil, syserror.ECONNREFUSED
+		}
+		return nil, syserror.ENOENT
+	}
 	rp := vfs.getResolvingPath(creds, pop)
 	for {
-		names, err := rp.mount.fs.impl.ListxattrAt(ctx, rp)
+		bep, err := rp.mount.fs.impl.BoundEndpointAt(ctx, rp, *opts)
+		if err == nil {
+			vfs.putResolvingPath(rp)
+			return bep, nil
+		}
+		if checkInvariants {
+			if rp.canHandleError(err) && rp.Done() {
+				panic(fmt.Sprintf("%T.BoundEndpointAt() consumed all path components and returned %v", rp.mount.fs.impl, err))
+			}
+		}
+		if !rp.handleError(err) {
+			vfs.putResolvingPath(rp)
+			return nil, err
+		}
+	}
+}
+
+// ListxattrAt returns all extended attribute names for the file at the given
+// path.
+func (vfs *VirtualFilesystem) ListxattrAt(ctx context.Context, creds *auth.Credentials, pop *PathOperation, size uint64) ([]string, error) {
+	rp := vfs.getResolvingPath(creds, pop)
+	for {
+		names, err := rp.mount.fs.impl.ListxattrAt(ctx, rp, size)
 		if err == nil {
 			vfs.putResolvingPath(rp)
 			return names, nil
@@ -655,10 +713,10 @@ func (vfs *VirtualFilesystem) ListxattrAt(ctx context.Context, creds *auth.Crede
 
 // GetxattrAt returns the value associated with the given extended attribute
 // for the file at the given path.
-func (vfs *VirtualFilesystem) GetxattrAt(ctx context.Context, creds *auth.Credentials, pop *PathOperation, name string) (string, error) {
+func (vfs *VirtualFilesystem) GetxattrAt(ctx context.Context, creds *auth.Credentials, pop *PathOperation, opts *GetxattrOptions) (string, error) {
 	rp := vfs.getResolvingPath(creds, pop)
 	for {
-		val, err := rp.mount.fs.impl.GetxattrAt(ctx, rp, name)
+		val, err := rp.mount.fs.impl.GetxattrAt(ctx, rp, *opts)
 		if err == nil {
 			vfs.putResolvingPath(rp)
 			return val, nil
@@ -748,6 +806,14 @@ func (vfs *VirtualFilesystem) SyncAllFilesystems(ctx context.Context) error {
 type VirtualDentry struct {
 	mount  *Mount
 	dentry *Dentry
+}
+
+// MakeVirtualDentry creates a VirtualDentry.
+func MakeVirtualDentry(mount *Mount, dentry *Dentry) VirtualDentry {
+	return VirtualDentry{
+		mount:  mount,
+		dentry: dentry,
+	}
 }
 
 // Ok returns true if vd is not empty. It does not require that a reference is

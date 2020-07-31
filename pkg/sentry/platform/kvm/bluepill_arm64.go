@@ -26,6 +26,17 @@ import (
 var (
 	// The action for bluepillSignal is changed by sigaction().
 	bluepillSignal = syscall.SIGILL
+
+	// vcpuSErr is the event of system error.
+	vcpuSErr = kvmVcpuEvents{
+		exception: exception{
+			sErrPending: 1,
+			sErrHasEsr:  0,
+			pad:         [6]uint8{0, 0, 0, 0, 0, 0},
+			sErrEsr:     1,
+		},
+		rsvd: [12]uint32{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+	}
 )
 
 // bluepillArchEnter is called during bluepillEnter.
@@ -54,9 +65,19 @@ func bluepillArchExit(c *vCPU, context *arch.SignalContext64) {
 	context.Pstate = regs.Pstate
 	context.Pstate &^= uint64(ring0.UserFlagsClear)
 	context.Pstate |= ring0.UserFlagsSet
+
+	lazyVfp := c.GetLazyVFP()
+	if lazyVfp != 0 {
+		fpsimd := fpsimdPtr((*byte)(c.floatingPointState))
+		context.Fpsimd64.Fpsr = fpsimd.Fpsr
+		context.Fpsimd64.Fpcr = fpsimd.Fpcr
+		context.Fpsimd64.Vregs = fpsimd.Vregs
+	}
 }
 
 // KernelSyscall handles kernel syscalls.
+//
+// +checkescape:all
 //
 //go:nosplit
 func (c *vCPU) KernelSyscall() {
@@ -64,10 +85,23 @@ func (c *vCPU) KernelSyscall() {
 	if regs.Regs[8] != ^uint64(0) {
 		regs.Pc -= 4 // Rewind.
 	}
+
+	vfpEnable := ring0.CPACREL1()
+	if vfpEnable != 0 {
+		fpsimd := fpsimdPtr((*byte)(c.floatingPointState))
+		fpcr := ring0.GetFPCR()
+		fpsr := ring0.GetFPSR()
+		fpsimd.Fpcr = uint32(fpcr)
+		fpsimd.Fpsr = uint32(fpsr)
+		ring0.SaveVRegs((*byte)(c.floatingPointState))
+	}
+
 	ring0.Halt()
 }
 
 // KernelException handles kernel exceptions.
+//
+// +checkescape:all
 //
 //go:nosplit
 func (c *vCPU) KernelException(vector ring0.Vector) {
@@ -75,5 +109,16 @@ func (c *vCPU) KernelException(vector ring0.Vector) {
 	if vector == ring0.Vector(bounce) {
 		regs.Pc = 0
 	}
+
+	vfpEnable := ring0.CPACREL1()
+	if vfpEnable != 0 {
+		fpsimd := fpsimdPtr((*byte)(c.floatingPointState))
+		fpcr := ring0.GetFPCR()
+		fpsr := ring0.GetFPSR()
+		fpsimd.Fpcr = uint32(fpcr)
+		fpsimd.Fpsr = uint32(fpsr)
+		ring0.SaveVRegs((*byte)(c.floatingPointState))
+	}
+
 	ring0.Halt()
 }

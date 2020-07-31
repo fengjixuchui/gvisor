@@ -17,6 +17,7 @@
 package netfilter
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 
@@ -26,7 +27,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/syserr"
 	"gvisor.dev/gvisor/pkg/tcpip"
-	"gvisor.dev/gvisor/pkg/tcpip/iptables"
+	"gvisor.dev/gvisor/pkg/tcpip/header"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
 	"gvisor.dev/gvisor/pkg/usermem"
 )
@@ -35,22 +36,28 @@ import (
 // shouldn't be reached - an error has occurred if we fall through to one.
 const errorTargetName = "ERROR"
 
-// Metadata is used to verify that we are correctly serializing and
-// deserializing iptables into structs consumable by the iptables tool. We save
-// a metadata struct when the tables are written, and when they are read out we
-// verify that certain fields are the same.
-//
-// metadata is used by this serialization/deserializing code, not netstack.
-type metadata struct {
-	HookEntry  [linux.NF_INET_NUMHOOKS]uint32
-	Underflow  [linux.NF_INET_NUMHOOKS]uint32
-	NumEntries uint32
-	Size       uint32
+// redirectTargetName is used to mark targets as redirect targets. Redirect
+// targets should be reached for only NAT and Mangle tables. These targets will
+// change the destination port/destination IP for packets.
+const redirectTargetName = "REDIRECT"
+
+// enableLogging controls whether to log the (de)serialization of netfilter
+// structs between userspace and netstack. These logs are useful when
+// developing iptables, but can pollute sentry logs otherwise.
+const enableLogging = false
+
+// emptyFilter is for comparison with a rule's filters to determine whether it
+// is also empty. It is immutable.
+var emptyFilter = stack.IPHeaderFilter{
+	Dst:     "\x00\x00\x00\x00",
+	DstMask: "\x00\x00\x00\x00",
+	Src:     "\x00\x00\x00\x00",
+	SrcMask: "\x00\x00\x00\x00",
 }
 
 // nflog logs messages related to the writing and reading of iptables.
 func nflog(format string, args ...interface{}) {
-	if log.IsLogging(log.Debug) {
+	if enableLogging && log.IsLogging(log.Debug) {
 		log.Debugf("netfilter: "+format, args...)
 	}
 }
@@ -59,33 +66,17 @@ func nflog(format string, args ...interface{}) {
 func GetInfo(t *kernel.Task, stack *stack.Stack, outPtr usermem.Addr) (linux.IPTGetinfo, *syserr.Error) {
 	// Read in the struct and table name.
 	var info linux.IPTGetinfo
-	if _, err := t.CopyIn(outPtr, &info); err != nil {
+	if _, err := info.CopyIn(t, outPtr); err != nil {
 		return linux.IPTGetinfo{}, syserr.FromError(err)
 	}
 
-	// Find the appropriate table.
-	table, err := findTable(stack, info.Name)
+	_, info, err := convertNetstackToBinary(stack, info.Name)
 	if err != nil {
-		nflog("%v", err)
+		nflog("couldn't convert iptables: %v", err)
 		return linux.IPTGetinfo{}, syserr.ErrInvalidArgument
 	}
 
-	// Get the hooks that apply to this table.
-	info.ValidHooks = table.ValidHooks()
-
-	// Grab the metadata struct, which is used to store information (e.g.
-	// the number of entries) that applies to the user's encoding of
-	// iptables, but not netstack's.
-	metadata := table.Metadata().(metadata)
-
-	// Set values from metadata.
-	info.HookEntry = metadata.HookEntry
-	info.Underflow = metadata.Underflow
-	info.NumEntries = metadata.NumEntries
-	info.Size = metadata.Size
-
 	nflog("returning info: %+v", info)
-
 	return info, nil
 }
 
@@ -93,27 +84,17 @@ func GetInfo(t *kernel.Task, stack *stack.Stack, outPtr usermem.Addr) (linux.IPT
 func GetEntries(t *kernel.Task, stack *stack.Stack, outPtr usermem.Addr, outLen int) (linux.KernelIPTGetEntries, *syserr.Error) {
 	// Read in the struct and table name.
 	var userEntries linux.IPTGetEntries
-	if _, err := t.CopyIn(outPtr, &userEntries); err != nil {
+	if _, err := userEntries.CopyIn(t, outPtr); err != nil {
 		nflog("couldn't copy in entries %q", userEntries.Name)
 		return linux.KernelIPTGetEntries{}, syserr.FromError(err)
 	}
 
-	// Find the appropriate table.
-	table, err := findTable(stack, userEntries.Name)
-	if err != nil {
-		nflog("%v", err)
-		return linux.KernelIPTGetEntries{}, syserr.ErrInvalidArgument
-	}
-
 	// Convert netstack's iptables rules to something that the iptables
 	// tool can understand.
-	entries, meta, err := convertNetstackToBinary(userEntries.Name.String(), table)
+	entries, _, err := convertNetstackToBinary(stack, userEntries.Name)
 	if err != nil {
 		nflog("couldn't read entries: %v", err)
 		return linux.KernelIPTGetEntries{}, syserr.ErrInvalidArgument
-	}
-	if meta != table.Metadata().(metadata) {
-		panic(fmt.Sprintf("Table %q metadata changed between writing and reading. Was saved as %+v, but is now %+v", userEntries.Name.String(), table.Metadata().(metadata), meta))
 	}
 	if binary.Size(entries) > uintptr(outLen) {
 		nflog("insufficient GetEntries output size: %d", uintptr(outLen))
@@ -123,48 +104,26 @@ func GetEntries(t *kernel.Task, stack *stack.Stack, outPtr usermem.Addr, outLen 
 	return entries, nil
 }
 
-func findTable(stack *stack.Stack, tablename linux.TableName) (iptables.Table, error) {
-	ipt := stack.IPTables()
-	table, ok := ipt.Tables[tablename.String()]
-	if !ok {
-		return iptables.Table{}, fmt.Errorf("couldn't find table %q", tablename)
-	}
-	return table, nil
-}
-
-// FillDefaultIPTables sets stack's IPTables to the default tables and
-// populates them with metadata.
-func FillDefaultIPTables(stack *stack.Stack) {
-	ipt := iptables.DefaultTables()
-
-	// In order to fill in the metadata, we have to translate ipt from its
-	// netstack format to Linux's giant-binary-blob format.
-	for name, table := range ipt.Tables {
-		_, metadata, err := convertNetstackToBinary(name, table)
-		if err != nil {
-			panic(fmt.Errorf("Unable to set default IP tables: %v", err))
-		}
-		table.SetMetadata(metadata)
-		ipt.Tables[name] = table
-	}
-
-	stack.SetIPTables(ipt)
-}
-
 // convertNetstackToBinary converts the iptables as stored in netstack to the
 // format expected by the iptables tool. Linux stores each table as a binary
 // blob that can only be traversed by parsing a bit, reading some offsets,
 // jumping to those offsets, parsing again, etc.
-func convertNetstackToBinary(tablename string, table iptables.Table) (linux.KernelIPTGetEntries, metadata, error) {
-	// Return values.
+func convertNetstackToBinary(stack *stack.Stack, tablename linux.TableName) (linux.KernelIPTGetEntries, linux.IPTGetinfo, error) {
+	table, ok := stack.IPTables().GetTable(tablename.String())
+	if !ok {
+		return linux.KernelIPTGetEntries{}, linux.IPTGetinfo{}, fmt.Errorf("couldn't find table %q", tablename)
+	}
+
 	var entries linux.KernelIPTGetEntries
-	var meta metadata
+	var info linux.IPTGetinfo
+	info.ValidHooks = table.ValidHooks()
 
 	// The table name has to fit in the struct.
 	if linux.XT_TABLE_MAXNAMELEN < len(tablename) {
-		return linux.KernelIPTGetEntries{}, metadata{}, fmt.Errorf("table name %q too long.", tablename)
+		return linux.KernelIPTGetEntries{}, linux.IPTGetinfo{}, fmt.Errorf("table name %q too long", tablename)
 	}
-	copy(entries.Name[:], tablename)
+	copy(info.Name[:], tablename[:])
+	copy(entries.Name[:], tablename[:])
 
 	for ruleIdx, rule := range table.Rules {
 		nflog("convert to binary: current offset: %d", entries.Size)
@@ -173,26 +132,41 @@ func convertNetstackToBinary(tablename string, table iptables.Table) (linux.Kern
 		for hook, hookRuleIdx := range table.BuiltinChains {
 			if hookRuleIdx == ruleIdx {
 				nflog("convert to binary: found hook %d at offset %d", hook, entries.Size)
-				meta.HookEntry[hook] = entries.Size
+				info.HookEntry[hook] = entries.Size
 			}
 		}
 		// Is this a chain underflow point?
 		for underflow, underflowRuleIdx := range table.Underflows {
 			if underflowRuleIdx == ruleIdx {
 				nflog("convert to binary: found underflow %d at offset %d", underflow, entries.Size)
-				meta.Underflow[underflow] = entries.Size
+				info.Underflow[underflow] = entries.Size
 			}
 		}
 
 		// Each rule corresponds to an entry.
 		entry := linux.KernelIPTEntry{
-			IPTEntry: linux.IPTEntry{
+			Entry: linux.IPTEntry{
 				IP: linux.IPTIP{
 					Protocol: uint16(rule.Filter.Protocol),
 				},
 				NextOffset:   linux.SizeOfIPTEntry,
 				TargetOffset: linux.SizeOfIPTEntry,
 			},
+		}
+		copy(entry.Entry.IP.Dst[:], rule.Filter.Dst)
+		copy(entry.Entry.IP.DstMask[:], rule.Filter.DstMask)
+		copy(entry.Entry.IP.Src[:], rule.Filter.Src)
+		copy(entry.Entry.IP.SrcMask[:], rule.Filter.SrcMask)
+		copy(entry.Entry.IP.OutputInterface[:], rule.Filter.OutputInterface)
+		copy(entry.Entry.IP.OutputInterfaceMask[:], rule.Filter.OutputInterfaceMask)
+		if rule.Filter.DstInvert {
+			entry.Entry.IP.InverseFlags |= linux.IPT_INV_DSTIP
+		}
+		if rule.Filter.SrcInvert {
+			entry.Entry.IP.InverseFlags |= linux.IPT_INV_SRCIP
+		}
+		if rule.Filter.OutputInterfaceInvert {
+			entry.Entry.IP.InverseFlags |= linux.IPT_INV_VIA_OUT
 		}
 
 		for _, matcher := range rule.Matchers {
@@ -204,8 +178,8 @@ func convertNetstackToBinary(tablename string, table iptables.Table) (linux.Kern
 				panic(fmt.Sprintf("matcher %T is not 64-bit aligned", matcher))
 			}
 			entry.Elems = append(entry.Elems, serialized...)
-			entry.NextOffset += uint16(len(serialized))
-			entry.TargetOffset += uint16(len(serialized))
+			entry.Entry.NextOffset += uint16(len(serialized))
+			entry.Entry.TargetOffset += uint16(len(serialized))
 		}
 
 		// Serialize and append the target.
@@ -214,32 +188,34 @@ func convertNetstackToBinary(tablename string, table iptables.Table) (linux.Kern
 			panic(fmt.Sprintf("target %T is not 64-bit aligned", rule.Target))
 		}
 		entry.Elems = append(entry.Elems, serialized...)
-		entry.NextOffset += uint16(len(serialized))
+		entry.Entry.NextOffset += uint16(len(serialized))
 
 		nflog("convert to binary: adding entry: %+v", entry)
 
-		entries.Size += uint32(entry.NextOffset)
+		entries.Size += uint32(entry.Entry.NextOffset)
 		entries.Entrytable = append(entries.Entrytable, entry)
-		meta.NumEntries++
+		info.NumEntries++
 	}
 
-	nflog("convert to binary: finished with an marshalled size of %d", meta.Size)
-	meta.Size = entries.Size
-	return entries, meta, nil
+	nflog("convert to binary: finished with an marshalled size of %d", info.Size)
+	info.Size = entries.Size
+	return entries, info, nil
 }
 
-func marshalTarget(target iptables.Target) []byte {
+func marshalTarget(target stack.Target) []byte {
 	switch tg := target.(type) {
-	case iptables.AcceptTarget:
-		return marshalStandardTarget(iptables.RuleAccept)
-	case iptables.DropTarget:
-		return marshalStandardTarget(iptables.RuleDrop)
-	case iptables.ErrorTarget:
+	case stack.AcceptTarget:
+		return marshalStandardTarget(stack.RuleAccept)
+	case stack.DropTarget:
+		return marshalStandardTarget(stack.RuleDrop)
+	case stack.ErrorTarget:
 		return marshalErrorTarget(errorTargetName)
-	case iptables.UserChainTarget:
+	case stack.UserChainTarget:
 		return marshalErrorTarget(tg.Name)
-	case iptables.ReturnTarget:
-		return marshalStandardTarget(iptables.RuleReturn)
+	case stack.ReturnTarget:
+		return marshalStandardTarget(stack.RuleReturn)
+	case stack.RedirectTarget:
+		return marshalRedirectTarget(tg)
 	case JumpTarget:
 		return marshalJumpTarget(tg)
 	default:
@@ -247,7 +223,7 @@ func marshalTarget(target iptables.Target) []byte {
 	}
 }
 
-func marshalStandardTarget(verdict iptables.RuleVerdict) []byte {
+func marshalStandardTarget(verdict stack.RuleVerdict) []byte {
 	nflog("convert to binary: marshalling standard target")
 
 	// The target's name will be the empty string.
@@ -276,6 +252,29 @@ func marshalErrorTarget(errorName string) []byte {
 	return binary.Marshal(ret, usermem.ByteOrder, target)
 }
 
+func marshalRedirectTarget(rt stack.RedirectTarget) []byte {
+	// This is a redirect target named redirect
+	target := linux.XTRedirectTarget{
+		Target: linux.XTEntryTarget{
+			TargetSize: linux.SizeOfXTRedirectTarget,
+		},
+	}
+	copy(target.Target.Name[:], redirectTargetName)
+
+	ret := make([]byte, 0, linux.SizeOfXTRedirectTarget)
+	target.NfRange.RangeSize = 1
+	if rt.RangeProtoSpecified {
+		target.NfRange.RangeIPV4.Flags |= linux.NF_NAT_RANGE_PROTO_SPECIFIED
+	}
+	// Convert port from little endian to big endian.
+	port := make([]byte, 2)
+	binary.LittleEndian.PutUint16(port, rt.MinPort)
+	target.NfRange.RangeIPV4.MinPort = binary.BigEndian.Uint16(port)
+	binary.LittleEndian.PutUint16(port, rt.MaxPort)
+	target.NfRange.RangeIPV4.MaxPort = binary.BigEndian.Uint16(port)
+	return binary.Marshal(ret, usermem.ByteOrder, target)
+}
+
 func marshalJumpTarget(jt JumpTarget) []byte {
 	nflog("convert to binary: marshalling jump target")
 
@@ -295,13 +294,13 @@ func marshalJumpTarget(jt JumpTarget) []byte {
 
 // translateFromStandardVerdict translates verdicts the same way as the iptables
 // tool.
-func translateFromStandardVerdict(verdict iptables.RuleVerdict) int32 {
+func translateFromStandardVerdict(verdict stack.RuleVerdict) int32 {
 	switch verdict {
-	case iptables.RuleAccept:
+	case stack.RuleAccept:
 		return -linux.NF_ACCEPT - 1
-	case iptables.RuleDrop:
+	case stack.RuleDrop:
 		return -linux.NF_DROP - 1
-	case iptables.RuleReturn:
+	case stack.RuleReturn:
 		return linux.NF_RETURN
 	default:
 		// TODO(gvisor.dev/issue/170): Support Jump.
@@ -310,18 +309,18 @@ func translateFromStandardVerdict(verdict iptables.RuleVerdict) int32 {
 }
 
 // translateToStandardTarget translates from the value in a
-// linux.XTStandardTarget to an iptables.Verdict.
-func translateToStandardTarget(val int32) (iptables.Target, error) {
+// linux.XTStandardTarget to an stack.Verdict.
+func translateToStandardTarget(val int32) (stack.Target, error) {
 	// TODO(gvisor.dev/issue/170): Support other verdicts.
 	switch val {
 	case -linux.NF_ACCEPT - 1:
-		return iptables.AcceptTarget{}, nil
+		return stack.AcceptTarget{}, nil
 	case -linux.NF_DROP - 1:
-		return iptables.DropTarget{}, nil
+		return stack.DropTarget{}, nil
 	case -linux.NF_QUEUE - 1:
 		return nil, errors.New("unsupported iptables verdict QUEUE")
 	case linux.NF_RETURN:
-		return iptables.ReturnTarget{}, nil
+		return stack.ReturnTarget{}, nil
 	default:
 		return nil, fmt.Errorf("unknown iptables verdict %d", val)
 	}
@@ -329,7 +328,7 @@ func translateToStandardTarget(val int32) (iptables.Target, error) {
 
 // SetEntries sets iptables rules for a single table. See
 // net/ipv4/netfilter/ip_tables.c:translate_table for reference.
-func SetEntries(stack *stack.Stack, optVal []byte) *syserr.Error {
+func SetEntries(stk *stack.Stack, optVal []byte) *syserr.Error {
 	// Get the basic rules data (struct ipt_replace).
 	if len(optVal) < linux.SizeOfIPTReplace {
 		nflog("optVal has insufficient size for replace %d", len(optVal))
@@ -341,10 +340,12 @@ func SetEntries(stack *stack.Stack, optVal []byte) *syserr.Error {
 	binary.Unmarshal(replaceBuf, usermem.ByteOrder, &replace)
 
 	// TODO(gvisor.dev/issue/170): Support other tables.
-	var table iptables.Table
+	var table stack.Table
 	switch replace.Name.String() {
-	case iptables.TablenameFilter:
-		table = iptables.EmptyFilterTable()
+	case stack.FilterTable:
+		table = stack.EmptyFilterTable()
+	case stack.NATTable:
+		table = stack.EmptyNATTable()
 	default:
 		nflog("we don't yet support writing to the %q table (gvisor.dev/issue/170)", replace.Name.String())
 		return syserr.ErrInvalidArgument
@@ -404,14 +405,14 @@ func SetEntries(stack *stack.Stack, optVal []byte) *syserr.Error {
 			nflog("entry doesn't have enough room for its target (only %d bytes remain)", len(optVal))
 			return syserr.ErrInvalidArgument
 		}
-		target, err := parseTarget(optVal[:targetSize])
+		target, err := parseTarget(filter, optVal[:targetSize])
 		if err != nil {
 			nflog("failed to parse target: %v", err)
 			return syserr.ErrInvalidArgument
 		}
 		optVal = optVal[targetSize:]
 
-		table.Rules = append(table.Rules, iptables.Rule{
+		table.Rules = append(table.Rules, stack.Rule{
 			Filter:   filter,
 			Target:   target,
 			Matchers: matchers,
@@ -430,23 +431,25 @@ func SetEntries(stack *stack.Stack, optVal []byte) *syserr.Error {
 	for hook, _ := range replace.HookEntry {
 		if table.ValidHooks()&(1<<hook) != 0 {
 			hk := hookFromLinux(hook)
+			table.BuiltinChains[hk] = stack.HookUnset
+			table.Underflows[hk] = stack.HookUnset
 			for offset, ruleIdx := range offsets {
 				if offset == replace.HookEntry[hook] {
 					table.BuiltinChains[hk] = ruleIdx
 				}
 				if offset == replace.Underflow[hook] {
 					if !validUnderflow(table.Rules[ruleIdx]) {
-						nflog("underflow for hook %d isn't an unconditional ACCEPT or DROP")
+						nflog("underflow for hook %d isn't an unconditional ACCEPT or DROP", ruleIdx)
 						return syserr.ErrInvalidArgument
 					}
 					table.Underflows[hk] = ruleIdx
 				}
 			}
-			if ruleIdx := table.BuiltinChains[hk]; ruleIdx == iptables.HookUnset {
+			if ruleIdx := table.BuiltinChains[hk]; ruleIdx == stack.HookUnset {
 				nflog("hook %v is unset.", hk)
 				return syserr.ErrInvalidArgument
 			}
-			if ruleIdx := table.Underflows[hk]; ruleIdx == iptables.HookUnset {
+			if ruleIdx := table.Underflows[hk]; ruleIdx == stack.HookUnset {
 				nflog("underflow %v is unset.", hk)
 				return syserr.ErrInvalidArgument
 			}
@@ -455,8 +458,7 @@ func SetEntries(stack *stack.Stack, optVal []byte) *syserr.Error {
 
 	// Add the user chains.
 	for ruleIdx, rule := range table.Rules {
-		target, ok := rule.Target.(iptables.UserChainTarget)
-		if !ok {
+		if _, ok := rule.Target.(stack.UserChainTarget); !ok {
 			continue
 		}
 
@@ -472,7 +474,6 @@ func SetEntries(stack *stack.Stack, optVal []byte) *syserr.Error {
 			nflog("user chain's first node must have no matchers")
 			return syserr.ErrInvalidArgument
 		}
-		table.UserChains[target.Name] = ruleIdx + 1
 	}
 
 	// Set each jump to point to the appropriate rule. Right now they hold byte
@@ -495,11 +496,14 @@ func SetEntries(stack *stack.Stack, optVal []byte) *syserr.Error {
 	}
 
 	// TODO(gvisor.dev/issue/170): Support other chains.
-	// Since we only support modifying the INPUT chain right now, make sure
-	// all other chains point to ACCEPT rules.
+	// Since we only support modifying the INPUT, PREROUTING and OUTPUT chain right now,
+	// make sure all other chains point to ACCEPT rules.
 	for hook, ruleIdx := range table.BuiltinChains {
-		if hook != iptables.Input {
-			if _, ok := table.Rules[ruleIdx].Target.(iptables.AcceptTarget); !ok {
+		if hook := stack.Hook(hook); hook == stack.Forward || hook == stack.Postrouting {
+			if ruleIdx == stack.HookUnset {
+				continue
+			}
+			if !isUnconditionalAccept(table.Rules[ruleIdx]) {
 				nflog("hook %d is unsupported.", hook)
 				return syserr.ErrInvalidArgument
 			}
@@ -511,24 +515,14 @@ func SetEntries(stack *stack.Stack, optVal []byte) *syserr.Error {
 	// - There are no chains without an unconditional final rule.
 	// - There are no chains without an unconditional underflow rule.
 
-	ipt := stack.IPTables()
-	table.SetMetadata(metadata{
-		HookEntry:  replace.HookEntry,
-		Underflow:  replace.Underflow,
-		NumEntries: replace.NumEntries,
-		Size:       replace.Size,
-	})
-	ipt.Tables[replace.Name.String()] = table
-	stack.SetIPTables(ipt)
-
-	return nil
+	return syserr.TranslateNetstackError(stk.IPTables().ReplaceTable(replace.Name.String(), table))
 }
 
 // parseMatchers parses 0 or more matchers from optVal. optVal should contain
 // only the matchers.
-func parseMatchers(filter iptables.IPHeaderFilter, optVal []byte) ([]iptables.Matcher, error) {
+func parseMatchers(filter stack.IPHeaderFilter, optVal []byte) ([]stack.Matcher, error) {
 	nflog("set entries: parsing matchers of size %d", len(optVal))
-	var matchers []iptables.Matcher
+	var matchers []stack.Matcher
 	for len(optVal) > 0 {
 		nflog("set entries: optVal has len %d", len(optVal))
 
@@ -570,7 +564,7 @@ func parseMatchers(filter iptables.IPHeaderFilter, optVal []byte) ([]iptables.Ma
 
 // parseTarget parses a target from optVal. optVal should contain only the
 // target.
-func parseTarget(optVal []byte) (iptables.Target, error) {
+func parseTarget(filter stack.IPHeaderFilter, optVal []byte) (stack.Target, error) {
 	nflog("set entries: parsing target of size %d", len(optVal))
 	if len(optVal) < linux.SizeOfXTEntryTarget {
 		return nil, fmt.Errorf("optVal has insufficient size for entry target %d", len(optVal))
@@ -614,67 +608,155 @@ func parseTarget(optVal []byte) (iptables.Target, error) {
 		switch name := errorTarget.Name.String(); name {
 		case errorTargetName:
 			nflog("set entries: error target")
-			return iptables.ErrorTarget{}, nil
+			return stack.ErrorTarget{}, nil
 		default:
 			// User defined chain.
 			nflog("set entries: user-defined target %q", name)
-			return iptables.UserChainTarget{Name: name}, nil
+			return stack.UserChainTarget{Name: name}, nil
 		}
+
+	case redirectTargetName:
+		// Redirect target.
+		if len(optVal) < linux.SizeOfXTRedirectTarget {
+			return nil, fmt.Errorf("netfilter.SetEntries: optVal has insufficient size for redirect target %d", len(optVal))
+		}
+
+		if filter.Protocol != header.TCPProtocolNumber && filter.Protocol != header.UDPProtocolNumber {
+			return nil, fmt.Errorf("netfilter.SetEntries: invalid argument")
+		}
+
+		var redirectTarget linux.XTRedirectTarget
+		buf = optVal[:linux.SizeOfXTRedirectTarget]
+		binary.Unmarshal(buf, usermem.ByteOrder, &redirectTarget)
+
+		// Copy linux.XTRedirectTarget to stack.RedirectTarget.
+		var target stack.RedirectTarget
+		nfRange := redirectTarget.NfRange
+
+		// RangeSize should be 1.
+		if nfRange.RangeSize != 1 {
+			return nil, fmt.Errorf("netfilter.SetEntries: invalid argument")
+		}
+
+		// TODO(gvisor.dev/issue/170): Check if the flags are valid.
+		// Also check if we need to map ports or IP.
+		// For now, redirect target only supports destination port change.
+		// Port range and IP range are not supported yet.
+		if nfRange.RangeIPV4.Flags&linux.NF_NAT_RANGE_PROTO_SPECIFIED == 0 {
+			return nil, fmt.Errorf("netfilter.SetEntries: invalid argument")
+		}
+		target.RangeProtoSpecified = true
+
+		target.MinIP = tcpip.Address(nfRange.RangeIPV4.MinIP[:])
+		target.MaxIP = tcpip.Address(nfRange.RangeIPV4.MaxIP[:])
+
+		// TODO(gvisor.dev/issue/170): Port range is not supported yet.
+		if nfRange.RangeIPV4.MinPort != nfRange.RangeIPV4.MaxPort {
+			return nil, fmt.Errorf("netfilter.SetEntries: invalid argument")
+		}
+
+		// Convert port from big endian to little endian.
+		port := make([]byte, 2)
+		binary.BigEndian.PutUint16(port, nfRange.RangeIPV4.MinPort)
+		target.MinPort = binary.LittleEndian.Uint16(port)
+
+		binary.BigEndian.PutUint16(port, nfRange.RangeIPV4.MaxPort)
+		target.MaxPort = binary.LittleEndian.Uint16(port)
+		return target, nil
 	}
 
 	// Unknown target.
 	return nil, fmt.Errorf("unknown target %q doesn't exist or isn't supported yet.", target.Name.String())
 }
 
-func filterFromIPTIP(iptip linux.IPTIP) (iptables.IPHeaderFilter, error) {
+func filterFromIPTIP(iptip linux.IPTIP) (stack.IPHeaderFilter, error) {
 	if containsUnsupportedFields(iptip) {
-		return iptables.IPHeaderFilter{}, fmt.Errorf("unsupported fields in struct iptip: %+v", iptip)
+		return stack.IPHeaderFilter{}, fmt.Errorf("unsupported fields in struct iptip: %+v", iptip)
 	}
-	return iptables.IPHeaderFilter{
-		Protocol: tcpip.TransportProtocolNumber(iptip.Protocol),
+	if len(iptip.Dst) != header.IPv4AddressSize || len(iptip.DstMask) != header.IPv4AddressSize {
+		return stack.IPHeaderFilter{}, fmt.Errorf("incorrect length of destination (%d) and/or destination mask (%d) fields", len(iptip.Dst), len(iptip.DstMask))
+	}
+	if len(iptip.Src) != header.IPv4AddressSize || len(iptip.SrcMask) != header.IPv4AddressSize {
+		return stack.IPHeaderFilter{}, fmt.Errorf("incorrect length of source (%d) and/or source mask (%d) fields", len(iptip.Src), len(iptip.SrcMask))
+	}
+
+	n := bytes.IndexByte([]byte(iptip.OutputInterface[:]), 0)
+	if n == -1 {
+		n = len(iptip.OutputInterface)
+	}
+	ifname := string(iptip.OutputInterface[:n])
+
+	n = bytes.IndexByte([]byte(iptip.OutputInterfaceMask[:]), 0)
+	if n == -1 {
+		n = len(iptip.OutputInterfaceMask)
+	}
+	ifnameMask := string(iptip.OutputInterfaceMask[:n])
+
+	return stack.IPHeaderFilter{
+		Protocol:              tcpip.TransportProtocolNumber(iptip.Protocol),
+		Dst:                   tcpip.Address(iptip.Dst[:]),
+		DstMask:               tcpip.Address(iptip.DstMask[:]),
+		DstInvert:             iptip.InverseFlags&linux.IPT_INV_DSTIP != 0,
+		Src:                   tcpip.Address(iptip.Src[:]),
+		SrcMask:               tcpip.Address(iptip.SrcMask[:]),
+		SrcInvert:             iptip.InverseFlags&linux.IPT_INV_SRCIP != 0,
+		OutputInterface:       ifname,
+		OutputInterfaceMask:   ifnameMask,
+		OutputInterfaceInvert: iptip.InverseFlags&linux.IPT_INV_VIA_OUT != 0,
 	}, nil
 }
 
 func containsUnsupportedFields(iptip linux.IPTIP) bool {
-	// Currently we check that everything except protocol is zeroed.
-	var emptyInetAddr = linux.InetAddr{}
+	// The following features are supported:
+	// - Protocol
+	// - Dst and DstMask
+	// - Src and SrcMask
+	// - The inverse destination IP check flag
+	// - OutputInterface, OutputInterfaceMask and its inverse.
 	var emptyInterface = [linux.IFNAMSIZ]byte{}
-	return iptip.Dst != emptyInetAddr ||
-		iptip.Src != emptyInetAddr ||
-		iptip.SrcMask != emptyInetAddr ||
-		iptip.DstMask != emptyInetAddr ||
-		iptip.InputInterface != emptyInterface ||
-		iptip.OutputInterface != emptyInterface ||
+	// Disable any supported inverse flags.
+	inverseMask := uint8(linux.IPT_INV_DSTIP) | uint8(linux.IPT_INV_SRCIP) | uint8(linux.IPT_INV_VIA_OUT)
+	return iptip.InputInterface != emptyInterface ||
 		iptip.InputInterfaceMask != emptyInterface ||
-		iptip.OutputInterfaceMask != emptyInterface ||
 		iptip.Flags != 0 ||
-		iptip.InverseFlags != 0
+		iptip.InverseFlags&^inverseMask != 0
 }
 
-func validUnderflow(rule iptables.Rule) bool {
+func validUnderflow(rule stack.Rule) bool {
 	if len(rule.Matchers) != 0 {
 		return false
 	}
+	if rule.Filter != emptyFilter {
+		return false
+	}
 	switch rule.Target.(type) {
-	case iptables.AcceptTarget, iptables.DropTarget:
+	case stack.AcceptTarget, stack.DropTarget:
 		return true
 	default:
 		return false
 	}
 }
 
-func hookFromLinux(hook int) iptables.Hook {
+func isUnconditionalAccept(rule stack.Rule) bool {
+	if !validUnderflow(rule) {
+		return false
+	}
+	_, ok := rule.Target.(stack.AcceptTarget)
+	return ok
+}
+
+func hookFromLinux(hook int) stack.Hook {
 	switch hook {
 	case linux.NF_INET_PRE_ROUTING:
-		return iptables.Prerouting
+		return stack.Prerouting
 	case linux.NF_INET_LOCAL_IN:
-		return iptables.Input
+		return stack.Input
 	case linux.NF_INET_FORWARD:
-		return iptables.Forward
+		return stack.Forward
 	case linux.NF_INET_LOCAL_OUT:
-		return iptables.Output
+		return stack.Output
 	case linux.NF_INET_POST_ROUTING:
-		return iptables.Postrouting
+		return stack.Postrouting
 	}
 	panic(fmt.Sprintf("Unknown hook %d does not correspond to a builtin chain", hook))
 }

@@ -23,14 +23,12 @@ import (
 
 	"gvisor.dev/gvisor/pkg/binary"
 	"gvisor.dev/gvisor/pkg/context"
+	"gvisor.dev/gvisor/pkg/gohacks"
 	"gvisor.dev/gvisor/pkg/safemem"
 	"gvisor.dev/gvisor/pkg/syserror"
 )
 
 // IO provides access to the contents of a virtual memory space.
-//
-// FIXME(b/38173783): Implementations of IO cannot expect ctx to contain any
-// meaningful data.
 type IO interface {
 	// CopyOut copies len(src) bytes from src to the memory mapped at addr. It
 	// returns the number of bytes copied. If the number of bytes copied is <
@@ -251,7 +249,7 @@ func CopyStringIn(ctx context.Context, uio IO, addr Addr, maxlen int, opts IOOpt
 		}
 		end, ok := addr.AddLength(uint64(readlen))
 		if !ok {
-			return stringFromImmutableBytes(buf[:done]), syserror.EFAULT
+			return gohacks.StringFromImmutableBytes(buf[:done]), syserror.EFAULT
 		}
 		// Shorten the read to avoid crossing page boundaries, since faulting
 		// in a page unnecessarily is expensive. This also ensures that partial
@@ -272,16 +270,16 @@ func CopyStringIn(ctx context.Context, uio IO, addr Addr, maxlen int, opts IOOpt
 		// Look for the terminating zero byte, which may have occurred before
 		// hitting err.
 		if i := bytes.IndexByte(buf[done:done+n], byte(0)); i >= 0 {
-			return stringFromImmutableBytes(buf[:done+i]), nil
+			return gohacks.StringFromImmutableBytes(buf[:done+i]), nil
 		}
 
 		done += n
 		if err != nil {
-			return stringFromImmutableBytes(buf[:done]), err
+			return gohacks.StringFromImmutableBytes(buf[:done]), err
 		}
 		addr = end
 	}
-	return stringFromImmutableBytes(buf), syserror.ENAMETOOLONG
+	return gohacks.StringFromImmutableBytes(buf), syserror.ENAMETOOLONG
 }
 
 // CopyOutVec copies bytes from src to the memory mapped at ars in uio. The

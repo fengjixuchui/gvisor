@@ -17,6 +17,7 @@ package header
 import (
 	"crypto/sha256"
 	"encoding/binary"
+	"fmt"
 	"strings"
 
 	"gvisor.dev/gvisor/pkg/tcpip"
@@ -27,7 +28,9 @@ const (
 	// IPv6PayloadLenOffset is the offset of the PayloadLength field in
 	// IPv6 header.
 	IPv6PayloadLenOffset = 4
-	nextHdr              = 6
+	// IPv6NextHeaderOffset is the offset of the NextHeader field in
+	// IPv6 header.
+	IPv6NextHeaderOffset = 6
 	hopLimit             = 7
 	v6SrcAddr            = 8
 	v6DstAddr            = v6SrcAddr + IPv6AddressSize
@@ -115,6 +118,19 @@ const (
 	// for the secret key used to generate an opaque interface identifier as
 	// outlined by RFC 7217.
 	OpaqueIIDSecretKeyMinBytes = 16
+
+	// ipv6MulticastAddressScopeByteIdx is the byte where the scope (scop) field
+	// is located within a multicast IPv6 address, as per RFC 4291 section 2.7.
+	ipv6MulticastAddressScopeByteIdx = 1
+
+	// ipv6MulticastAddressScopeMask is the mask for the scope (scop) field,
+	// within the byte holding the field, as per RFC 4291 section 2.7.
+	ipv6MulticastAddressScopeMask = 0xF
+
+	// ipv6LinkLocalMulticastScope is the value of the scope (scop) field within
+	// a multicast IPv6 address that indicates the address has link-local scope,
+	// as per RFC 4291 section 2.7.
+	ipv6LinkLocalMulticastScope = 2
 )
 
 // IPv6EmptySubnet is the empty IPv6 subnet. It may also be known as the
@@ -150,7 +166,7 @@ func (b IPv6) HopLimit() uint8 {
 
 // NextHeader returns the value of the "next header" field of the ipv6 header.
 func (b IPv6) NextHeader() uint8 {
-	return b[nextHdr]
+	return b[IPv6NextHeaderOffset]
 }
 
 // TransportProtocol implements Network.TransportProtocol.
@@ -210,7 +226,7 @@ func (b IPv6) SetDestinationAddress(addr tcpip.Address) {
 
 // SetNextHeader sets the value of the "next header" field of the ipv6 header.
 func (b IPv6) SetNextHeader(v uint8) {
-	b[nextHdr] = v
+	b[IPv6NextHeaderOffset] = v
 }
 
 // SetChecksum implements Network.SetChecksum. Given that IPv6 doesn't have a
@@ -222,7 +238,7 @@ func (IPv6) SetChecksum(uint16) {
 func (b IPv6) Encode(i *IPv6Fields) {
 	b.SetTOS(i.TrafficClass, i.FlowLabel)
 	b.SetPayloadLength(i.PayloadLength)
-	b[nextHdr] = i.NextHeader
+	b[IPv6NextHeaderOffset] = i.NextHeader
 	b[hopLimit] = i.HopLimit
 	b.SetSourceAddress(i.SrcAddr)
 	b.SetDestinationAddress(i.DstAddr)
@@ -340,6 +356,12 @@ func IsV6LinkLocalAddress(addr tcpip.Address) bool {
 	return addr[0] == 0xfe && (addr[1]&0xc0) == 0x80
 }
 
+// IsV6LinkLocalMulticastAddress determines if the provided address is an IPv6
+// link-local multicast address.
+func IsV6LinkLocalMulticastAddress(addr tcpip.Address) bool {
+	return IsV6MulticastAddress(addr) && addr[ipv6MulticastAddressScopeByteIdx]&ipv6MulticastAddressScopeMask == ipv6LinkLocalMulticastScope
+}
+
 // IsV6UniqueLocalAddress determines if the provided address is an IPv6
 // unique-local address (within the prefix FC00::/7).
 func IsV6UniqueLocalAddress(addr tcpip.Address) bool {
@@ -411,6 +433,9 @@ func ScopeForIPv6Address(addr tcpip.Address) (IPv6AddressScope, *tcpip.Error) {
 	}
 
 	switch {
+	case IsV6LinkLocalMulticastAddress(addr):
+		return LinkLocalScope, nil
+
 	case IsV6LinkLocalAddress(addr):
 		return LinkLocalScope, nil
 
@@ -419,5 +444,56 @@ func ScopeForIPv6Address(addr tcpip.Address) (IPv6AddressScope, *tcpip.Error) {
 
 	default:
 		return GlobalScope, nil
+	}
+}
+
+// InitialTempIID generates the initial temporary IID history value to generate
+// temporary SLAAC addresses with.
+//
+// Panics if initialTempIIDHistory is not at least IIDSize bytes.
+func InitialTempIID(initialTempIIDHistory []byte, seed []byte, nicID tcpip.NICID) {
+	h := sha256.New()
+	// h.Write never returns an error.
+	h.Write(seed)
+	var nicIDBuf [4]byte
+	binary.BigEndian.PutUint32(nicIDBuf[:], uint32(nicID))
+	h.Write(nicIDBuf[:])
+
+	var sumBuf [sha256.Size]byte
+	sum := h.Sum(sumBuf[:0])
+
+	if n := copy(initialTempIIDHistory, sum[sha256.Size-IIDSize:]); n != IIDSize {
+		panic(fmt.Sprintf("copied %d bytes, expected %d bytes", n, IIDSize))
+	}
+}
+
+// GenerateTempIPv6SLAACAddr generates a temporary SLAAC IPv6 address for an
+// associated stable/permanent SLAAC address.
+//
+// GenerateTempIPv6SLAACAddr will update the temporary IID history value to be
+// used when generating a new temporary IID.
+//
+// Panics if tempIIDHistory is not at least IIDSize bytes.
+func GenerateTempIPv6SLAACAddr(tempIIDHistory []byte, stableAddr tcpip.Address) tcpip.AddressWithPrefix {
+	addrBytes := []byte(stableAddr)
+	h := sha256.New()
+	h.Write(tempIIDHistory)
+	h.Write(addrBytes[IIDOffsetInIPv6Address:])
+	var sumBuf [sha256.Size]byte
+	sum := h.Sum(sumBuf[:0])
+
+	// The rightmost 64 bits of sum are saved for the next iteration.
+	if n := copy(tempIIDHistory, sum[sha256.Size-IIDSize:]); n != IIDSize {
+		panic(fmt.Sprintf("copied %d bytes, expected %d bytes", n, IIDSize))
+	}
+
+	// The leftmost 64 bits of sum is used as the IID.
+	if n := copy(addrBytes[IIDOffsetInIPv6Address:], sum); n != IIDSize {
+		panic(fmt.Sprintf("copied %d IID bytes, expected %d bytes", n, IIDSize))
+	}
+
+	return tcpip.AddressWithPrefix{
+		Address:   tcpip.Address(addrBytes),
+		PrefixLen: IIDOffsetInIPv6Address * 8,
 	}
 }

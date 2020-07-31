@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// +build i386 amd64
+// +build 386 amd64
 
 package cpuid
 
@@ -235,7 +235,9 @@ const (
 	X86FeaturePERFCTR_TSC
 	X86FeaturePERFCTR_LLC
 	X86FeatureMWAITX
-	// ECX[31:30] are reserved.
+	// TODO(b/152776797): Some CPUs set this but it is not documented anywhere.
+	X86FeatureBlock5Bit30
+	_ // ecx bit 31 is reserved.
 )
 
 // Block 6 constants are the extended feature bits in
@@ -438,6 +440,9 @@ var x86FeatureParseOnlyStrings = map[Feature]string{
 
 	// Block 3.
 	X86FeaturePREFETCHWT1: "prefetchwt1",
+
+	// Block 5.
+	X86FeatureBlock5Bit30: "block5_bit30",
 }
 
 // intelCacheDescriptors describe the caches and TLBs on the system. They are
@@ -1052,9 +1057,9 @@ func HostFeatureSet() *FeatureSet {
 	}
 }
 
-// Reads max cpu frequency from host /proc/cpuinfo. Must run before
-// whitelisting. This value is used to create the fake /proc/cpuinfo from a
-// FeatureSet.
+// Reads max cpu frequency from host /proc/cpuinfo. Must run before syscall
+// filter installation. This value is used to create the fake /proc/cpuinfo
+// from a FeatureSet.
 func initCPUFreq() {
 	cpuinfob, err := ioutil.ReadFile("/proc/cpuinfo")
 	if err != nil {
@@ -1101,7 +1106,6 @@ func initFeaturesFromString() {
 }
 
 func init() {
-	// initCpuFreq must be run before whitelists are enabled.
 	initCPUFreq()
 	initFeaturesFromString()
 }

@@ -25,8 +25,12 @@ import (
 
 // doSplice implements a blocking splice operation.
 func doSplice(t *kernel.Task, outFile, inFile *fs.File, opts fs.SpliceOpts, nonBlocking bool) (int64, error) {
-	if opts.Length < 0 || opts.SrcStart < 0 || opts.DstStart < 0 {
+	if opts.Length < 0 || opts.SrcStart < 0 || opts.DstStart < 0 || (opts.SrcStart+opts.Length < 0) {
 		return 0, syserror.EINVAL
+	}
+
+	if opts.Length > int64(kernel.MAX_RW_COUNT) {
+		opts.Length = int64(kernel.MAX_RW_COUNT)
 	}
 
 	var (
@@ -76,6 +80,12 @@ func doSplice(t *kernel.Task, outFile, inFile *fs.File, opts fs.SpliceOpts, nonB
 		}
 	}
 
+	if total > 0 {
+		// On Linux, inotify behavior is not very consistent with splice(2). We try
+		// our best to emulate Linux for very basic calls to splice, where for some
+		// reason, events are generated for output files, but not input files.
+		outFile.Dirent.InotifyEvent(linux.IN_MODIFY, 0)
+	}
 	return total, err
 }
 
