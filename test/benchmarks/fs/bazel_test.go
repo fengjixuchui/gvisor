@@ -15,14 +15,27 @@ package fs
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 
 	"gvisor.dev/gvisor/pkg/test/dockerutil"
+	"gvisor.dev/gvisor/test/benchmarks/harness"
 )
 
 // Note: CleanCache versions of this test require running with root permissions.
-func BenchmarkABSL(b *testing.B) {
+func BenchmarkBuildABSL(b *testing.B) {
+	runBuildBenchmark(b, "benchmarks/absl", "/abseil-cpp", "absl/base/...")
+}
+
+// Note: CleanCache versions of this test require running with root permissions.
+// Note: This test takes on the order of 10m per permutation for runsc on kvm.
+func BenchmarkBuildRunsc(b *testing.B) {
+	runBuildBenchmark(b, "benchmarks/runsc", "/gvisor", "runsc:runsc")
+}
+
+func runBuildBenchmark(b *testing.B, image, workdir, target string) {
+	b.Helper()
 	// Get a machine from the Harness on which to run.
 	machine, err := h.GetMachine()
 	if err != nil {
@@ -49,36 +62,40 @@ func BenchmarkABSL(b *testing.B) {
 			container := machine.GetContainer(ctx, b)
 			defer container.CleanUp(ctx)
 
-			workdir := "/abseil-cpp"
-
-			// Start a container.
+			// Start a container and sleep by an order of b.N.
 			if err := container.Spawn(ctx, dockerutil.RunOpts{
-				Image: "benchmarks/absl",
-			}, "sleep", "1000"); err != nil {
+				Image: image,
+			}, "sleep", fmt.Sprintf("%d", 1000000)); err != nil {
 				b.Fatalf("run failed with: %v", err)
 			}
 
 			// If we are running on a tmpfs, copy to /tmp which is a tmpfs.
 			if bm.tmpfs {
-				if _, err := container.Exec(ctx, dockerutil.ExecOpts{},
-					"cp", "-r", "/abseil-cpp", "/tmp/."); err != nil {
-					b.Fatal("failed to copy directory: %v", err)
+				if out, err := container.Exec(ctx, dockerutil.ExecOpts{},
+					"cp", "-r", workdir, "/tmp/."); err != nil {
+					b.Fatal("failed to copy directory: %v %s", err, out)
 				}
 				workdir = "/tmp" + workdir
 			}
 
-			// Drop Caches.
-			if bm.clearCache {
-				if out, err := machine.RunCommand("/bin/sh -c sync; echo 3 > /proc/sys/vm/drop_caches"); err != nil {
-					b.Fatalf("failed to drop caches: %v %s", err, out)
-				}
-			}
-
+			// Restart profiles after the copy.
+			container.RestartProfiles()
 			b.ResetTimer()
+			// Drop Caches and bazel clean should happen inside the loop as we may use
+			// time options with b.N. (e.g. Run for an hour.)
 			for i := 0; i < b.N; i++ {
+				b.StopTimer()
+				// Drop Caches for clear cache runs.
+				if bm.clearCache {
+					if err := harness.DropCaches(machine); err != nil {
+						b.Skipf("failed to drop caches: %v. You probably need root.", err)
+					}
+				}
+				b.StartTimer()
+
 				got, err := container.Exec(ctx, dockerutil.ExecOpts{
 					WorkDir: workdir,
-				}, "bazel", "build", "-c", "opt", "absl/base/...")
+				}, "bazel", "build", "-c", "opt", target)
 				if err != nil {
 					b.Fatalf("build failed with: %v", err)
 				}
@@ -87,6 +104,13 @@ func BenchmarkABSL(b *testing.B) {
 				want := "Build completed successfully"
 				if !strings.Contains(got, want) {
 					b.Fatalf("string %s not in: %s", want, got)
+				}
+				// Clean bazel in case we use b.N.
+				_, err = container.Exec(ctx, dockerutil.ExecOpts{
+					WorkDir: workdir,
+				}, "bazel", "clean")
+				if err != nil {
+					b.Fatalf("build failed with: %v", err)
 				}
 				b.StartTimer()
 			}

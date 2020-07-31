@@ -43,15 +43,21 @@ import (
 // See: https://pkg.go.dev/github.com/docker/docker.
 type Container struct {
 	Name    string
-	Runtime string
+	runtime string
 
 	logger   testutil.Logger
 	client   *client.Client
 	id       string
 	mounts   []mount.Mount
 	links    []string
-	cleanups []func()
 	copyErr  error
+	cleanups []func()
+
+	// Profiles are profiles added to this container. They contain methods
+	// that are run after Creation, Start, and Cleanup of this Container, along
+	// a handle to restart the profile. Generally, tests/benchmarks using
+	// profiles need to run as root.
+	profiles []Profile
 
 	// Stores streams attached to the container. Used by WaitForOutputSubmatch.
 	streams types.HijackedResponse
@@ -106,7 +112,19 @@ type RunOpts struct {
 // MakeContainer sets up the struct for a Docker container.
 //
 // Names of containers will be unique.
+// Containers will check flags for profiling requests.
 func MakeContainer(ctx context.Context, logger testutil.Logger) *Container {
+	c := MakeNativeContainer(ctx, logger)
+	c.runtime = *runtime
+	if p := MakePprofFromFlags(c); p != nil {
+		c.AddProfile(p)
+	}
+	return c
+}
+
+// MakeNativeContainer sets up the struct for a DockerContainer using runc. Native
+// containers aren't profiled.
+func MakeNativeContainer(ctx context.Context, logger testutil.Logger) *Container {
 	// Slashes are not allowed in container names.
 	name := testutil.RandomID(logger.Name())
 	name = strings.ReplaceAll(name, "/", "-")
@@ -114,20 +132,33 @@ func MakeContainer(ctx context.Context, logger testutil.Logger) *Container {
 	if err != nil {
 		return nil
 	}
-
 	client.NegotiateAPIVersion(ctx)
-
 	return &Container{
 		logger:  logger,
 		Name:    name,
-		Runtime: *runtime,
+		runtime: "",
 		client:  client,
 	}
 }
 
+// AddProfile adds a profile to this container.
+func (c *Container) AddProfile(p Profile) {
+	c.profiles = append(c.profiles, p)
+}
+
+// RestartProfiles calls Restart on all profiles for this container.
+func (c *Container) RestartProfiles() error {
+	for _, profile := range c.profiles {
+		if err := profile.Restart(c); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // Spawn is analogous to 'docker run -d'.
 func (c *Container) Spawn(ctx context.Context, r RunOpts, args ...string) error {
-	if err := c.create(ctx, r, args); err != nil {
+	if err := c.create(ctx, c.config(r, args), c.hostConfig(r), nil); err != nil {
 		return err
 	}
 	return c.Start(ctx)
@@ -153,7 +184,7 @@ func (c *Container) SpawnProcess(ctx context.Context, r RunOpts, args ...string)
 
 // Run is analogous to 'docker run'.
 func (c *Container) Run(ctx context.Context, r RunOpts, args ...string) (string, error) {
-	if err := c.create(ctx, r, args); err != nil {
+	if err := c.create(ctx, c.config(r, args), c.hostConfig(r), nil); err != nil {
 		return "", err
 	}
 
@@ -181,27 +212,25 @@ func (c *Container) MakeLink(target string) string {
 
 // CreateFrom creates a container from the given configs.
 func (c *Container) CreateFrom(ctx context.Context, conf *container.Config, hostconf *container.HostConfig, netconf *network.NetworkingConfig) error {
-	cont, err := c.client.ContainerCreate(ctx, conf, hostconf, netconf, c.Name)
-	if err != nil {
-		return err
-	}
-	c.id = cont.ID
-	return nil
+	return c.create(ctx, conf, hostconf, netconf)
 }
 
 // Create is analogous to 'docker create'.
 func (c *Container) Create(ctx context.Context, r RunOpts, args ...string) error {
-	return c.create(ctx, r, args)
+	return c.create(ctx, c.config(r, args), c.hostConfig(r), nil)
 }
 
-func (c *Container) create(ctx context.Context, r RunOpts, args []string) error {
-	conf := c.config(r, args)
-	hostconf := c.hostConfig(r)
+func (c *Container) create(ctx context.Context, conf *container.Config, hostconf *container.HostConfig, netconf *network.NetworkingConfig) error {
 	cont, err := c.client.ContainerCreate(ctx, conf, hostconf, nil, c.Name)
 	if err != nil {
 		return err
 	}
 	c.id = cont.ID
+	for _, profile := range c.profiles {
+		if err := profile.OnCreate(c); err != nil {
+			return fmt.Errorf("OnCreate method failed with: %v", err)
+		}
+	}
 	return nil
 }
 
@@ -227,7 +256,7 @@ func (c *Container) hostConfig(r RunOpts) *container.HostConfig {
 	c.mounts = append(c.mounts, r.Mounts...)
 
 	return &container.HostConfig{
-		Runtime:         c.Runtime,
+		Runtime:         c.runtime,
 		Mounts:          c.mounts,
 		PublishAllPorts: true,
 		Links:           r.Links,
@@ -261,8 +290,15 @@ func (c *Container) Start(ctx context.Context) error {
 	c.cleanups = append(c.cleanups, func() {
 		c.streams.Close()
 	})
-
-	return c.client.ContainerStart(ctx, c.id, types.ContainerStartOptions{})
+	if err := c.client.ContainerStart(ctx, c.id, types.ContainerStartOptions{}); err != nil {
+		return fmt.Errorf("ContainerStart failed: %v", err)
+	}
+	for _, profile := range c.profiles {
+		if err := profile.OnStart(c); err != nil {
+			return fmt.Errorf("OnStart method failed: %v", err)
+		}
+	}
+	return nil
 }
 
 // Stop is analogous to 'docker stop'.
@@ -324,13 +360,18 @@ func (c *Container) SandboxPid(ctx context.Context) (int, error) {
 }
 
 // FindIP returns the IP address of the container.
-func (c *Container) FindIP(ctx context.Context) (net.IP, error) {
+func (c *Container) FindIP(ctx context.Context, ipv6 bool) (net.IP, error) {
 	resp, err := c.client.ContainerInspect(ctx, c.id)
 	if err != nil {
 		return nil, err
 	}
 
-	ip := net.ParseIP(resp.NetworkSettings.DefaultNetworkSettings.IPAddress)
+	var ip net.IP
+	if ipv6 {
+		ip = net.ParseIP(resp.NetworkSettings.DefaultNetworkSettings.GlobalIPv6Address)
+	} else {
+		ip = net.ParseIP(resp.NetworkSettings.DefaultNetworkSettings.IPAddress)
+	}
 	if ip == nil {
 		return net.IP{}, fmt.Errorf("invalid IP: %q", ip)
 	}
@@ -413,15 +454,19 @@ func (c *Container) Wait(ctx context.Context) error {
 
 // WaitTimeout waits for the container to exit with a timeout.
 func (c *Container) WaitTimeout(ctx context.Context, timeout time.Duration) error {
-	timeoutChan := time.After(timeout)
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
 	statusChan, errChan := c.client.ContainerWait(ctx, c.id, container.WaitConditionNotRunning)
 	select {
+	case <-ctx.Done():
+		if ctx.Err() == context.DeadlineExceeded {
+			return fmt.Errorf("container %s timed out after %v seconds", c.Name, timeout.Seconds())
+		}
+		return nil
 	case err := <-errChan:
 		return err
 	case <-statusChan:
 		return nil
-	case <-timeoutChan:
-		return fmt.Errorf("container %s timed out after %v seconds", c.Name, timeout.Seconds())
 	}
 }
 
@@ -446,6 +491,12 @@ func (c *Container) WaitForOutputSubmatch(ctx context.Context, pattern string, t
 	}
 
 	for exp := time.Now().Add(timeout); time.Now().Before(exp); {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		default:
+		}
+
 		c.streams.Conn.SetDeadline(time.Now().Add(50 * time.Millisecond))
 		_, err := stdcopy.StdCopy(&c.streamBuf, &c.streamBuf, c.streams.Reader)
 
@@ -482,6 +533,12 @@ func (c *Container) Remove(ctx context.Context) error {
 
 // CleanUp kills and deletes the container (best effort).
 func (c *Container) CleanUp(ctx context.Context) {
+	// Execute profile cleanups before the container goes down.
+	for _, profile := range c.profiles {
+		profile.OnCleanUp(c)
+	}
+	// Forget profiles.
+	c.profiles = nil
 	// Kill the container.
 	if err := c.Kill(ctx); err != nil && !strings.Contains(err.Error(), "is not running") {
 		// Just log; can't do anything here.

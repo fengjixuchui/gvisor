@@ -16,12 +16,11 @@ package network
 import (
 	"context"
 	"fmt"
-	"regexp"
-	"strconv"
 	"testing"
 
 	"gvisor.dev/gvisor/pkg/test/dockerutil"
 	"gvisor.dev/gvisor/test/benchmarks/harness"
+	"gvisor.dev/gvisor/test/benchmarks/tools"
 )
 
 // see Dockerfile '//images/benchmarks/httpd'.
@@ -52,13 +51,16 @@ func BenchmarkHttpdConcurrency(b *testing.B) {
 	defer serverMachine.CleanUp()
 
 	// The test iterates over client concurrency, so set other parameters.
-	requests := 1000
 	concurrency := []int{1, 5, 10, 25}
-	doc := docs["10Kb"]
 
 	for _, c := range concurrency {
-		b.Run(fmt.Sprintf("%dConcurrency", c), func(b *testing.B) {
-			runHttpd(b, clientMachine, serverMachine, doc, requests, c)
+		b.Run(fmt.Sprintf("%d", c), func(b *testing.B) {
+			hey := &tools.Hey{
+				Requests:    10000,
+				Concurrency: c,
+				Doc:         docs["10Kb"],
+			}
+			runHttpd(b, clientMachine, serverMachine, hey)
 		})
 	}
 }
@@ -78,18 +80,20 @@ func BenchmarkHttpdDocSize(b *testing.B) {
 	}
 	defer serverMachine.CleanUp()
 
-	requests := 1000
-	concurrency := 1
-
 	for name, filename := range docs {
 		b.Run(name, func(b *testing.B) {
-			runHttpd(b, clientMachine, serverMachine, filename, requests, concurrency)
+			hey := &tools.Hey{
+				Requests:    10000,
+				Concurrency: 1,
+				Doc:         filename,
+			}
+			runHttpd(b, clientMachine, serverMachine, hey)
 		})
 	}
 }
 
 // runHttpd runs a single test run.
-func runHttpd(b *testing.B, clientMachine, serverMachine harness.Machine, doc string, requests, concurrency int) {
+func runHttpd(b *testing.B, clientMachine, serverMachine harness.Machine, hey *tools.Hey) {
 	b.Helper()
 
 	// Grab a container from the server.
@@ -98,11 +102,11 @@ func runHttpd(b *testing.B, clientMachine, serverMachine harness.Machine, doc st
 	defer server.CleanUp(ctx)
 
 	// Copy the docs to /tmp and serve from there.
-	cmd := "mkdir -p /tmp/html; cp -r /local /tmp/html/.; apache2 -X"
+	cmd := "mkdir -p /tmp/html; cp -r /local/* /tmp/html/.; apache2 -X"
 	port := 80
 
 	// Start the server.
-	server.Spawn(ctx, dockerutil.RunOpts{
+	if err := server.Spawn(ctx, dockerutil.RunOpts{
 		Image: "benchmarks/httpd",
 		Ports: []int{port},
 		Env: []string{
@@ -113,7 +117,9 @@ func runHttpd(b *testing.B, clientMachine, serverMachine harness.Machine, doc st
 			"APACHE_LOG_DIR=/tmp",
 			"APACHE_PID_FILE=/tmp/apache.pid",
 		},
-	}, "sh", "-c", cmd)
+	}, "sh", "-c", cmd); err != nil {
+		b.Fatalf("failed to start server: %v")
+	}
 
 	ip, err := serverMachine.IPAddress()
 	if err != nil {
@@ -129,148 +135,21 @@ func runHttpd(b *testing.B, clientMachine, serverMachine harness.Machine, doc st
 	harness.WaitUntilServing(ctx, clientMachine, ip, servingPort)
 
 	// Grab a client.
-	client := clientMachine.GetContainer(ctx, b)
+	client := clientMachine.GetNativeContainer(ctx, b)
 	defer client.CleanUp(ctx)
 
-	path := fmt.Sprintf("http://%s:%d/%s", ip, servingPort, doc)
-	// See apachebench (ab) for flags.
-	cmd = fmt.Sprintf("ab -n %d -c %d %s", requests, concurrency, path)
-
 	b.ResetTimer()
+	server.RestartProfiles()
 	for i := 0; i < b.N; i++ {
 		out, err := client.Run(ctx, dockerutil.RunOpts{
-			Image: "benchmarks/ab",
-		}, "sh", "-c", cmd)
+			Image: "benchmarks/hey",
+		}, hey.MakeCmd(ip, servingPort)...)
 		if err != nil {
 			b.Fatalf("run failed with: %v", err)
 		}
 
 		b.StopTimer()
-
-		// Parse and report custom metrics.
-		transferRate, err := parseTransferRate(out)
-		if err != nil {
-			b.Logf("failed to parse transferrate: %v", err)
-		}
-		b.ReportMetric(transferRate*1024, "transfer_rate") // Convert from Kb/s to b/s.
-
-		latency, err := parseLatency(out)
-		if err != nil {
-			b.Logf("failed to parse latency: %v", err)
-		}
-		b.ReportMetric(latency/1000, "mean_latency") // Convert from ms to s.
-
-		reqPerSecond, err := parseRequestsPerSecond(out)
-		if err != nil {
-			b.Logf("failed to parse requests per second: %v", err)
-		}
-		b.ReportMetric(reqPerSecond, "requests_per_second")
-
+		hey.Report(b, out)
 		b.StartTimer()
-	}
-}
-
-var transferRateRE = regexp.MustCompile(`Transfer rate:\s+(\d+\.?\d+?)\s+\[Kbytes/sec\]\s+received`)
-
-// parseTransferRate parses transfer rate from apachebench output.
-func parseTransferRate(data string) (float64, error) {
-	match := transferRateRE.FindStringSubmatch(data)
-	if len(match) < 2 {
-		return 0, fmt.Errorf("failed get bandwidth: %s", data)
-	}
-	return strconv.ParseFloat(match[1], 64)
-}
-
-var latencyRE = regexp.MustCompile(`Total:\s+\d+\s+(\d+)\s+(\d+\.?\d+?)\s+\d+\s+\d+\s`)
-
-// parseLatency parses latency from apachebench output.
-func parseLatency(data string) (float64, error) {
-	match := latencyRE.FindStringSubmatch(data)
-	if len(match) < 2 {
-		return 0, fmt.Errorf("failed get bandwidth: %s", data)
-	}
-	return strconv.ParseFloat(match[1], 64)
-}
-
-var requestsPerSecondRE = regexp.MustCompile(`Requests per second:\s+(\d+\.?\d+?)\s+`)
-
-// parseRequestsPerSecond parses requests per second from apachebench output.
-func parseRequestsPerSecond(data string) (float64, error) {
-	match := requestsPerSecondRE.FindStringSubmatch(data)
-	if len(match) < 2 {
-		return 0, fmt.Errorf("failed get bandwidth: %s", data)
-	}
-	return strconv.ParseFloat(match[1], 64)
-}
-
-// Sample output from apachebench.
-const sampleData = `This is ApacheBench, Version 2.3 <$Revision: 1826891 $>
-Copyright 1996 Adam Twiss, Zeus Technology Ltd, http://www.zeustech.net/
-Licensed to The Apache Software Foundation, http://www.apache.org/
-
-Benchmarking 10.10.10.10 (be patient).....done
-
-
-Server Software:        Apache/2.4.38
-Server Hostname:        10.10.10.10
-Server Port:            80
-
-Document Path:          /latin10k.txt
-Document Length:        210 bytes
-
-Concurrency Level:      1
-Time taken for tests:   0.180 seconds
-Complete requests:      100
-Failed requests:        0
-Non-2xx responses:      100
-Total transferred:      38800 bytes
-HTML transferred:       21000 bytes
-Requests per second:    556.44 [#/sec] (mean)
-Time per request:       1.797 [ms] (mean)
-Time per request:       1.797 [ms] (mean, across all concurrent requests)
-Transfer rate:          210.84 [Kbytes/sec] received
-
-Connection Times (ms)
-              min  mean[+/-sd] median   max
-Connect:        0    0   0.2      0       2
-Processing:     1    2   1.0      1       8
-Waiting:        1    1   1.0      1       7
-Total:          1    2   1.2      1      10
-
-Percentage of the requests served within a certain time (ms)
-  50%      1
-  66%      2
-  75%      2
-  80%      2
-  90%      2
-  95%      3
-  98%      7
-  99%     10
- 100%     10 (longest request)`
-
-// TestParsers checks the parsers work.
-func TestParsers(t *testing.T) {
-	want := 210.84
-	got, err := parseTransferRate(sampleData)
-	if err != nil {
-		t.Fatalf("failed to parse transfer rate with error: %v", err)
-	} else if got != want {
-		t.Fatalf("parseTransferRate got: %f, want: %f", got, want)
-	}
-
-	want = 2.0
-	got, err = parseLatency(sampleData)
-	if err != nil {
-		t.Fatalf("failed to parse transfer rate with error: %v", err)
-	} else if got != want {
-		t.Fatalf("parseLatency got: %f, want: %f", got, want)
-	}
-
-	want = 556.44
-	got, err = parseRequestsPerSecond(sampleData)
-	if err != nil {
-		t.Fatalf("failed to parse transfer rate with error: %v", err)
-	} else if got != want {
-		t.Fatalf("parseRequestsPerSecond got: %f, want: %f", got, want)
 	}
 }

@@ -51,6 +51,11 @@ type filesystemOptions struct {
 
 	// rootMode specifies the the file mode of the filesystem's root.
 	rootMode linux.FileMode
+
+	// maxActiveRequests specifies the maximum number of active requests that can
+	// exist at any time. Any further requests will block when trying to
+	// Call the server.
+	maxActiveRequests uint64
 }
 
 // filesystem implements vfs.FilesystemImpl.
@@ -58,12 +63,12 @@ type filesystem struct {
 	kernfs.Filesystem
 	devMinor uint32
 
-	// fuseFD is the FD returned when opening /dev/fuse. It is used for communication
-	// between the FUSE server daemon and the sentry fusefs.
-	fuseFD *DeviceFD
+	// conn is used for communication between the FUSE server
+	// daemon and the sentry fusefs.
+	conn *connection
 
 	// opts is the options the fusefs is initialized with.
-	opts filesystemOptions
+	opts *filesystemOptions
 }
 
 // Name implements vfs.FilesystemType.Name.
@@ -100,7 +105,7 @@ func (fsType FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 	fuseFd := kernelTask.GetFileVFS2(int32(deviceDescriptor))
 
 	// Parse and set all the other supported FUSE mount options.
-	// TODO: Expand the supported mount options.
+	// TODO(gVisor.dev/issue/3229): Expand the supported mount options.
 	if userIDStr, ok := mopts["user_id"]; ok {
 		delete(mopts, "user_id")
 		userID, err := strconv.ParseUint(userIDStr, 10, 32)
@@ -134,32 +139,55 @@ func (fsType FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 	}
 	fsopts.rootMode = rootMode
 
+	// Set the maxInFlightRequests option.
+	fsopts.maxActiveRequests = maxActiveRequestsDefault
+
 	// Check for unparsed options.
 	if len(mopts) != 0 {
 		log.Warningf("%s.GetFilesystem: unknown options: %v", fsType.Name(), mopts)
 		return nil, nil, syserror.EINVAL
 	}
 
-	// Mark the device as ready so it can be used. /dev/fuse can only be used if the FD was used to
-	// mount a FUSE filesystem.
-	fuseFD := fuseFd.Impl().(*DeviceFD)
-	fuseFD.mounted = true
-
-	fs := &filesystem{
-		devMinor: devMinor,
-		fuseFD:   fuseFD,
-		opts:     fsopts,
+	// Create a new FUSE filesystem.
+	fs, err := NewFUSEFilesystem(ctx, devMinor, &fsopts, fuseFd)
+	if err != nil {
+		log.Warningf("%s.NewFUSEFilesystem: failed with error: %v", fsType.Name(), err)
+		return nil, nil, err
 	}
 
 	fs.VFSFilesystem().Init(vfsObj, &fsType, fs)
 
-	// TODO: dispatch a FUSE_INIT request to the FUSE daemon server before
-	//  returning. Mount will not block on this dispatched request.
+	// Send a FUSE_INIT request to the FUSE daemon server before returning.
+	// This call is not blocking.
+	if err := fs.conn.InitSend(creds, uint32(kernelTask.ThreadID())); err != nil {
+		log.Warningf("%s.InitSend: failed with error: %v", fsType.Name(), err)
+		return nil, nil, err
+	}
 
 	// root is the fusefs root directory.
 	root := fs.newInode(creds, fsopts.rootMode)
 
 	return fs.VFSFilesystem(), root.VFSDentry(), nil
+}
+
+// NewFUSEFilesystem creates a new FUSE filesystem.
+func NewFUSEFilesystem(ctx context.Context, devMinor uint32, opts *filesystemOptions, device *vfs.FileDescription) (*filesystem, error) {
+	fs := &filesystem{
+		devMinor: devMinor,
+		opts:     opts,
+	}
+
+	conn, err := newFUSEConnection(ctx, device, opts.maxActiveRequests)
+	if err != nil {
+		log.Warningf("fuse.NewFUSEFilesystem: NewFUSEConnection failed with error: %v", err)
+		return nil, syserror.EINVAL
+	}
+
+	fs.conn = conn
+	fuseFD := device.Impl().(*DeviceFD)
+	fuseFD.fs = fs
+
+	return fs, nil
 }
 
 // Release implements vfs.FilesystemImpl.Release.
@@ -168,8 +196,8 @@ func (fs *filesystem) Release() {
 	fs.Filesystem.Release()
 }
 
-// Inode implements kernfs.Inode.
-type Inode struct {
+// inode implements kernfs.Inode.
+type inode struct {
 	kernfs.InodeAttrs
 	kernfs.InodeNoDynamicLookup
 	kernfs.InodeNotSymlink
@@ -182,7 +210,7 @@ type Inode struct {
 }
 
 func (fs *filesystem) newInode(creds *auth.Credentials, mode linux.FileMode) *kernfs.Dentry {
-	i := &Inode{}
+	i := &inode{}
 	i.InodeAttrs.Init(creds, linux.UNNAMED_MAJOR, fs.devMinor, fs.NextIno(), linux.ModeDirectory|0755)
 	i.OrderedChildren.Init(kernfs.OrderedChildrenOptions{})
 	i.dentry.Init(i)
@@ -191,7 +219,7 @@ func (fs *filesystem) newInode(creds *auth.Credentials, mode linux.FileMode) *ke
 }
 
 // Open implements kernfs.Inode.Open.
-func (i *Inode) Open(ctx context.Context, rp *vfs.ResolvingPath, vfsd *vfs.Dentry, opts vfs.OpenOptions) (*vfs.FileDescription, error) {
+func (i *inode) Open(ctx context.Context, rp *vfs.ResolvingPath, vfsd *vfs.Dentry, opts vfs.OpenOptions) (*vfs.FileDescription, error) {
 	fd, err := kernfs.NewGenericDirectoryFD(rp.Mount(), vfsd, &i.OrderedChildren, &i.locks, &opts)
 	if err != nil {
 		return nil, err
