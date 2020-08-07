@@ -192,10 +192,14 @@ const (
 	//
 	// - File timestamps are based on client clocks. This ensures that users of
 	// the client observe timestamps that are coherent with their own clocks
-	// and consistent with Linux's semantics. However, since it is not always
-	// possible for clients to set arbitrary atimes and mtimes, and never
-	// possible for clients to set arbitrary ctimes, file timestamp changes are
-	// stored in the client only and never sent to the remote filesystem.
+	// and consistent with Linux's semantics (in particular, it is not always
+	// possible for clients to set arbitrary atimes and mtimes depending on the
+	// remote filesystem implementation, and never possible for clients to set
+	// arbitrary ctimes.) If a dentry containing a client-defined atime or
+	// mtime is evicted from cache, client timestamps will be sent to the
+	// remote filesystem on a best-effort basis to attempt to ensure that
+	// timestamps will be preserved when another dentry representing the same
+	// file is instantiated.
 	InteropModeExclusive InteropMode = iota
 
 	// InteropModeWritethrough is appropriate when there are read-only users of
@@ -482,7 +486,7 @@ func (fstype FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 	root, err := fs.newDentry(ctx, attachFile, qid, attrMask, &attr)
 	if err != nil {
 		attachFile.close(ctx)
-		fs.vfsfs.DecRef()
+		fs.vfsfs.DecRef(ctx)
 		return nil, nil, err
 	}
 	// Set the root's reference count to 2. One reference is returned to the
@@ -495,8 +499,7 @@ func (fstype FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 }
 
 // Release implements vfs.FilesystemImpl.Release.
-func (fs *filesystem) Release() {
-	ctx := context.Background()
+func (fs *filesystem) Release(ctx context.Context) {
 	mf := fs.mfp.MemoryFile()
 
 	fs.syncMu.Lock()
@@ -558,8 +561,6 @@ type dentry struct {
 	// filesystem root, name is the empty string. name is protected by
 	// filesystem.renameMu.
 	name string
-
-	// We don't support hard links, so each dentry maps 1:1 to an inode.
 
 	// file is the unopened p9.File that backs this dentry. file is immutable.
 	//
@@ -624,6 +625,12 @@ type dentry struct {
 	// File size, protected by both metadataMu and dataMu (i.e. both must be
 	// locked to mutate it; locking either is sufficient to access it).
 	size uint64
+	// If this dentry does not represent a synthetic file, deleted is 0, and
+	// atimeDirty/mtimeDirty are non-zero, atime/mtime may have diverged from the
+	// remote file's timestamps, which should be updated when this dentry is
+	// evicted.
+	atimeDirty uint32
+	mtimeDirty uint32
 
 	// nlink counts the number of hard links to this dentry. It's updated and
 	// accessed using atomic operations. It's not protected by metadataMu like the
@@ -804,10 +811,12 @@ func (d *dentry) updateFromP9AttrsLocked(mask p9.AttrMask, attr *p9.Attr) {
 	if attr.BlockSize != 0 {
 		atomic.StoreUint32(&d.blockSize, uint32(attr.BlockSize))
 	}
-	if mask.ATime {
+	// Don't override newer client-defined timestamps with old server-defined
+	// ones.
+	if mask.ATime && atomic.LoadUint32(&d.atimeDirty) == 0 {
 		atomic.StoreInt64(&d.atime, dentryTimestampFromP9(attr.ATimeSeconds, attr.ATimeNanoSeconds))
 	}
-	if mask.MTime {
+	if mask.MTime && atomic.LoadUint32(&d.mtimeDirty) == 0 {
 		atomic.StoreInt64(&d.mtime, dentryTimestampFromP9(attr.MTimeSeconds, attr.MTimeNanoSeconds))
 	}
 	if mask.CTime {
@@ -904,51 +913,44 @@ func (d *dentry) setStat(ctx context.Context, creds *auth.Credentials, opts *vfs
 		return err
 	}
 	defer mnt.EndWrite()
-	setLocalAtime := false
-	setLocalMtime := false
-	if d.cachedMetadataAuthoritative() {
-		// Timestamp updates will be handled locally.
-		setLocalAtime = stat.Mask&linux.STATX_ATIME != 0
-		setLocalMtime = stat.Mask&linux.STATX_MTIME != 0
-		stat.Mask &^= linux.STATX_ATIME | linux.STATX_MTIME
 
-		// Prepare for truncate.
-		if stat.Mask&linux.STATX_SIZE != 0 {
-			switch mode.FileType() {
-			case linux.ModeRegular:
-				if !setLocalMtime {
-					// Truncate updates mtime.
-					setLocalMtime = true
-					stat.Mtime.Nsec = linux.UTIME_NOW
-				}
-			case linux.ModeDirectory:
-				return syserror.EISDIR
-			default:
-				return syserror.EINVAL
-			}
+	if stat.Mask&linux.STATX_SIZE != 0 {
+		// Reject attempts to truncate files other than regular files, since
+		// filesystem implementations may return the wrong errno.
+		switch mode.FileType() {
+		case linux.S_IFREG:
+			// ok
+		case linux.S_IFDIR:
+			return syserror.EISDIR
+		default:
+			return syserror.EINVAL
 		}
 	}
+
+	var now int64
+	if d.cachedMetadataAuthoritative() {
+		// Truncate updates mtime.
+		if stat.Mask&(linux.STATX_SIZE|linux.STATX_MTIME) == linux.STATX_SIZE {
+			stat.Mask |= linux.STATX_MTIME
+			stat.Mtime = linux.StatxTimestamp{
+				Nsec: linux.UTIME_NOW,
+			}
+		}
+
+		// Use client clocks for timestamps.
+		now = d.fs.clock.Now().Nanoseconds()
+		if stat.Mask&linux.STATX_ATIME != 0 && stat.Atime.Nsec == linux.UTIME_NOW {
+			stat.Atime = statxTimestampFromDentry(now)
+		}
+		if stat.Mask&linux.STATX_MTIME != 0 && stat.Mtime.Nsec == linux.UTIME_NOW {
+			stat.Mtime = statxTimestampFromDentry(now)
+		}
+	}
+
 	d.metadataMu.Lock()
 	defer d.metadataMu.Unlock()
-	if stat.Mask&linux.STATX_SIZE != 0 {
-		// The size needs to be changed even when
-		// !d.cachedMetadataAuthoritative() because d.mappings has to be
-		// updated.
-		d.updateFileSizeLocked(stat.Size)
-	}
 	if !d.isSynthetic() {
 		if stat.Mask != 0 {
-			if stat.Mask&linux.STATX_SIZE != 0 {
-				// Check whether to allow a truncate request to be made.
-				switch d.mode & linux.S_IFMT {
-				case linux.S_IFREG:
-					// Allow.
-				case linux.S_IFDIR:
-					return syserror.EISDIR
-				default:
-					return syserror.EINVAL
-				}
-			}
 			if err := d.file.setAttr(ctx, p9.SetAttrMask{
 				Permissions:        stat.Mask&linux.STATX_MODE != 0,
 				UID:                stat.Mask&linux.STATX_UID != 0,
@@ -970,6 +972,11 @@ func (d *dentry) setStat(ctx context.Context, creds *auth.Credentials, opts *vfs
 			}); err != nil {
 				return err
 			}
+			if stat.Mask&linux.STATX_SIZE != 0 {
+				// Privatized copy-on-write mappings of truncated pages need to
+				// be invalidated even if InteropModeShared is in effect.
+				d.updateFileSizeLocked(stat.Size)
+			}
 		}
 		if d.fs.opts.interop == InteropModeShared {
 			// There's no point to updating d's metadata in this case since
@@ -979,7 +986,6 @@ func (d *dentry) setStat(ctx context.Context, creds *auth.Credentials, opts *vfs
 			return nil
 		}
 	}
-	now := d.fs.clock.Now().Nanoseconds()
 	if stat.Mask&linux.STATX_MODE != 0 {
 		atomic.StoreUint32(&d.mode, d.fileType()|uint32(stat.Mode))
 	}
@@ -989,23 +995,18 @@ func (d *dentry) setStat(ctx context.Context, creds *auth.Credentials, opts *vfs
 	if stat.Mask&linux.STATX_GID != 0 {
 		atomic.StoreUint32(&d.gid, stat.GID)
 	}
-	if setLocalAtime {
-		if stat.Atime.Nsec == linux.UTIME_NOW {
-			atomic.StoreInt64(&d.atime, now)
-		} else {
-			atomic.StoreInt64(&d.atime, dentryTimestampFromStatx(stat.Atime))
-		}
-		// Restore mask bits that we cleared earlier.
-		stat.Mask |= linux.STATX_ATIME
+	// Note that stat.Atime.Nsec and stat.Mtime.Nsec can't be UTIME_NOW because
+	// if d.cachedMetadataAuthoritative() then we converted stat.Atime and
+	// stat.Mtime to client-local timestamps above, and if
+	// !d.cachedMetadataAuthoritative() then we returned after calling
+	// d.file.setAttr(). For the same reason, now must have been initialized.
+	if stat.Mask&linux.STATX_ATIME != 0 {
+		atomic.StoreInt64(&d.atime, dentryTimestampFromStatx(stat.Atime))
+		atomic.StoreUint32(&d.atimeDirty, 0)
 	}
-	if setLocalMtime {
-		if stat.Mtime.Nsec == linux.UTIME_NOW {
-			atomic.StoreInt64(&d.mtime, now)
-		} else {
-			atomic.StoreInt64(&d.mtime, dentryTimestampFromStatx(stat.Mtime))
-		}
-		// Restore mask bits that we cleared earlier.
-		stat.Mask |= linux.STATX_MTIME
+	if stat.Mask&linux.STATX_MTIME != 0 {
+		atomic.StoreInt64(&d.mtime, dentryTimestampFromStatx(stat.Mtime))
+		atomic.StoreUint32(&d.mtimeDirty, 0)
 	}
 	atomic.StoreInt64(&d.ctime, now)
 	return nil
@@ -1089,10 +1090,10 @@ func (d *dentry) TryIncRef() bool {
 }
 
 // DecRef implements vfs.DentryImpl.DecRef.
-func (d *dentry) DecRef() {
+func (d *dentry) DecRef(ctx context.Context) {
 	if refs := atomic.AddInt64(&d.refs, -1); refs == 0 {
 		d.fs.renameMu.Lock()
-		d.checkCachingLocked()
+		d.checkCachingLocked(ctx)
 		d.fs.renameMu.Unlock()
 	} else if refs < 0 {
 		panic("gofer.dentry.DecRef() called without holding a reference")
@@ -1109,7 +1110,7 @@ func (d *dentry) decRefLocked() {
 }
 
 // InotifyWithParent implements vfs.DentryImpl.InotifyWithParent.
-func (d *dentry) InotifyWithParent(events, cookie uint32, et vfs.EventType) {
+func (d *dentry) InotifyWithParent(ctx context.Context, events, cookie uint32, et vfs.EventType) {
 	if d.isDir() {
 		events |= linux.IN_ISDIR
 	}
@@ -1117,9 +1118,9 @@ func (d *dentry) InotifyWithParent(events, cookie uint32, et vfs.EventType) {
 	d.fs.renameMu.RLock()
 	// The ordering below is important, Linux always notifies the parent first.
 	if d.parent != nil {
-		d.parent.watches.Notify(d.name, events, cookie, et, d.isDeleted())
+		d.parent.watches.Notify(ctx, d.name, events, cookie, et, d.isDeleted())
 	}
-	d.watches.Notify("", events, cookie, et, d.isDeleted())
+	d.watches.Notify(ctx, "", events, cookie, et, d.isDeleted())
 	d.fs.renameMu.RUnlock()
 }
 
@@ -1131,10 +1132,10 @@ func (d *dentry) Watches() *vfs.Watches {
 // OnZeroWatches implements vfs.DentryImpl.OnZeroWatches.
 //
 // If no watches are left on this dentry and it has no references, cache it.
-func (d *dentry) OnZeroWatches() {
+func (d *dentry) OnZeroWatches(ctx context.Context) {
 	if atomic.LoadInt64(&d.refs) == 0 {
 		d.fs.renameMu.Lock()
-		d.checkCachingLocked()
+		d.checkCachingLocked(ctx)
 		d.fs.renameMu.Unlock()
 	}
 }
@@ -1149,7 +1150,7 @@ func (d *dentry) OnZeroWatches() {
 // do nothing.
 //
 // Preconditions: d.fs.renameMu must be locked for writing.
-func (d *dentry) checkCachingLocked() {
+func (d *dentry) checkCachingLocked(ctx context.Context) {
 	// Dentries with a non-zero reference count must be retained. (The only way
 	// to obtain a reference on a dentry with zero references is via path
 	// resolution, which requires renameMu, so if d.refs is zero then it will
@@ -1171,14 +1172,14 @@ func (d *dentry) checkCachingLocked() {
 	// reachable by path resolution and should be dropped immediately.
 	if d.vfsd.IsDead() {
 		if d.isDeleted() {
-			d.watches.HandleDeletion()
+			d.watches.HandleDeletion(ctx)
 		}
 		if d.cached {
 			d.fs.cachedDentries.Remove(d)
 			d.fs.cachedDentriesLen--
 			d.cached = false
 		}
-		d.destroyLocked()
+		d.destroyLocked(ctx)
 		return
 	}
 	// If d still has inotify watches and it is not deleted or invalidated, we
@@ -1213,7 +1214,7 @@ func (d *dentry) checkCachingLocked() {
 				if !victim.vfsd.IsDead() {
 					// Note that victim can't be a mount point (in any mount
 					// namespace), since VFS holds references on mount points.
-					d.fs.vfsfs.VirtualFilesystem().InvalidateDentry(&victim.vfsd)
+					d.fs.vfsfs.VirtualFilesystem().InvalidateDentry(ctx, &victim.vfsd)
 					delete(victim.parent.children, victim.name)
 					// We're only deleting the dentry, not the file it
 					// represents, so we don't need to update
@@ -1221,7 +1222,7 @@ func (d *dentry) checkCachingLocked() {
 				}
 				victim.parent.dirMu.Unlock()
 			}
-			victim.destroyLocked()
+			victim.destroyLocked(ctx)
 		}
 		// Whether or not victim was destroyed, we brought fs.cachedDentriesLen
 		// back down to fs.opts.maxCachedDentries, so we don't loop.
@@ -1233,7 +1234,7 @@ func (d *dentry) checkCachingLocked() {
 //
 // Preconditions: d.fs.renameMu must be locked for writing. d.refs == 0. d is
 // not a child dentry.
-func (d *dentry) destroyLocked() {
+func (d *dentry) destroyLocked(ctx context.Context) {
 	switch atomic.LoadInt64(&d.refs) {
 	case 0:
 		// Mark the dentry destroyed.
@@ -1244,7 +1245,6 @@ func (d *dentry) destroyLocked() {
 		panic("dentry.destroyLocked() called with references on the dentry")
 	}
 
-	ctx := context.Background()
 	d.handleMu.Lock()
 	if !d.handle.file.isNil() {
 		mf := d.fs.mfp.MemoryFile()
@@ -1252,7 +1252,7 @@ func (d *dentry) destroyLocked() {
 		// Write dirty pages back to the remote filesystem.
 		if d.handleWritable {
 			if err := fsutil.SyncDirtyAll(ctx, &d.cache, &d.dirty, d.size, mf, d.handle.writeFromBlocksAt); err != nil {
-				log.Warningf("gofer.dentry.DecRef: failed to write dirty data back: %v", err)
+				log.Warningf("gofer.dentry.destroyLocked: failed to write dirty data back: %v", err)
 			}
 		}
 		// Discard cached data.
@@ -1265,6 +1265,28 @@ func (d *dentry) destroyLocked() {
 	d.handleMu.Unlock()
 
 	if !d.file.isNil() {
+		if !d.isDeleted() {
+			// Write dirty timestamps back to the remote filesystem.
+			atimeDirty := atomic.LoadUint32(&d.atimeDirty) != 0
+			mtimeDirty := atomic.LoadUint32(&d.mtimeDirty) != 0
+			if atimeDirty || mtimeDirty {
+				atime := atomic.LoadInt64(&d.atime)
+				mtime := atomic.LoadInt64(&d.mtime)
+				if err := d.file.setAttr(ctx, p9.SetAttrMask{
+					ATime:              atimeDirty,
+					ATimeNotSystemTime: atimeDirty,
+					MTime:              mtimeDirty,
+					MTimeNotSystemTime: mtimeDirty,
+				}, p9.SetAttr{
+					ATimeSeconds:     uint64(atime / 1e9),
+					ATimeNanoSeconds: uint64(atime % 1e9),
+					MTimeSeconds:     uint64(mtime / 1e9),
+					MTimeNanoSeconds: uint64(mtime % 1e9),
+				}); err != nil {
+					log.Warningf("gofer.dentry.destroyLocked: failed to write dirty timestamps back: %v", err)
+				}
+			}
+		}
 		d.file.close(ctx)
 		d.file = p9file{}
 		// Remove d from the set of syncable dentries.
@@ -1276,7 +1298,7 @@ func (d *dentry) destroyLocked() {
 	// d.fs.renameMu.
 	if d.parent != nil {
 		if refs := atomic.AddInt64(&d.parent.refs, -1); refs == 0 {
-			d.parent.checkCachingLocked()
+			d.parent.checkCachingLocked(ctx)
 		} else if refs < 0 {
 			panic("gofer.dentry.DecRef() called without holding a reference")
 		}
@@ -1514,7 +1536,7 @@ func (fd *fileDescription) SetStat(ctx context.Context, opts vfs.SetStatOptions)
 		return err
 	}
 	if ev := vfs.InotifyEventFromStatMask(opts.Stat.Mask); ev != 0 {
-		fd.dentry().InotifyWithParent(ev, 0, vfs.InodeEvent)
+		fd.dentry().InotifyWithParent(ctx, ev, 0, vfs.InodeEvent)
 	}
 	return nil
 }
@@ -1535,7 +1557,7 @@ func (fd *fileDescription) Setxattr(ctx context.Context, opts vfs.SetxattrOption
 	if err := d.setxattr(ctx, auth.CredentialsFromContext(ctx), &opts); err != nil {
 		return err
 	}
-	d.InotifyWithParent(linux.IN_ATTRIB, 0, vfs.InodeEvent)
+	d.InotifyWithParent(ctx, linux.IN_ATTRIB, 0, vfs.InodeEvent)
 	return nil
 }
 
@@ -1545,7 +1567,7 @@ func (fd *fileDescription) Removexattr(ctx context.Context, name string) error {
 	if err := d.removexattr(ctx, auth.CredentialsFromContext(ctx), name); err != nil {
 		return err
 	}
-	d.InotifyWithParent(linux.IN_ATTRIB, 0, vfs.InodeEvent)
+	d.InotifyWithParent(ctx, linux.IN_ATTRIB, 0, vfs.InodeEvent)
 	return nil
 }
 
