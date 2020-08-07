@@ -37,6 +37,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/proc"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/sys"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/tmpfs"
+	"gvisor.dev/gvisor/pkg/sentry/inet"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
@@ -89,6 +90,12 @@ func registerFilesystems(k *kernel.Kernel) error {
 	if err := ttydev.Register(vfsObj); err != nil {
 		return fmt.Errorf("registering ttydev: %w", err)
 	}
+	tunSupported := tundev.IsNetTunSupported(inet.StackFromContext(ctx))
+	if tunSupported {
+		if err := tundev.Register(vfsObj); err != nil {
+			return fmt.Errorf("registering tundev: %v", err)
+		}
+	}
 
 	if kernel.FUSEEnabled {
 		if err := fuse.Register(vfsObj); err != nil {
@@ -96,14 +103,11 @@ func registerFilesystems(k *kernel.Kernel) error {
 		}
 	}
 
-	if err := tundev.Register(vfsObj); err != nil {
-		return fmt.Errorf("registering tundev: %v", err)
-	}
 	a, err := devtmpfs.NewAccessor(ctx, vfsObj, creds, devtmpfs.Name)
 	if err != nil {
 		return fmt.Errorf("creating devtmpfs accessor: %w", err)
 	}
-	defer a.Release()
+	defer a.Release(ctx)
 
 	if err := a.UserspaceInit(ctx); err != nil {
 		return fmt.Errorf("initializing userspace: %w", err)
@@ -114,8 +118,10 @@ func registerFilesystems(k *kernel.Kernel) error {
 	if err := ttydev.CreateDevtmpfsFiles(ctx, a); err != nil {
 		return fmt.Errorf("creating ttydev devtmpfs files: %w", err)
 	}
-	if err := tundev.CreateDevtmpfsFiles(ctx, a); err != nil {
-		return fmt.Errorf("creating tundev devtmpfs files: %v", err)
+	if tunSupported {
+		if err := tundev.CreateDevtmpfsFiles(ctx, a); err != nil {
+			return fmt.Errorf("creating tundev devtmpfs files: %v", err)
+		}
 	}
 
 	if kernel.FUSEEnabled {
@@ -252,7 +258,7 @@ func (c *containerMounter) prepareMountsVFS2() ([]mountAndFD, error) {
 
 func (c *containerMounter) mountSubmountVFS2(ctx context.Context, conf *Config, mns *vfs.MountNamespace, creds *auth.Credentials, submount *mountAndFD) error {
 	root := mns.Root()
-	defer root.DecRef()
+	defer root.DecRef(ctx)
 	target := &vfs.PathOperation{
 		Root:  root,
 		Start: root,
@@ -387,7 +393,7 @@ func (c *containerMounter) mountTmpVFS2(ctx context.Context, conf *Config, creds
 	}
 
 	root := mns.Root()
-	defer root.DecRef()
+	defer root.DecRef(ctx)
 	pop := vfs.PathOperation{
 		Root:  root,
 		Start: root,
@@ -481,10 +487,10 @@ func (c *containerMounter) mountSharedSubmountVFS2(ctx context.Context, conf *Co
 	if err != nil {
 		return err
 	}
-	defer newMnt.DecRef()
+	defer newMnt.DecRef(ctx)
 
 	root := mns.Root()
-	defer root.DecRef()
+	defer root.DecRef(ctx)
 	if err := c.makeSyntheticMount(ctx, mount.Destination, root, creds); err != nil {
 		return err
 	}

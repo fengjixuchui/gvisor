@@ -12,9 +12,7 @@ go_library(
 go_test(
     name = "database_test",
     size = "enormous",
-    srcs = [
-        "redis_test.go",
-    ],
+    srcs = ["redis_test.go"],
     library = ":database",
     tags = [
         # Requires docker and runsc to be configured before test runs.
