@@ -65,9 +65,9 @@ func testReceiveICMP(t *testing.T, s *stack.Stack, e *channel.Endpoint, src, dst
 		DstAddr:       dst,
 	})
 
-	e.InjectInbound(ProtocolNumber, &stack.PacketBuffer{
+	e.InjectInbound(ProtocolNumber, stack.NewPacketBuffer(stack.PacketBufferOptions{
 		Data: hdr.View().ToVectorisedView(),
-	})
+	}))
 
 	stats := s.Stats().ICMP.V6PacketsReceived
 
@@ -123,9 +123,9 @@ func testReceiveUDP(t *testing.T, s *stack.Stack, e *channel.Endpoint, src, dst 
 		DstAddr:       dst,
 	})
 
-	e.InjectInbound(ProtocolNumber, &stack.PacketBuffer{
+	e.InjectInbound(ProtocolNumber, stack.NewPacketBuffer(stack.PacketBufferOptions{
 		Data: hdr.View().ToVectorisedView(),
-	})
+	}))
 
 	stat := s.Stats().UDP.PacketsReceived
 
@@ -637,9 +637,9 @@ func TestReceiveIPv6ExtHdrs(t *testing.T) {
 				DstAddr:       addr2,
 			})
 
-			e.InjectInbound(ProtocolNumber, &stack.PacketBuffer{
+			e.InjectInbound(ProtocolNumber, stack.NewPacketBuffer(stack.PacketBufferOptions{
 				Data: hdr.View().ToVectorisedView(),
-			})
+			}))
 
 			stats := s.Stats().UDP.PacketsReceived
 
@@ -819,6 +819,84 @@ func TestReceiveIPv6Fragments(t *testing.T) {
 							//
 							// Fragment offset = 8, More = false, ID = 1
 							buffer.View([]byte{uint8(header.UDPProtocolNumber), 0, 0, 64, 0, 0, 0, 1}),
+
+							ipv6Payload1Addr1ToAddr2[64:],
+						},
+					),
+				},
+			},
+			expectedPayloads: [][]byte{udpPayload1Addr1ToAddr2},
+		},
+		{
+			name: "Two fragments out of order",
+			fragments: []fragmentData{
+				{
+					srcAddr: addr1,
+					dstAddr: addr2,
+					nextHdr: fragmentExtHdrID,
+					data: buffer.NewVectorisedView(
+						fragmentExtHdrLen+len(ipv6Payload1Addr1ToAddr2)-64,
+						[]buffer.View{
+							// Fragment extension header.
+							//
+							// Fragment offset = 8, More = false, ID = 1
+							buffer.View([]byte{uint8(header.UDPProtocolNumber), 0, 0, 64, 0, 0, 0, 1}),
+
+							ipv6Payload1Addr1ToAddr2[64:],
+						},
+					),
+				},
+				{
+					srcAddr: addr1,
+					dstAddr: addr2,
+					nextHdr: fragmentExtHdrID,
+					data: buffer.NewVectorisedView(
+						fragmentExtHdrLen+64,
+						[]buffer.View{
+							// Fragment extension header.
+							//
+							// Fragment offset = 0, More = true, ID = 1
+							buffer.View([]byte{uint8(header.UDPProtocolNumber), 0, 0, 1, 0, 0, 0, 1}),
+
+							ipv6Payload1Addr1ToAddr2[:64],
+						},
+					),
+				},
+			},
+			expectedPayloads: [][]byte{udpPayload1Addr1ToAddr2},
+		},
+		{
+			name: "Two fragments with different Next Header values",
+			fragments: []fragmentData{
+				{
+					srcAddr: addr1,
+					dstAddr: addr2,
+					nextHdr: fragmentExtHdrID,
+					data: buffer.NewVectorisedView(
+						fragmentExtHdrLen+64,
+						[]buffer.View{
+							// Fragment extension header.
+							//
+							// Fragment offset = 0, More = true, ID = 1
+							buffer.View([]byte{uint8(header.UDPProtocolNumber), 0, 0, 1, 0, 0, 0, 1}),
+
+							ipv6Payload1Addr1ToAddr2[:64],
+						},
+					),
+				},
+				{
+					srcAddr: addr1,
+					dstAddr: addr2,
+					nextHdr: fragmentExtHdrID,
+					data: buffer.NewVectorisedView(
+						fragmentExtHdrLen+len(ipv6Payload1Addr1ToAddr2)-64,
+						[]buffer.View{
+							// Fragment extension header.
+							//
+							// Fragment offset = 8, More = false, ID = 1
+							// NextHeader value is different than the one in the first fragment, so
+							// this NextHeader should be ignored.
+							buffer.View([]byte{uint8(header.IPv6NoNextHeaderIdentifier), 0, 0, 64, 0, 0, 0, 1}),
 
 							ipv6Payload1Addr1ToAddr2[64:],
 						},
@@ -1469,9 +1547,9 @@ func TestReceiveIPv6Fragments(t *testing.T) {
 				vv := hdr.View().ToVectorisedView()
 				vv.Append(f.data)
 
-				e.InjectInbound(ProtocolNumber, &stack.PacketBuffer{
+				e.InjectInbound(ProtocolNumber, stack.NewPacketBuffer(stack.PacketBufferOptions{
 					Data: vv,
-				})
+				}))
 			}
 
 			if got, want := s.Stats().UDP.PacketsReceived.Value(), uint64(len(test.expectedPayloads)); got != want {

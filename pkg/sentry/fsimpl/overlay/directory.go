@@ -29,7 +29,9 @@ func (d *dentry) isDir() bool {
 	return atomic.LoadUint32(&d.mode)&linux.S_IFMT == linux.S_IFDIR
 }
 
-// Preconditions: d.dirMu must be locked. d.isDir().
+// Preconditions:
+// * d.dirMu must be locked.
+// * d.isDir().
 func (d *dentry) collectWhiteoutsForRmdirLocked(ctx context.Context) (map[string]bool, error) {
 	vfsObj := d.fs.vfsfs.VirtualFilesystem()
 	var readdirErr error
@@ -51,7 +53,7 @@ func (d *dentry) collectWhiteoutsForRmdirLocked(ctx context.Context) (map[string
 		// Reuse slice allocated for maybeWhiteouts from a previous layer to
 		// reduce allocations.
 		maybeWhiteouts = maybeWhiteouts[:0]
-		if err := layerFD.IterDirents(ctx, vfs.IterDirentsCallbackFunc(func(dirent vfs.Dirent) error {
+		err = layerFD.IterDirents(ctx, vfs.IterDirentsCallbackFunc(func(dirent vfs.Dirent) error {
 			if dirent.Name == "." || dirent.Name == ".." {
 				return nil
 			}
@@ -68,7 +70,8 @@ func (d *dentry) collectWhiteoutsForRmdirLocked(ctx context.Context) (map[string
 			}
 			// Non-whiteout file in the directory prevents rmdir.
 			return syserror.ENOTEMPTY
-		})); err != nil {
+		}))
+		if err != nil {
 			readdirErr = err
 			return false
 		}
@@ -182,7 +185,7 @@ func (d *dentry) getDirents(ctx context.Context) ([]vfs.Dirent, error) {
 		// Reuse slice allocated for maybeWhiteouts from a previous layer to
 		// reduce allocations.
 		maybeWhiteouts = maybeWhiteouts[:0]
-		if err := layerFD.IterDirents(ctx, vfs.IterDirentsCallbackFunc(func(dirent vfs.Dirent) error {
+		err = layerFD.IterDirents(ctx, vfs.IterDirentsCallbackFunc(func(dirent vfs.Dirent) error {
 			if dirent.Name == "." || dirent.Name == ".." {
 				return nil
 			}
@@ -201,7 +204,8 @@ func (d *dentry) getDirents(ctx context.Context) ([]vfs.Dirent, error) {
 			dirent.NextOff = int64(len(dirents) + 1)
 			dirents = append(dirents, dirent)
 			return nil
-		})); err != nil {
+		}))
+		if err != nil {
 			readdirErr = err
 			return false
 		}

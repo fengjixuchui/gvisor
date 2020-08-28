@@ -62,7 +62,8 @@ def _syscall_test(
         overlay = False,
         add_uds_tree = False,
         vfs2 = False,
-        fuse = False):
+        fuse = False,
+        debug = True):
     # Prepend "runsc" to non-native platform names.
     full_platform = platform if platform == "native" else "runsc_" + platform
 
@@ -111,6 +112,8 @@ def _syscall_test(
         "--add-uds-tree=" + str(add_uds_tree),
         "--vfs2=" + str(vfs2),
         "--fuse=" + str(fuse),
+        "--strace=" + str(debug),
+        "--debug=" + str(debug),
     ]
 
     # Call the rule above.
@@ -132,8 +135,9 @@ def syscall_test(
         add_overlay = False,
         add_uds_tree = False,
         add_hostinet = False,
-        vfs2 = False,
+        vfs2 = True,
         fuse = False,
+        debug = True,
         tags = None):
     """syscall_test is a macro that will create targets for all platforms.
 
@@ -149,6 +153,34 @@ def syscall_test(
     """
     if not tags:
         tags = []
+
+    vfs2_tags = list(tags)
+    if vfs2:
+        # Add tag to easily run VFS2 tests with --test_tag_filters=vfs2
+        vfs2_tags.append("vfs2")
+        if fuse:
+            vfs2_tags.append("fuse")
+
+    else:
+        # Don't automatically run tests tests not yet passing.
+        vfs2_tags.append("manual")
+        vfs2_tags.append("noguitar")
+        vfs2_tags.append("notap")
+
+    _syscall_test(
+        test = test,
+        shard_count = shard_count,
+        size = size,
+        platform = default_platform,
+        use_tmpfs = use_tmpfs,
+        add_uds_tree = add_uds_tree,
+        tags = platforms[default_platform] + vfs2_tags,
+        vfs2 = True,
+        fuse = fuse,
+    )
+    if fuse:
+        # Only generate *_vfs2_fuse target if fuse parameter is enabled.
+        return
 
     _syscall_test(
         test = test,
@@ -169,41 +201,6 @@ def syscall_test(
             use_tmpfs = use_tmpfs,
             add_uds_tree = add_uds_tree,
             tags = platform_tags + tags,
-        )
-
-    vfs2_tags = list(tags)
-    if vfs2:
-        # Add tag to easily run VFS2 tests with --test_tag_filters=vfs2
-        vfs2_tags.append("vfs2")
-
-    else:
-        # Don't automatically run tests tests not yet passing.
-        vfs2_tags.append("manual")
-        vfs2_tags.append("noguitar")
-        vfs2_tags.append("notap")
-
-    _syscall_test(
-        test = test,
-        shard_count = shard_count,
-        size = size,
-        platform = default_platform,
-        use_tmpfs = use_tmpfs,
-        add_uds_tree = add_uds_tree,
-        tags = platforms[default_platform] + vfs2_tags,
-        vfs2 = True,
-    )
-
-    if vfs2 and fuse:
-        _syscall_test(
-            test = test,
-            shard_count = shard_count,
-            size = size,
-            platform = default_platform,
-            use_tmpfs = use_tmpfs,
-            add_uds_tree = add_uds_tree,
-            tags = platforms[default_platform] + vfs2_tags + ["fuse"],
-            vfs2 = True,
-            fuse = True,
         )
 
     # TODO(gvisor.dev/issue/1487): Enable VFS2 overlay tests.

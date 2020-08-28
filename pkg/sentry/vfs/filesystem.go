@@ -15,8 +15,6 @@
 package vfs
 
 import (
-	"sync/atomic"
-
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/fspath"
@@ -34,9 +32,7 @@ import (
 //
 // +stateify savable
 type Filesystem struct {
-	// refs is the reference count. refs is accessed using atomic memory
-	// operations.
-	refs int64
+	FilesystemRefs
 
 	// vfs is the VirtualFilesystem that uses this Filesystem. vfs is
 	// immutable.
@@ -52,7 +48,7 @@ type Filesystem struct {
 
 // Init must be called before first use of fs.
 func (fs *Filesystem) Init(vfsObj *VirtualFilesystem, fsType FilesystemType, impl FilesystemImpl) {
-	fs.refs = 1
+	fs.EnableLeakCheck()
 	fs.vfs = vfsObj
 	fs.fsType = fsType
 	fs.impl = impl
@@ -76,39 +72,14 @@ func (fs *Filesystem) Impl() FilesystemImpl {
 	return fs.impl
 }
 
-// IncRef increments fs' reference count.
-func (fs *Filesystem) IncRef() {
-	if atomic.AddInt64(&fs.refs, 1) <= 1 {
-		panic("Filesystem.IncRef() called without holding a reference")
-	}
-}
-
-// TryIncRef increments fs' reference count and returns true. If fs' reference
-// count is zero, TryIncRef does nothing and returns false.
-//
-// TryIncRef does not require that a reference is held on fs.
-func (fs *Filesystem) TryIncRef() bool {
-	for {
-		refs := atomic.LoadInt64(&fs.refs)
-		if refs <= 0 {
-			return false
-		}
-		if atomic.CompareAndSwapInt64(&fs.refs, refs, refs+1) {
-			return true
-		}
-	}
-}
-
 // DecRef decrements fs' reference count.
 func (fs *Filesystem) DecRef(ctx context.Context) {
-	if refs := atomic.AddInt64(&fs.refs, -1); refs == 0 {
+	fs.FilesystemRefs.DecRef(func() {
 		fs.vfs.filesystemsMu.Lock()
 		delete(fs.vfs.filesystems, fs)
 		fs.vfs.filesystemsMu.Unlock()
 		fs.impl.Release(ctx)
-	} else if refs < 0 {
-		panic("Filesystem.decRef() called without holding a reference")
-	}
+	})
 }
 
 // FilesystemImpl contains implementation details for a Filesystem.
@@ -212,8 +183,9 @@ type FilesystemImpl interface {
 	// ENOENT. Equivalently, if vd represents a file with a link count of 0 not
 	// created by open(O_TMPFILE) without O_EXCL, LinkAt returns ENOENT.
 	//
-	// Preconditions: !rp.Done(). For the final path component in rp,
-	// !rp.ShouldFollowSymlink().
+	// Preconditions:
+	// * !rp.Done().
+	// * For the final path component in rp, !rp.ShouldFollowSymlink().
 	//
 	// Postconditions: If LinkAt returns an error returned by
 	// ResolvingPath.Resolve*(), then !rp.Done().
@@ -231,8 +203,9 @@ type FilesystemImpl interface {
 	// - If the directory in which the new directory would be created has been
 	// removed by RmdirAt or RenameAt, MkdirAt returns ENOENT.
 	//
-	// Preconditions: !rp.Done(). For the final path component in rp,
-	// !rp.ShouldFollowSymlink().
+	// Preconditions:
+	// * !rp.Done().
+	// * For the final path component in rp, !rp.ShouldFollowSymlink().
 	//
 	// Postconditions: If MkdirAt returns an error returned by
 	// ResolvingPath.Resolve*(), then !rp.Done().
@@ -253,8 +226,9 @@ type FilesystemImpl interface {
 	// - If the directory in which the file would be created has been removed
 	// by RmdirAt or RenameAt, MknodAt returns ENOENT.
 	//
-	// Preconditions: !rp.Done(). For the final path component in rp,
-	// !rp.ShouldFollowSymlink().
+	// Preconditions:
+	// * !rp.Done().
+	// * For the final path component in rp, !rp.ShouldFollowSymlink().
 	//
 	// Postconditions: If MknodAt returns an error returned by
 	// ResolvingPath.Resolve*(), then !rp.Done().
@@ -345,11 +319,12 @@ type FilesystemImpl interface {
 	// - If renaming would replace a non-empty directory, RenameAt returns
 	// ENOTEMPTY.
 	//
-	// Preconditions: !rp.Done(). For the final path component in rp,
-	// !rp.ShouldFollowSymlink(). oldParentVD.Dentry() was obtained from a
-	// previous call to
-	// oldParentVD.Mount().Filesystem().Impl().GetParentDentryAt(). oldName is
-	// not "." or "..".
+	// Preconditions:
+	// * !rp.Done().
+	// * For the final path component in rp, !rp.ShouldFollowSymlink().
+	// * oldParentVD.Dentry() was obtained from a previous call to
+	//   oldParentVD.Mount().Filesystem().Impl().GetParentDentryAt().
+	// * oldName is not "." or "..".
 	//
 	// Postconditions: If RenameAt returns an error returned by
 	// ResolvingPath.Resolve*(), then !rp.Done().
@@ -372,8 +347,9 @@ type FilesystemImpl interface {
 	// - If the file at rp exists but is not a directory, RmdirAt returns
 	// ENOTDIR.
 	//
-	// Preconditions: !rp.Done(). For the final path component in rp,
-	// !rp.ShouldFollowSymlink().
+	// Preconditions:
+	// * !rp.Done().
+	// * For the final path component in rp, !rp.ShouldFollowSymlink().
 	//
 	// Postconditions: If RmdirAt returns an error returned by
 	// ResolvingPath.Resolve*(), then !rp.Done().
@@ -410,8 +386,9 @@ type FilesystemImpl interface {
 	// - If the directory in which the symbolic link would be created has been
 	// removed by RmdirAt or RenameAt, SymlinkAt returns ENOENT.
 	//
-	// Preconditions: !rp.Done(). For the final path component in rp,
-	// !rp.ShouldFollowSymlink().
+	// Preconditions:
+	// * !rp.Done().
+	// * For the final path component in rp, !rp.ShouldFollowSymlink().
 	//
 	// Postconditions: If SymlinkAt returns an error returned by
 	// ResolvingPath.Resolve*(), then !rp.Done().
@@ -431,8 +408,9 @@ type FilesystemImpl interface {
 	//
 	// - If the file at rp exists but is a directory, UnlinkAt returns EISDIR.
 	//
-	// Preconditions: !rp.Done(). For the final path component in rp,
-	// !rp.ShouldFollowSymlink().
+	// Preconditions:
+	// * !rp.Done().
+	// * For the final path component in rp, !rp.ShouldFollowSymlink().
 	//
 	// Postconditions: If UnlinkAt returns an error returned by
 	// ResolvingPath.Resolve*(), then !rp.Done().

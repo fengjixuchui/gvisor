@@ -20,7 +20,6 @@ import (
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/context"
-	"gvisor.dev/gvisor/pkg/refs"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
 	"gvisor.dev/gvisor/pkg/sync"
@@ -46,10 +45,6 @@ func (InodeNoopRefCount) DecRef(context.Context) {
 // TryIncRef implements Inode.TryIncRef.
 func (InodeNoopRefCount) TryIncRef() bool {
 	return true
-}
-
-// Destroy implements Inode.Destroy.
-func (InodeNoopRefCount) Destroy(context.Context) {
 }
 
 // InodeDirectoryNoNewChildren partially implements the Inode interface.
@@ -348,8 +343,6 @@ type OrderedChildrenOptions struct {
 //
 // Must be initialize with Init before first use.
 type OrderedChildren struct {
-	refs.AtomicRefCount
-
 	// Can children be modified by user syscalls? It set to false, interface
 	// methods that would modify the children return EPERM. Immutable.
 	writable bool
@@ -365,13 +358,10 @@ func (o *OrderedChildren) Init(opts OrderedChildrenOptions) {
 	o.set = make(map[string]*slot)
 }
 
-// DecRef implements Inode.DecRef.
-func (o *OrderedChildren) DecRef(ctx context.Context) {
-	o.AtomicRefCount.DecRefWithDestructor(ctx, o.Destroy)
-}
-
-// Destroy cleans up resources referenced by this OrderedChildren.
-func (o *OrderedChildren) Destroy(context.Context) {
+// Destroy clears the children stored in o. It should be called by structs
+// embedding OrderedChildren upon destruction, i.e. when their reference count
+// reaches zero.
+func (o *OrderedChildren) Destroy() {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	o.order.Reset()
@@ -556,21 +546,23 @@ func (InodeSymlink) Open(ctx context.Context, rp *vfs.ResolvingPath, vfsd *vfs.D
 //
 // +stateify savable
 type StaticDirectory struct {
+	StaticDirectoryRefs
 	InodeNotSymlink
 	InodeDirectoryNoNewChildren
 	InodeAttrs
 	InodeNoDynamicLookup
 	OrderedChildren
 
-	locks vfs.FileLocks
+	locks  vfs.FileLocks
+	fdOpts GenericDirectoryFDOptions
 }
 
 var _ Inode = (*StaticDirectory)(nil)
 
 // NewStaticDir creates a new static directory and returns its dentry.
-func NewStaticDir(creds *auth.Credentials, devMajor, devMinor uint32, ino uint64, perm linux.FileMode, children map[string]*Dentry) *Dentry {
+func NewStaticDir(creds *auth.Credentials, devMajor, devMinor uint32, ino uint64, perm linux.FileMode, children map[string]*Dentry, fdOpts GenericDirectoryFDOptions) *Dentry {
 	inode := &StaticDirectory{}
-	inode.Init(creds, devMajor, devMinor, ino, perm)
+	inode.Init(creds, devMajor, devMinor, ino, perm, fdOpts)
 
 	dentry := &Dentry{}
 	dentry.Init(inode)
@@ -583,25 +575,31 @@ func NewStaticDir(creds *auth.Credentials, devMajor, devMinor uint32, ino uint64
 }
 
 // Init initializes StaticDirectory.
-func (s *StaticDirectory) Init(creds *auth.Credentials, devMajor, devMinor uint32, ino uint64, perm linux.FileMode) {
+func (s *StaticDirectory) Init(creds *auth.Credentials, devMajor, devMinor uint32, ino uint64, perm linux.FileMode, fdOpts GenericDirectoryFDOptions) {
 	if perm&^linux.PermissionsMask != 0 {
 		panic(fmt.Sprintf("Only permission mask must be set: %x", perm&linux.PermissionsMask))
 	}
+	s.fdOpts = fdOpts
 	s.InodeAttrs.Init(creds, devMajor, devMinor, ino, linux.ModeDirectory|perm)
 }
 
 // Open implements kernfs.Inode.
 func (s *StaticDirectory) Open(ctx context.Context, rp *vfs.ResolvingPath, vfsd *vfs.Dentry, opts vfs.OpenOptions) (*vfs.FileDescription, error) {
-	fd, err := NewGenericDirectoryFD(rp.Mount(), vfsd, &s.OrderedChildren, &s.locks, &opts)
+	fd, err := NewGenericDirectoryFD(rp.Mount(), vfsd, &s.OrderedChildren, &s.locks, &opts, s.fdOpts)
 	if err != nil {
 		return nil, err
 	}
 	return fd.VFSFileDescription(), nil
 }
 
-// SetStat implements Inode.SetStat not allowing inode attributes to be changed.
+// SetStat implements kernfs.Inode.SetStat not allowing inode attributes to be changed.
 func (*StaticDirectory) SetStat(context.Context, *vfs.Filesystem, *auth.Credentials, vfs.SetStatOptions) error {
 	return syserror.EPERM
+}
+
+// DecRef implements kernfs.Inode.
+func (s *StaticDirectory) DecRef(context.Context) {
+	s.StaticDirectoryRefs.DecRef(s.Destroy)
 }
 
 // AlwaysValid partially implements kernfs.inodeDynamicLookup.

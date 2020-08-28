@@ -128,11 +128,10 @@ func (c *testContext) sendV4Packet(payload []byte, h *headers, linkEpID tcpip.NI
 	u.SetChecksum(^u.CalculateChecksum(xsum))
 
 	// Inject packet.
-	c.linkEps[linkEpID].InjectInbound(ipv4.ProtocolNumber, &stack.PacketBuffer{
-		Data:            buf.ToVectorisedView(),
-		NetworkHeader:   buffer.View(ip),
-		TransportHeader: buffer.View(u),
+	pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
+		Data: buf.ToVectorisedView(),
 	})
+	c.linkEps[linkEpID].InjectInbound(ipv4.ProtocolNumber, pkt)
 }
 
 func (c *testContext) sendV6Packet(payload []byte, h *headers, linkEpID tcpip.NICID) {
@@ -166,11 +165,10 @@ func (c *testContext) sendV6Packet(payload []byte, h *headers, linkEpID tcpip.NI
 	u.SetChecksum(^u.CalculateChecksum(xsum))
 
 	// Inject packet.
-	c.linkEps[linkEpID].InjectInbound(ipv6.ProtocolNumber, &stack.PacketBuffer{
-		Data:            buf.ToVectorisedView(),
-		NetworkHeader:   buffer.View(ip),
-		TransportHeader: buffer.View(u),
+	pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
+		Data: buf.ToVectorisedView(),
 	})
+	c.linkEps[linkEpID].InjectInbound(ipv6.ProtocolNumber, pkt)
 }
 
 func TestTransportDemuxerRegister(t *testing.T) {
@@ -314,8 +312,8 @@ func TestBindToDeviceDistribution(t *testing.T) {
 							t.Fatalf("SetSockOptBool(ReusePortOption, %t) on endpoint %d failed: %s", endpoint.reuse, i, err)
 						}
 						bindToDeviceOption := tcpip.BindToDeviceOption(endpoint.bindToDevice)
-						if err := ep.SetSockOpt(bindToDeviceOption); err != nil {
-							t.Fatalf("SetSockOpt(%#v) on endpoint %d failed: %s", bindToDeviceOption, i, err)
+						if err := ep.SetSockOpt(&bindToDeviceOption); err != nil {
+							t.Fatalf("SetSockOpt(&%T(%d)) on endpoint %d failed: %s", bindToDeviceOption, bindToDeviceOption, i, err)
 						}
 
 						var dstAddr tcpip.Address

@@ -114,7 +114,7 @@ runsc: ## Builds the runsc binary.
 .PHONY: runsc
 
 debian: ## Builds the debian packages.
-	@$(call submake,build OPTIONS="-c opt" TARGETS="//runsc:runsc-debian")
+	@$(call submake,build OPTIONS="-c opt" TARGETS="//debian:debian")
 .PHONY: debian
 
 smoke-tests: ## Runs a simple smoke test after build runsc.
@@ -122,7 +122,7 @@ smoke-tests: ## Runs a simple smoke test after build runsc.
 .PHONY: smoke-tests
 
 unit-tests: ## Local package unit tests in pkg/..., runsc/, tools/.., etc.
-	@$(call submake,test TARGETS="pkg/... runsc/... tools/... benchmarks/... benchmarks/runner:runner_test")
+	@$(call submake,test TARGETS="pkg/... runsc/... tools/...")
 
 tests: ## Runs all unit tests and syscall tests.
 tests: unit-tests
@@ -166,14 +166,11 @@ do-tests: runsc
 simple-tests: unit-tests # Compatibility target.
 .PHONY: simple-tests
 
-IMAGE_FILTER := HelloWorld\|Httpd\|Ruby\|Stdio
-INTEGRATION_FILTER := Life\|Pause\|Connect\|JobControl\|Overlay\|Exec\|DirCreation/root
-
 docker-tests: load-basic-images
 	@$(call submake,install-test-runtime RUNTIME="vfs1")
 	@$(call submake,test-runtime RUNTIME="vfs1" TARGETS="$(INTEGRATION_TARGETS)")
 	@$(call submake,install-test-runtime RUNTIME="vfs2" ARGS="--vfs2")
-	@$(call submake,test-runtime RUNTIME="vfs2" OPTIONS="--test_filter=$(IMAGE_FILTER)\|$(INTEGRATION_FILTER)" TARGETS="$(INTEGRATION_TARGETS)")
+	@$(call submake,test-runtime RUNTIME="vfs2" TARGETS="$(INTEGRATION_TARGETS)")
 .PHONY: docker-tests
 
 overlay-tests: load-basic-images
@@ -304,8 +301,10 @@ $(RELEASE_KEY):
 release: $(RELEASE_KEY) ## Builds a release.
 	@mkdir -p $(RELEASE_ROOT)
 	@T=$$(mktemp -d /tmp/release.XXXXXX); \
-	  $(call submake,copy TARGETS="runsc" DESTINATION=$$T) && \
-	  $(call submake,copy TARGETS="runsc:runsc-debian" DESTINATION=$$T) && \
+	  $(call submake,copy TARGETS="//runsc:runsc" DESTINATION=$$T) && \
+	  $(call submake,copy TARGETS="//shim/v1:gvisor-containerd-shim" DESTINATION=$$T) && \
+	  $(call submake,copy TARGETS="//shim/v2:containerd-shim-runsc-v1" DESTINATION=$$T) && \
+	  $(call submake,copy TARGETS="//debian:debian" DESTINATION=$$T) && \
 	  NIGHTLY=$(RELEASE_NIGHTLY) tools/make_release.sh $(RELEASE_KEY) $(RELEASE_ROOT) $$T/*; \
 	rc=$$?; rm -rf $$T; exit $$rc
 .PHONY: release

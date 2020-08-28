@@ -34,6 +34,9 @@
 namespace gvisor {
 namespace testing {
 
+using ::testing::AnyOf;
+using ::testing::Eq;
+
 TEST_P(TCPSocketPairTest, TcpInfoSucceeds) {
   auto sockets = ASSERT_NO_ERRNO_AND_VALUE(NewSocketPair());
 
@@ -800,6 +803,9 @@ TEST_P(TCPSocketPairTest, SetCongestionControlFailsForUnsupported) {
 
 // Linux and Netstack both default to a 60s TCP_LINGER2 timeout.
 constexpr int kDefaultTCPLingerTimeout = 60;
+// On Linux, the maximum linger2 timeout was changed from 60sec to 120sec.
+constexpr int kMaxTCPLingerTimeout = 120;
+constexpr int kOldMaxTCPLingerTimeout = 60;
 
 TEST_P(TCPSocketPairTest, TCPLingerTimeoutDefault) {
   auto sockets = ASSERT_NO_ERRNO_AND_VALUE(NewSocketPair());
@@ -813,26 +819,45 @@ TEST_P(TCPSocketPairTest, TCPLingerTimeoutDefault) {
   EXPECT_EQ(get, kDefaultTCPLingerTimeout);
 }
 
-TEST_P(TCPSocketPairTest, SetTCPLingerTimeoutZeroOrLess) {
+TEST_P(TCPSocketPairTest, SetTCPLingerTimeoutLessThanZero) {
+  auto sockets = ASSERT_NO_ERRNO_AND_VALUE(NewSocketPair());
+
+  constexpr int kNegative = -1234;
+  EXPECT_THAT(setsockopt(sockets->first_fd(), IPPROTO_TCP, TCP_LINGER2,
+                         &kNegative, sizeof(kNegative)),
+              SyscallSucceedsWithValue(0));
+  int get = INT_MAX;
+  socklen_t get_len = sizeof(get);
+  EXPECT_THAT(
+      getsockopt(sockets->first_fd(), IPPROTO_TCP, TCP_LINGER2, &get, &get_len),
+      SyscallSucceedsWithValue(0));
+  EXPECT_EQ(get_len, sizeof(get));
+  EXPECT_EQ(get, -1);
+}
+
+TEST_P(TCPSocketPairTest, SetTCPLingerTimeoutZero) {
   auto sockets = ASSERT_NO_ERRNO_AND_VALUE(NewSocketPair());
 
   constexpr int kZero = 0;
   EXPECT_THAT(setsockopt(sockets->first_fd(), IPPROTO_TCP, TCP_LINGER2, &kZero,
                          sizeof(kZero)),
               SyscallSucceedsWithValue(0));
-
-  constexpr int kNegative = -1234;
-  EXPECT_THAT(setsockopt(sockets->first_fd(), IPPROTO_TCP, TCP_LINGER2,
-                         &kNegative, sizeof(kNegative)),
-              SyscallSucceedsWithValue(0));
+  int get = -1;
+  socklen_t get_len = sizeof(get);
+  EXPECT_THAT(
+      getsockopt(sockets->first_fd(), IPPROTO_TCP, TCP_LINGER2, &get, &get_len),
+      SyscallSucceedsWithValue(0));
+  EXPECT_EQ(get_len, sizeof(get));
+  EXPECT_THAT(get,
+              AnyOf(Eq(kMaxTCPLingerTimeout), Eq(kOldMaxTCPLingerTimeout)));
 }
 
-TEST_P(TCPSocketPairTest, SetTCPLingerTimeoutAboveDefault) {
+TEST_P(TCPSocketPairTest, SetTCPLingerTimeoutAboveMax) {
   auto sockets = ASSERT_NO_ERRNO_AND_VALUE(NewSocketPair());
 
   // Values above the net.ipv4.tcp_fin_timeout are capped to tcp_fin_timeout
   // on linux (defaults to 60 seconds on linux).
-  constexpr int kAboveDefault = kDefaultTCPLingerTimeout + 1;
+  constexpr int kAboveDefault = kMaxTCPLingerTimeout + 1;
   EXPECT_THAT(setsockopt(sockets->first_fd(), IPPROTO_TCP, TCP_LINGER2,
                          &kAboveDefault, sizeof(kAboveDefault)),
               SyscallSucceedsWithValue(0));
@@ -843,7 +868,12 @@ TEST_P(TCPSocketPairTest, SetTCPLingerTimeoutAboveDefault) {
       getsockopt(sockets->first_fd(), IPPROTO_TCP, TCP_LINGER2, &get, &get_len),
       SyscallSucceedsWithValue(0));
   EXPECT_EQ(get_len, sizeof(get));
-  EXPECT_EQ(get, kDefaultTCPLingerTimeout);
+  if (IsRunningOnGvisor()) {
+    EXPECT_EQ(get, kMaxTCPLingerTimeout);
+  } else {
+    EXPECT_THAT(get,
+                AnyOf(Eq(kMaxTCPLingerTimeout), Eq(kOldMaxTCPLingerTimeout)));
+  }
 }
 
 TEST_P(TCPSocketPairTest, SetTCPLingerTimeout) {
@@ -1050,5 +1080,124 @@ TEST_P(TCPSocketPairTest, TCPResetDuringClose_NoRandomSave) {
   }
 }
 
+// Test setsockopt and getsockopt for a socket with SO_LINGER option.
+TEST_P(TCPSocketPairTest, SetAndGetLingerOption) {
+  auto sockets = ASSERT_NO_ERRNO_AND_VALUE(NewSocketPair());
+
+  // Check getsockopt before SO_LINGER option is set.
+  struct linger got_linger = {-1, -1};
+  socklen_t got_len = sizeof(got_linger);
+
+  ASSERT_THAT(getsockopt(sockets->first_fd(), SOL_SOCKET, SO_LINGER,
+                         &got_linger, &got_len),
+              SyscallSucceeds());
+  ASSERT_THAT(got_len, sizeof(got_linger));
+  struct linger want_linger = {};
+  EXPECT_EQ(0, memcmp(&want_linger, &got_linger, got_len));
+
+  // Set and get SO_LINGER with negative values.
+  struct linger sl;
+  sl.l_onoff = 1;
+  sl.l_linger = -3;
+  ASSERT_THAT(
+      setsockopt(sockets->first_fd(), SOL_SOCKET, SO_LINGER, &sl, sizeof(sl)),
+      SyscallSucceeds());
+  ASSERT_THAT(getsockopt(sockets->first_fd(), SOL_SOCKET, SO_LINGER,
+                         &got_linger, &got_len),
+              SyscallSucceeds());
+  ASSERT_EQ(got_len, sizeof(got_linger));
+  EXPECT_EQ(sl.l_onoff, got_linger.l_onoff);
+  // Linux returns a different value as it uses HZ to convert the seconds to
+  // jiffies which overflows for negative values. We want to be compatible with
+  // linux for getsockopt return value.
+  if (IsRunningOnGvisor()) {
+    EXPECT_EQ(sl.l_linger, got_linger.l_linger);
+  }
+
+  // Set and get SO_LINGER option with positive values.
+  sl.l_onoff = 1;
+  sl.l_linger = 5;
+  ASSERT_THAT(
+      setsockopt(sockets->first_fd(), SOL_SOCKET, SO_LINGER, &sl, sizeof(sl)),
+      SyscallSucceeds());
+  ASSERT_THAT(getsockopt(sockets->first_fd(), SOL_SOCKET, SO_LINGER,
+                         &got_linger, &got_len),
+              SyscallSucceeds());
+  ASSERT_EQ(got_len, sizeof(got_linger));
+  EXPECT_EQ(0, memcmp(&sl, &got_linger, got_len));
+}
+
+// Test socket to disable SO_LINGER option.
+TEST_P(TCPSocketPairTest, SetOffLingerOption) {
+  auto sockets = ASSERT_NO_ERRNO_AND_VALUE(NewSocketPair());
+
+  // Set the SO_LINGER option.
+  struct linger sl;
+  sl.l_onoff = 1;
+  sl.l_linger = 5;
+  ASSERT_THAT(
+      setsockopt(sockets->first_fd(), SOL_SOCKET, SO_LINGER, &sl, sizeof(sl)),
+      SyscallSucceeds());
+
+  // Check getsockopt after SO_LINGER option is set.
+  struct linger got_linger = {-1, -1};
+  socklen_t got_len = sizeof(got_linger);
+  ASSERT_THAT(getsockopt(sockets->first_fd(), SOL_SOCKET, SO_LINGER,
+                         &got_linger, &got_len),
+              SyscallSucceeds());
+  ASSERT_EQ(got_len, sizeof(got_linger));
+  EXPECT_EQ(0, memcmp(&sl, &got_linger, got_len));
+
+  sl.l_onoff = 0;
+  sl.l_linger = 5;
+  ASSERT_THAT(
+      setsockopt(sockets->first_fd(), SOL_SOCKET, SO_LINGER, &sl, sizeof(sl)),
+      SyscallSucceeds());
+
+  // Check getsockopt after SO_LINGER option is set to zero.
+  ASSERT_THAT(getsockopt(sockets->first_fd(), SOL_SOCKET, SO_LINGER,
+                         &got_linger, &got_len),
+              SyscallSucceeds());
+  ASSERT_EQ(got_len, sizeof(got_linger));
+  EXPECT_EQ(0, memcmp(&sl, &got_linger, got_len));
+}
+
+// Test close on dup'd socket with SO_LINGER option set.
+TEST_P(TCPSocketPairTest, CloseWithLingerOption) {
+  auto sockets = ASSERT_NO_ERRNO_AND_VALUE(NewSocketPair());
+
+  // Set the SO_LINGER option.
+  struct linger sl;
+  sl.l_onoff = 1;
+  sl.l_linger = 5;
+  ASSERT_THAT(
+      setsockopt(sockets->first_fd(), SOL_SOCKET, SO_LINGER, &sl, sizeof(sl)),
+      SyscallSucceeds());
+
+  // Check getsockopt after SO_LINGER option is set.
+  struct linger got_linger = {-1, -1};
+  socklen_t got_len = sizeof(got_linger);
+  ASSERT_THAT(getsockopt(sockets->first_fd(), SOL_SOCKET, SO_LINGER,
+                         &got_linger, &got_len),
+              SyscallSucceeds());
+  ASSERT_EQ(got_len, sizeof(got_linger));
+  EXPECT_EQ(0, memcmp(&sl, &got_linger, got_len));
+
+  FileDescriptor dupFd = FileDescriptor(dup(sockets->first_fd()));
+  ASSERT_THAT(close(sockets->release_first_fd()), SyscallSucceeds());
+  char buf[10] = {};
+  // Write on dupFd should succeed as socket will not be closed until
+  // all references are removed.
+  ASSERT_THAT(RetryEINTR(write)(dupFd.get(), buf, sizeof(buf)),
+              SyscallSucceedsWithValue(sizeof(buf)));
+  ASSERT_THAT(RetryEINTR(write)(sockets->first_fd(), buf, sizeof(buf)),
+              SyscallFailsWithErrno(EBADF));
+
+  // Close the socket.
+  dupFd.reset();
+  // Write on dupFd should fail as all references for socket are removed.
+  ASSERT_THAT(RetryEINTR(write)(dupFd.get(), buf, sizeof(buf)),
+              SyscallFailsWithErrno(EBADF));
+}
 }  // namespace testing
 }  // namespace gvisor

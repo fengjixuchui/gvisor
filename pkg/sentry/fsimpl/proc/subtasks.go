@@ -31,6 +31,7 @@ import (
 //
 // +stateify savable
 type subtasksInode struct {
+	subtasksInodeRefs
 	kernfs.InodeNotSymlink
 	kernfs.InodeDirectoryNoNewChildren
 	kernfs.InodeAttrs
@@ -57,6 +58,7 @@ func (fs *filesystem) newSubtasks(task *kernel.Task, pidns *kernel.PIDNamespace,
 	// Note: credentials are overridden by taskOwnedInode.
 	subInode.InodeAttrs.Init(task.Credentials(), linux.UNNAMED_MAJOR, fs.devMinor, fs.NextIno(), linux.ModeDirectory|0555)
 	subInode.OrderedChildren.Init(kernfs.OrderedChildrenOptions{})
+	subInode.EnableLeakCheck()
 
 	inode := &taskOwnedInode{Inode: subInode, owner: task}
 	dentry := &kernfs.Dentry{}
@@ -155,7 +157,9 @@ func (fd *subtasksFD) SetStat(ctx context.Context, opts vfs.SetStatOptions) erro
 // Open implements kernfs.Inode.
 func (i *subtasksInode) Open(ctx context.Context, rp *vfs.ResolvingPath, vfsd *vfs.Dentry, opts vfs.OpenOptions) (*vfs.FileDescription, error) {
 	fd := &subtasksFD{task: i.task}
-	if err := fd.Init(&i.OrderedChildren, &i.locks, &opts); err != nil {
+	if err := fd.Init(&i.OrderedChildren, &i.locks, &opts, kernfs.GenericDirectoryFDOptions{
+		SeekEnd: kernfs.SeekEndZero,
+	}); err != nil {
 		return nil, err
 	}
 	if err := fd.VFSFileDescription().Init(fd, opts.Flags, rp.Mount(), vfsd, &vfs.FileDescriptionOptions{}); err != nil {
@@ -179,4 +183,9 @@ func (i *subtasksInode) Stat(ctx context.Context, vsfs *vfs.Filesystem, opts vfs
 // SetStat implements Inode.SetStat not allowing inode attributes to be changed.
 func (*subtasksInode) SetStat(context.Context, *vfs.Filesystem, *auth.Credentials, vfs.SetStatOptions) error {
 	return syserror.EPERM
+}
+
+// DecRef implements kernfs.Inode.
+func (i *subtasksInode) DecRef(context.Context) {
+	i.subtasksInodeRefs.DecRef(i.Destroy)
 }

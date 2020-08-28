@@ -96,6 +96,7 @@ func (*attrs) SetStat(context.Context, *vfs.Filesystem, *auth.Credentials, vfs.S
 }
 
 type readonlyDir struct {
+	readonlyDirRefs
 	attrs
 	kernfs.InodeNotSymlink
 	kernfs.InodeNoDynamicLookup
@@ -111,6 +112,7 @@ func (fs *filesystem) newReadonlyDir(creds *auth.Credentials, mode linux.FileMod
 	dir := &readonlyDir{}
 	dir.attrs.Init(creds, 0 /* devMajor */, 0 /* devMinor */, fs.NextIno(), linux.ModeDirectory|mode)
 	dir.OrderedChildren.Init(kernfs.OrderedChildrenOptions{})
+	dir.EnableLeakCheck()
 	dir.dentry.Init(dir)
 
 	dir.IncLinks(dir.OrderedChildren.Populate(&dir.dentry, contents))
@@ -119,14 +121,21 @@ func (fs *filesystem) newReadonlyDir(creds *auth.Credentials, mode linux.FileMod
 }
 
 func (d *readonlyDir) Open(ctx context.Context, rp *vfs.ResolvingPath, vfsd *vfs.Dentry, opts vfs.OpenOptions) (*vfs.FileDescription, error) {
-	fd, err := kernfs.NewGenericDirectoryFD(rp.Mount(), vfsd, &d.OrderedChildren, &d.locks, &opts)
+	fd, err := kernfs.NewGenericDirectoryFD(rp.Mount(), vfsd, &d.OrderedChildren, &d.locks, &opts, kernfs.GenericDirectoryFDOptions{
+		SeekEnd: kernfs.SeekEndStaticEntries,
+	})
 	if err != nil {
 		return nil, err
 	}
 	return fd.VFSFileDescription(), nil
 }
 
+func (d *readonlyDir) DecRef(context.Context) {
+	d.readonlyDirRefs.DecRef(d.Destroy)
+}
+
 type dir struct {
+	dirRefs
 	attrs
 	kernfs.InodeNotSymlink
 	kernfs.InodeNoDynamicLookup
@@ -143,6 +152,7 @@ func (fs *filesystem) newDir(creds *auth.Credentials, mode linux.FileMode, conte
 	dir.fs = fs
 	dir.attrs.Init(creds, 0 /* devMajor */, 0 /* devMinor */, fs.NextIno(), linux.ModeDirectory|mode)
 	dir.OrderedChildren.Init(kernfs.OrderedChildrenOptions{Writable: true})
+	dir.EnableLeakCheck()
 	dir.dentry.Init(dir)
 
 	dir.IncLinks(dir.OrderedChildren.Populate(&dir.dentry, contents))
@@ -151,11 +161,17 @@ func (fs *filesystem) newDir(creds *auth.Credentials, mode linux.FileMode, conte
 }
 
 func (d *dir) Open(ctx context.Context, rp *vfs.ResolvingPath, vfsd *vfs.Dentry, opts vfs.OpenOptions) (*vfs.FileDescription, error) {
-	fd, err := kernfs.NewGenericDirectoryFD(rp.Mount(), vfsd, &d.OrderedChildren, &d.locks, &opts)
+	fd, err := kernfs.NewGenericDirectoryFD(rp.Mount(), vfsd, &d.OrderedChildren, &d.locks, &opts, kernfs.GenericDirectoryFDOptions{
+		SeekEnd: kernfs.SeekEndStaticEntries,
+	})
 	if err != nil {
 		return nil, err
 	}
 	return fd.VFSFileDescription(), nil
+}
+
+func (d *dir) DecRef(context.Context) {
+	d.dirRefs.DecRef(d.Destroy)
 }
 
 func (d *dir) NewDir(ctx context.Context, name string, opts vfs.MkdirOptions) (*vfs.Dentry, error) {

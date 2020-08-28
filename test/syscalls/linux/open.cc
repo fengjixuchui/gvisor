@@ -27,6 +27,7 @@
 #include "test/util/cleanup.h"
 #include "test/util/file_descriptor.h"
 #include "test/util/fs_util.h"
+#include "test/util/posix_error.h"
 #include "test/util/temp_path.h"
 #include "test/util/test_util.h"
 #include "test/util/thread_util.h"
@@ -95,6 +96,38 @@ TEST_F(OpenTest, OTruncAndReadOnlyFile) {
       Open(dirpath.c_str(), O_TRUNC | O_RDONLY, 0666));
 }
 
+TEST_F(OpenTest, OCreateDirectory) {
+  SKIP_IF(IsRunningWithVFS1());
+  auto dirpath = GetAbsoluteTestTmpdir();
+
+  // Normal case: existing directory.
+  ASSERT_THAT(open(dirpath.c_str(), O_RDWR | O_CREAT, 0666),
+              SyscallFailsWithErrno(EISDIR));
+  // Trailing separator on existing directory.
+  ASSERT_THAT(open(dirpath.append("/").c_str(), O_RDWR | O_CREAT, 0666),
+              SyscallFailsWithErrno(EISDIR));
+  // Trailing separator on non-existing directory.
+  ASSERT_THAT(open(JoinPath(dirpath, "non-existent").append("/").c_str(),
+                   O_RDWR | O_CREAT, 0666),
+              SyscallFailsWithErrno(EISDIR));
+  // "." special case.
+  ASSERT_THAT(open(JoinPath(dirpath, ".").c_str(), O_RDWR | O_CREAT, 0666),
+              SyscallFailsWithErrno(EISDIR));
+}
+
+TEST_F(OpenTest, MustCreateExisting) {
+  auto dirPath = GetAbsoluteTestTmpdir();
+
+  // Existing directory.
+  ASSERT_THAT(open(dirPath.c_str(), O_RDWR | O_CREAT | O_EXCL, 0666),
+              SyscallFailsWithErrno(EEXIST));
+
+  // Existing file.
+  auto newFile = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateFileIn(dirPath));
+  ASSERT_THAT(open(newFile.path().c_str(), O_RDWR | O_CREAT | O_EXCL, 0666),
+              SyscallFailsWithErrno(EEXIST));
+}
+
 TEST_F(OpenTest, ReadOnly) {
   char buf;
   const FileDescriptor ro_file =
@@ -113,6 +146,26 @@ TEST_F(OpenTest, WriteOnly) {
   EXPECT_THAT(read(wo_file.get(), &buf, 1), SyscallFailsWithErrno(EBADF));
   EXPECT_THAT(lseek(wo_file.get(), 0, SEEK_SET), SyscallSucceeds());
   EXPECT_THAT(write(wo_file.get(), &buf, 1), SyscallSucceedsWithValue(1));
+}
+
+TEST_F(OpenTest, CreateWithAppend) {
+  std::string data = "text";
+  std::string new_file = NewTempAbsPath();
+  const FileDescriptor file = ASSERT_NO_ERRNO_AND_VALUE(
+      Open(new_file, O_WRONLY | O_APPEND | O_CREAT, 0666));
+  EXPECT_THAT(write(file.get(), data.c_str(), data.size()),
+              SyscallSucceedsWithValue(data.size()));
+  EXPECT_THAT(lseek(file.get(), 0, SEEK_SET), SyscallSucceeds());
+  EXPECT_THAT(write(file.get(), data.c_str(), data.size()),
+              SyscallSucceedsWithValue(data.size()));
+
+  // Check that the size of the file is correct and that the offset has been
+  // incremented to that size.
+  struct stat s0;
+  EXPECT_THAT(fstat(file.get(), &s0), SyscallSucceeds());
+  EXPECT_EQ(s0.st_size, 2 * data.size());
+  EXPECT_THAT(lseek(file.get(), 0, SEEK_CUR),
+              SyscallSucceedsWithValue(2 * data.size()));
 }
 
 TEST_F(OpenTest, ReadWrite) {
@@ -354,6 +407,13 @@ TEST_F(OpenTest, FileNotDirectory) {
   auto file = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateFile());
   ASSERT_THAT(open(file.path().c_str(), O_RDONLY | O_DIRECTORY),
               SyscallFailsWithErrno(ENOTDIR));
+}
+
+TEST_F(OpenTest, SymlinkDirectory) {
+  auto dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  std::string link = NewTempAbsPath();
+  ASSERT_THAT(symlink(dir.path().c_str(), link.c_str()), SyscallSucceeds());
+  ASSERT_NO_ERRNO(Open(link, O_RDONLY | O_DIRECTORY));
 }
 
 TEST_F(OpenTest, Null) {

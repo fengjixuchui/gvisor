@@ -57,6 +57,7 @@ go_library(
         "conntrack.go",
         "dhcpv6configurationfromndpra_string.go",
         "forwarder.go",
+        "headertype_string.go",
         "icmp_rate_limit.go",
         "iptables.go",
         "iptables_state.go",
@@ -121,6 +122,7 @@ go_test(
         "//pkg/tcpip/header",
         "//pkg/tcpip/link/channel",
         "//pkg/tcpip/link/loopback",
+        "//pkg/tcpip/network/arp",
         "//pkg/tcpip/network/ipv4",
         "//pkg/tcpip/network/ipv6",
         "//pkg/tcpip/ports",
@@ -142,6 +144,7 @@ go_test(
         "neighbor_cache_test.go",
         "neighbor_entry_test.go",
         "nic_test.go",
+        "packet_buffer_test.go",
     ],
     library = ":stack",
     deps = [

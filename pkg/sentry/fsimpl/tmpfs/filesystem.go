@@ -25,7 +25,6 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/socket/unix/transport"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
 	"gvisor.dev/gvisor/pkg/syserror"
-	"gvisor.dev/gvisor/pkg/usermem"
 )
 
 // Sync implements vfs.FilesystemImpl.Sync.
@@ -39,7 +38,9 @@ func (fs *filesystem) Sync(ctx context.Context) error {
 //
 // stepLocked is loosely analogous to fs/namei.c:walk_component().
 //
-// Preconditions: filesystem.mu must be locked. !rp.Done().
+// Preconditions:
+// * filesystem.mu must be locked.
+// * !rp.Done().
 func stepLocked(ctx context.Context, rp *vfs.ResolvingPath, d *dentry) (*dentry, error) {
 	dir, ok := d.inode.impl.(*directory)
 	if !ok {
@@ -97,7 +98,9 @@ afterSymlink:
 // walkParentDirLocked is loosely analogous to Linux's
 // fs/namei.c:path_parentat().
 //
-// Preconditions: filesystem.mu must be locked. !rp.Done().
+// Preconditions:
+// * filesystem.mu must be locked.
+// * !rp.Done().
 func walkParentDirLocked(ctx context.Context, rp *vfs.ResolvingPath, d *dentry) (*directory, error) {
 	for !rp.Final() {
 		next, err := stepLocked(ctx, rp, d)
@@ -139,8 +142,9 @@ func resolveLocked(ctx context.Context, rp *vfs.ResolvingPath) (*dentry, error) 
 // doCreateAt is loosely analogous to a conjunction of Linux's
 // fs/namei.c:filename_create() and done_path_create().
 //
-// Preconditions: !rp.Done(). For the final path component in rp,
-// !rp.ShouldFollowSymlink().
+// Preconditions:
+// * !rp.Done().
+// * For the final path component in rp, !rp.ShouldFollowSymlink().
 func (fs *filesystem) doCreateAt(ctx context.Context, rp *vfs.ResolvingPath, dir bool, create func(parentDir *directory, name string) error) error {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
@@ -307,26 +311,39 @@ func (fs *filesystem) OpenAt(ctx context.Context, rp *vfs.ResolvingPath, opts vf
 	// don't need fs.mu for writing.
 	if opts.Flags&linux.O_CREAT == 0 {
 		fs.mu.RLock()
-		defer fs.mu.RUnlock()
 		d, err := resolveLocked(ctx, rp)
 		if err != nil {
+			fs.mu.RUnlock()
 			return nil, err
 		}
+		d.IncRef()
+		defer d.DecRef(ctx)
+		fs.mu.RUnlock()
 		return d.open(ctx, rp, &opts, false /* afterCreate */)
 	}
 
 	mustCreate := opts.Flags&linux.O_EXCL != 0
 	start := rp.Start().Impl().(*dentry)
 	fs.mu.Lock()
-	defer fs.mu.Unlock()
+	unlocked := false
+	unlock := func() {
+		if !unlocked {
+			fs.mu.Unlock()
+			unlocked = true
+		}
+	}
+	defer unlock()
 	if rp.Done() {
-		// Reject attempts to open directories with O_CREAT.
+		// Reject attempts to open mount root directory with O_CREAT.
 		if rp.MustBeDir() {
 			return nil, syserror.EISDIR
 		}
 		if mustCreate {
 			return nil, syserror.EEXIST
 		}
+		start.IncRef()
+		defer start.DecRef(ctx)
+		unlock()
 		return start.open(ctx, rp, &opts, false /* afterCreate */)
 	}
 afterTrailingSymlink:
@@ -364,6 +381,7 @@ afterTrailingSymlink:
 		creds := rp.Credentials()
 		child := fs.newDentry(fs.newRegularFile(creds.EffectiveKUID, creds.EffectiveKGID, opts.Mode))
 		parentDir.insertChildLocked(child, name)
+		unlock()
 		fd, err := child.open(ctx, rp, &opts, true)
 		if err != nil {
 			return nil, err
@@ -389,13 +407,17 @@ afterTrailingSymlink:
 		start = &parentDir.dentry
 		goto afterTrailingSymlink
 	}
-	// Open existing file.
-	if mustCreate {
-		return nil, syserror.EEXIST
+	if rp.MustBeDir() && !child.inode.isDir() {
+		return nil, syserror.ENOTDIR
 	}
+	child.IncRef()
+	defer child.DecRef(ctx)
+	unlock()
 	return child.open(ctx, rp, &opts, false)
 }
 
+// Preconditions: The caller must hold no locks (since opening pipes may block
+// indefinitely).
 func (d *dentry) open(ctx context.Context, rp *vfs.ResolvingPath, opts *vfs.OpenOptions, afterCreate bool) (*vfs.FileDescription, error) {
 	ats := vfs.AccessTypesForOpenFlags(opts)
 	if !afterCreate {
@@ -683,16 +705,7 @@ func (fs *filesystem) StatFSAt(ctx context.Context, rp *vfs.ResolvingPath) (linu
 	if _, err := resolveLocked(ctx, rp); err != nil {
 		return linux.Statfs{}, err
 	}
-	statfs := linux.Statfs{
-		Type:         linux.TMPFS_MAGIC,
-		BlockSize:    usermem.PageSize,
-		FragmentSize: usermem.PageSize,
-		NameLength:   linux.NAME_MAX,
-		// TODO(b/29637826): Allow configuring a tmpfs size and enforce it.
-		Blocks:     0,
-		BlocksFree: 0,
-	}
-	return statfs, nil
+	return globalStatfs, nil
 }
 
 // SymlinkAt implements vfs.FilesystemImpl.SymlinkAt.
@@ -770,6 +783,9 @@ func (fs *filesystem) BoundEndpointAt(ctx context.Context, rp *vfs.ResolvingPath
 	}
 	switch impl := d.inode.impl.(type) {
 	case *socketFile:
+		if impl.ep == nil {
+			return nil, syserror.ECONNREFUSED
+		}
 		return impl.ep, nil
 	default:
 		return nil, syserror.ECONNREFUSED

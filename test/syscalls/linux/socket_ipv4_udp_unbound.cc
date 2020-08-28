@@ -2121,39 +2121,6 @@ TEST_P(IPv4UDPUnboundSocketTest, ReuseAddrReusePortDistribution) {
               SyscallSucceedsWithValue(kMessageSize));
 }
 
-// Check that connect returns EADDRNOTAVAIL when out of local ephemeral ports.
-// We disable S/R because this test creates a large number of sockets.
-TEST_P(IPv4UDPUnboundSocketTest, UDPConnectPortExhaustion_NoRandomSave) {
-  auto receiver1 = ASSERT_NO_ERRNO_AND_VALUE(NewSocket());
-  constexpr int kClients = 65536;
-  // Bind the first socket to the loopback and take note of the selected port.
-  auto addr = V4Loopback();
-  ASSERT_THAT(bind(receiver1->get(), reinterpret_cast<sockaddr*>(&addr.addr),
-                   addr.addr_len),
-              SyscallSucceeds());
-  socklen_t addr_len = addr.addr_len;
-  ASSERT_THAT(getsockname(receiver1->get(),
-                          reinterpret_cast<sockaddr*>(&addr.addr), &addr_len),
-              SyscallSucceeds());
-  EXPECT_EQ(addr_len, addr.addr_len);
-
-  // Disable cooperative S/R as we are making too many syscalls.
-  DisableSave ds;
-  std::vector<std::unique_ptr<FileDescriptor>> sockets;
-  for (int i = 0; i < kClients; i++) {
-    auto s = ASSERT_NO_ERRNO_AND_VALUE(NewSocket());
-
-    int ret = connect(s->get(), reinterpret_cast<sockaddr*>(&addr.addr),
-                      addr.addr_len);
-    if (ret == 0) {
-      sockets.push_back(std::move(s));
-      continue;
-    }
-    ASSERT_THAT(ret, SyscallFailsWithErrno(EAGAIN));
-    break;
-  }
-}
-
 // Test that socket will receive packet info control message.
 TEST_P(IPv4UDPUnboundSocketTest, SetAndReceiveIPPKTINFO) {
   // TODO(gvisor.dev/issue/1202): ioctl() is not supported by hostinet.
@@ -2452,5 +2419,105 @@ TEST_P(IPv4UDPUnboundSocketTest, SetSocketSendBuf) {
 
   ASSERT_EQ(quarter_sz, val);
 }
+
+TEST_P(IPv4UDPUnboundSocketTest, IpMulticastIPPacketInfo) {
+  auto sender_socket = ASSERT_NO_ERRNO_AND_VALUE(NewSocket());
+  auto receiver_socket = ASSERT_NO_ERRNO_AND_VALUE(NewSocket());
+
+  // Bind the first FD to the loopback. This is an alternative to
+  // IP_MULTICAST_IF for setting the default send interface.
+  auto sender_addr = V4Loopback();
+  ASSERT_THAT(
+      bind(sender_socket->get(), reinterpret_cast<sockaddr*>(&sender_addr.addr),
+           sender_addr.addr_len),
+      SyscallSucceeds());
+
+  // Bind the second FD to the v4 any address to ensure that we can receive the
+  // multicast packet.
+  auto receiver_addr = V4Any();
+  ASSERT_THAT(bind(receiver_socket->get(),
+                   reinterpret_cast<sockaddr*>(&receiver_addr.addr),
+                   receiver_addr.addr_len),
+              SyscallSucceeds());
+  socklen_t receiver_addr_len = receiver_addr.addr_len;
+  ASSERT_THAT(getsockname(receiver_socket->get(),
+                          reinterpret_cast<sockaddr*>(&receiver_addr.addr),
+                          &receiver_addr_len),
+              SyscallSucceeds());
+  EXPECT_EQ(receiver_addr_len, receiver_addr.addr_len);
+
+  // Register to receive multicast packets.
+  ip_mreqn group = {};
+  group.imr_multiaddr.s_addr = inet_addr(kMulticastAddress);
+  group.imr_ifindex = ASSERT_NO_ERRNO_AND_VALUE(InterfaceIndex("lo"));
+  ASSERT_THAT(setsockopt(receiver_socket->get(), IPPROTO_IP, IP_ADD_MEMBERSHIP,
+                         &group, sizeof(group)),
+              SyscallSucceeds());
+
+  // Register to receive IP packet info.
+  const int one = 1;
+  ASSERT_THAT(setsockopt(receiver_socket->get(), IPPROTO_IP, IP_PKTINFO, &one,
+                         sizeof(one)),
+              SyscallSucceeds());
+
+  // Send a multicast packet.
+  auto send_addr = V4Multicast();
+  reinterpret_cast<sockaddr_in*>(&send_addr.addr)->sin_port =
+      reinterpret_cast<sockaddr_in*>(&receiver_addr.addr)->sin_port;
+  char send_buf[200];
+  RandomizeBuffer(send_buf, sizeof(send_buf));
+  ASSERT_THAT(
+      RetryEINTR(sendto)(sender_socket->get(), send_buf, sizeof(send_buf), 0,
+                         reinterpret_cast<sockaddr*>(&send_addr.addr),
+                         send_addr.addr_len),
+      SyscallSucceedsWithValue(sizeof(send_buf)));
+
+  // Check that we received the multicast packet.
+  msghdr recv_msg = {};
+  iovec recv_iov = {};
+  char recv_buf[sizeof(send_buf)];
+  char recv_cmsg_buf[CMSG_SPACE(sizeof(in_pktinfo))] = {};
+  size_t cmsg_data_len = sizeof(in_pktinfo);
+  recv_iov.iov_base = recv_buf;
+  recv_iov.iov_len = sizeof(recv_buf);
+  recv_msg.msg_iov = &recv_iov;
+  recv_msg.msg_iovlen = 1;
+  recv_msg.msg_controllen = CMSG_LEN(cmsg_data_len);
+  recv_msg.msg_control = recv_cmsg_buf;
+  ASSERT_THAT(RetryEINTR(recvmsg)(receiver_socket->get(), &recv_msg, 0),
+              SyscallSucceedsWithValue(sizeof(send_buf)));
+  EXPECT_EQ(0, memcmp(send_buf, recv_buf, sizeof(send_buf)));
+
+  // Check the IP_PKTINFO control message.
+  cmsghdr* cmsg = CMSG_FIRSTHDR(&recv_msg);
+  ASSERT_NE(cmsg, nullptr);
+  EXPECT_EQ(cmsg->cmsg_len, CMSG_LEN(cmsg_data_len));
+  EXPECT_EQ(cmsg->cmsg_level, IPPROTO_IP);
+  EXPECT_EQ(cmsg->cmsg_type, IP_PKTINFO);
+
+  // Get loopback index.
+  ifreq ifr = {};
+  absl::SNPrintF(ifr.ifr_name, IFNAMSIZ, "lo");
+  ASSERT_THAT(ioctl(receiver_socket->get(), SIOCGIFINDEX, &ifr),
+              SyscallSucceeds());
+  ASSERT_NE(ifr.ifr_ifindex, 0);
+
+  in_pktinfo received_pktinfo = {};
+  memcpy(&received_pktinfo, CMSG_DATA(cmsg), sizeof(in_pktinfo));
+  EXPECT_EQ(received_pktinfo.ipi_ifindex, ifr.ifr_ifindex);
+  if (IsRunningOnGvisor()) {
+    // This should actually be a unicast address assigned to the interface.
+    //
+    // TODO(gvisor.dev/issue/3556): This check is validating incorrect
+    // behaviour. We still include the test so that once the bug is
+    // resolved, this test will start to fail and the individual tasked
+    // with fixing this bug knows to also fix this test :).
+    EXPECT_EQ(received_pktinfo.ipi_spec_dst.s_addr, group.imr_multiaddr.s_addr);
+  } else {
+    EXPECT_EQ(received_pktinfo.ipi_spec_dst.s_addr, htonl(INADDR_LOOPBACK));
+  }
+  EXPECT_EQ(received_pktinfo.ipi_addr.s_addr, group.imr_multiaddr.s_addr);
+}
+
 }  // namespace testing
 }  // namespace gvisor

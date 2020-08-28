@@ -101,11 +101,9 @@ var _ NetworkEndpoint = (*testIPv6Endpoint)(nil)
 // We use this instead of ipv6.endpoint because the ipv6 package depends on
 // the stack package which this test lives in, causing a cyclic dependency.
 type testIPv6Endpoint struct {
-	nicID     tcpip.NICID
-	id        NetworkEndpointID
-	prefixLen int
-	linkEP    LinkEndpoint
-	protocol  *testIPv6Protocol
+	nicID    tcpip.NICID
+	linkEP   LinkEndpoint
+	protocol *testIPv6Protocol
 }
 
 // DefaultTTL implements NetworkEndpoint.DefaultTTL.
@@ -144,16 +142,6 @@ func (*testIPv6Endpoint) WritePackets(*Route, *GSO, PacketBufferList, NetworkHea
 func (*testIPv6Endpoint) WriteHeaderIncludedPacket(*Route, *PacketBuffer) *tcpip.Error {
 	// Our tests don't use this so we don't support it.
 	return tcpip.ErrNotSupported
-}
-
-// ID implements NetworkEndpoint.ID.
-func (e *testIPv6Endpoint) ID() *NetworkEndpointID {
-	return &e.id
-}
-
-// PrefixLen implements NetworkEndpoint.PrefixLen.
-func (e *testIPv6Endpoint) PrefixLen() int {
-	return e.prefixLen
 }
 
 // NICID implements NetworkEndpoint.NICID.
@@ -204,14 +192,12 @@ func (*testIPv6Protocol) ParseAddresses(v buffer.View) (src, dst tcpip.Address) 
 }
 
 // NewEndpoint implements NetworkProtocol.NewEndpoint.
-func (p *testIPv6Protocol) NewEndpoint(nicID tcpip.NICID, addrWithPrefix tcpip.AddressWithPrefix, _ LinkAddressCache, _ TransportDispatcher, linkEP LinkEndpoint, _ *Stack) (NetworkEndpoint, *tcpip.Error) {
+func (p *testIPv6Protocol) NewEndpoint(nicID tcpip.NICID, _ LinkAddressCache, _ NUDHandler, _ TransportDispatcher, linkEP LinkEndpoint, _ *Stack) NetworkEndpoint {
 	return &testIPv6Endpoint{
-		nicID:     nicID,
-		id:        NetworkEndpointID{LocalAddress: addrWithPrefix.Address},
-		prefixLen: addrWithPrefix.PrefixLen,
-		linkEP:    linkEP,
-		protocol:  p,
-	}, nil
+		nicID:    nicID,
+		linkEP:   linkEP,
+		protocol: p,
+	}
 }
 
 // SetOption implements NetworkProtocol.SetOption.
@@ -311,7 +297,9 @@ func TestDisabledRxStatsWhenNICDisabled(t *testing.T) {
 		t.FailNow()
 	}
 
-	nic.DeliverNetworkPacket("", "", 0, &PacketBuffer{Data: buffer.View([]byte{1, 2, 3, 4}).ToVectorisedView()})
+	nic.DeliverNetworkPacket("", "", 0, NewPacketBuffer(PacketBufferOptions{
+		Data: buffer.View([]byte{1, 2, 3, 4}).ToVectorisedView(),
+	}))
 
 	if got := nic.stats.DisabledRx.Packets.Value(); got != 1 {
 		t.Errorf("got DisabledRx.Packets = %d, want = 1", got)

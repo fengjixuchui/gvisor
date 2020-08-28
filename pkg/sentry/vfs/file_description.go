@@ -38,9 +38,7 @@ import (
 //
 // FileDescription is analogous to Linux's struct file.
 type FileDescription struct {
-	// refs is the reference count. refs is accessed using atomic memory
-	// operations.
-	refs int64
+	FileDescriptionRefs
 
 	// flagsMu protects statusFlags and asyncHandler below.
 	flagsMu sync.Mutex
@@ -131,7 +129,7 @@ func (fd *FileDescription) Init(impl FileDescriptionImpl, flags uint32, mnt *Mou
 		}
 	}
 
-	fd.refs = 1
+	fd.EnableLeakCheck()
 
 	// Remove "file creation flags" to mirror the behavior from file.f_flags in
 	// fs/open.c:do_dentry_open.
@@ -149,30 +147,9 @@ func (fd *FileDescription) Init(impl FileDescriptionImpl, flags uint32, mnt *Mou
 	return nil
 }
 
-// IncRef increments fd's reference count.
-func (fd *FileDescription) IncRef() {
-	atomic.AddInt64(&fd.refs, 1)
-}
-
-// TryIncRef increments fd's reference count and returns true. If fd's
-// reference count is already zero, TryIncRef does nothing and returns false.
-//
-// TryIncRef does not require that a reference is held on fd.
-func (fd *FileDescription) TryIncRef() bool {
-	for {
-		refs := atomic.LoadInt64(&fd.refs)
-		if refs <= 0 {
-			return false
-		}
-		if atomic.CompareAndSwapInt64(&fd.refs, refs, refs+1) {
-			return true
-		}
-	}
-}
-
 // DecRef decrements fd's reference count.
 func (fd *FileDescription) DecRef(ctx context.Context) {
-	if refs := atomic.AddInt64(&fd.refs, -1); refs == 0 {
+	fd.FileDescriptionRefs.DecRef(func() {
 		// Unregister fd from all epoll instances.
 		fd.epollMu.Lock()
 		epolls := fd.epolls
@@ -208,15 +185,7 @@ func (fd *FileDescription) DecRef(ctx context.Context) {
 		}
 		fd.asyncHandler = nil
 		fd.flagsMu.Unlock()
-	} else if refs < 0 {
-		panic("FileDescription.DecRef() called without holding a reference")
-	}
-}
-
-// Refs returns the current number of references. The returned count
-// is inherently racy and is unsafe to use without external synchronization.
-func (fd *FileDescription) Refs() int64 {
-	return atomic.LoadInt64(&fd.refs)
+	})
 }
 
 // Mount returns the mount on which fd was opened. It does not take a reference
@@ -289,7 +258,7 @@ func (fd *FileDescription) SetStatusFlags(ctx context.Context, creds *auth.Crede
 	if flags&linux.O_DIRECT != 0 && !fd.opts.AllowDirectIO {
 		return syserror.EINVAL
 	}
-	// TODO(jamieliu): FileDescriptionImpl.SetOAsync()?
+	// TODO(gvisor.dev/issue/1035): FileDescriptionImpl.SetOAsync()?
 	const settableFlags = linux.O_APPEND | linux.O_ASYNC | linux.O_DIRECT | linux.O_NOATIME | linux.O_NONBLOCK
 	fd.flagsMu.Lock()
 	if fd.asyncHandler != nil {
@@ -301,7 +270,7 @@ func (fd *FileDescription) SetStatusFlags(ctx context.Context, creds *auth.Crede
 			fd.asyncHandler.Unregister(fd)
 		}
 	}
-	fd.statusFlags = (oldFlags &^ settableFlags) | (flags & settableFlags)
+	atomic.StoreUint32(&fd.statusFlags, (oldFlags&^settableFlags)|(flags&settableFlags))
 	fd.flagsMu.Unlock()
 	return nil
 }
@@ -356,6 +325,8 @@ type FileDescriptionImpl interface {
 
 	// Allocate grows the file to offset + length bytes.
 	// Only mode == 0 is supported currently.
+	//
+	// Preconditions: The FileDescription was opened for writing.
 	Allocate(ctx context.Context, mode, offset, length uint64) error
 
 	// waiter.Waitable methods may be used to poll for I/O events.
@@ -369,8 +340,9 @@ type FileDescriptionImpl interface {
 	//
 	// - If opts.Flags specifies unsupported options, PRead returns EOPNOTSUPP.
 	//
-	// Preconditions: The FileDescription was opened for reading.
-	// FileDescriptionOptions.DenyPRead == false.
+	// Preconditions:
+	// * The FileDescription was opened for reading.
+	// * FileDescriptionOptions.DenyPRead == false.
 	PRead(ctx context.Context, dst usermem.IOSequence, offset int64, opts ReadOptions) (int64, error)
 
 	// Read is similar to PRead, but does not specify an offset.
@@ -401,8 +373,9 @@ type FileDescriptionImpl interface {
 	// - If opts.Flags specifies unsupported options, PWrite returns
 	// EOPNOTSUPP.
 	//
-	// Preconditions: The FileDescription was opened for writing.
-	// FileDescriptionOptions.DenyPWrite == false.
+	// Preconditions:
+	// * The FileDescription was opened for writing.
+	// * FileDescriptionOptions.DenyPWrite == false.
 	PWrite(ctx context.Context, src usermem.IOSequence, offset int64, opts WriteOptions) (int64, error)
 
 	// Write is similar to PWrite, but does not specify an offset, which is
@@ -565,6 +538,9 @@ func (fd *FileDescription) StatFS(ctx context.Context) (linux.Statfs, error) {
 
 // Allocate grows file represented by FileDescription to offset + length bytes.
 func (fd *FileDescription) Allocate(ctx context.Context, mode, offset, length uint64) error {
+	if !fd.IsWritable() {
+		return syserror.EBADF
+	}
 	return fd.impl.Allocate(ctx, mode, offset, length)
 }
 
@@ -839,4 +815,32 @@ func (fd *FileDescription) SetAsyncHandler(newHandler func() FileAsync) FileAsyn
 		}
 	}
 	return fd.asyncHandler
+}
+
+// FileReadWriteSeeker is a helper struct to pass a FileDescription as
+// io.Reader/io.Writer/io.ReadSeeker/etc.
+type FileReadWriteSeeker struct {
+	FD    *FileDescription
+	Ctx   context.Context
+	ROpts ReadOptions
+	WOpts WriteOptions
+}
+
+// Read implements io.ReadWriteSeeker.Read.
+func (f *FileReadWriteSeeker) Read(p []byte) (int, error) {
+	dst := usermem.BytesIOSequence(p)
+	ret, err := f.FD.Read(f.Ctx, dst, f.ROpts)
+	return int(ret), err
+}
+
+// Seek implements io.ReadWriteSeeker.Seek.
+func (f *FileReadWriteSeeker) Seek(offset int64, whence int) (int64, error) {
+	return f.FD.Seek(f.Ctx, offset, int32(whence))
+}
+
+// Write implements io.ReadWriteSeeker.Write.
+func (f *FileReadWriteSeeker) Write(p []byte) (int, error) {
+	buf := usermem.BytesIOSequence(p)
+	ret, err := f.FD.Write(f.Ctx, buf, f.WOpts)
+	return int(ret), err
 }
