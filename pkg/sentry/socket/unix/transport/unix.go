@@ -172,9 +172,8 @@ type Endpoint interface {
 	// connected.
 	GetRemoteAddress() (tcpip.FullAddress, *tcpip.Error)
 
-	// SetSockOpt sets a socket option. opt should be one of the tcpip.*Option
-	// types.
-	SetSockOpt(opt interface{}) *tcpip.Error
+	// SetSockOpt sets a socket option.
+	SetSockOpt(opt tcpip.SettableSocketOption) *tcpip.Error
 
 	// SetSockOptBool sets a socket option for simple cases when a value has
 	// the int type.
@@ -184,9 +183,8 @@ type Endpoint interface {
 	// the int type.
 	SetSockOptInt(opt tcpip.SockOptInt, v int) *tcpip.Error
 
-	// GetSockOpt gets a socket option. opt should be a pointer to one of the
-	// tcpip.*Option types.
-	GetSockOpt(opt interface{}) *tcpip.Error
+	// GetSockOpt gets a socket option.
+	GetSockOpt(opt tcpip.GettableSocketOption) *tcpip.Error
 
 	// GetSockOptBool gets a socket option for simple cases when a return
 	// value has the int type.
@@ -199,6 +197,9 @@ type Endpoint interface {
 	// State returns the current state of the socket, as represented by Linux in
 	// procfs.
 	State() uint32
+
+	// LastError implements tcpip.Endpoint.LastError.
+	LastError() *tcpip.Error
 }
 
 // A Credentialer is a socket or endpoint that supports the SO_PASSCRED socket
@@ -838,7 +839,7 @@ func (e *baseEndpoint) SendMsg(ctx context.Context, data [][]byte, c ControlMess
 }
 
 // SetSockOpt sets a socket option. Currently not supported.
-func (e *baseEndpoint) SetSockOpt(opt interface{}) *tcpip.Error {
+func (e *baseEndpoint) SetSockOpt(tcpip.SettableSocketOption) *tcpip.Error {
 	return nil
 }
 
@@ -940,15 +941,20 @@ func (e *baseEndpoint) GetSockOptInt(opt tcpip.SockOptInt) (int, *tcpip.Error) {
 }
 
 // GetSockOpt implements tcpip.Endpoint.GetSockOpt.
-func (e *baseEndpoint) GetSockOpt(opt interface{}) *tcpip.Error {
+func (e *baseEndpoint) GetSockOpt(opt tcpip.GettableSocketOption) *tcpip.Error {
 	switch opt.(type) {
-	case tcpip.ErrorOption:
+	case *tcpip.LingerOption:
 		return nil
 
 	default:
 		log.Warningf("Unsupported socket option: %T", opt)
 		return tcpip.ErrUnknownProtocolOption
 	}
+}
+
+// LastError implements Endpoint.LastError.
+func (*baseEndpoint) LastError() *tcpip.Error {
+	return nil
 }
 
 // Shutdown closes the read and/or write end of the endpoint connection to its

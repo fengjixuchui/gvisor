@@ -91,7 +91,7 @@ func NewFileDescription(ep transport.Endpoint, stype linux.SockType, flags uint3
 // GetSockOpt implements the linux syscall getsockopt(2) for sockets backed by
 // a transport.Endpoint.
 func (s *SocketVFS2) GetSockOpt(t *kernel.Task, level, name int, outPtr usermem.Addr, outLen int) (marshal.Marshallable, *syserr.Error) {
-	return netstack.GetSockOpt(t, s, s.ep, linux.AF_UNIX, s.ep.Type(), level, name, outLen)
+	return netstack.GetSockOpt(t, s, s.ep, linux.AF_UNIX, s.ep.Type(), level, name, outPtr, outLen)
 }
 
 // blockingAccept implements a blocking version of accept(2), that is, if no
@@ -183,10 +183,14 @@ func (s *SocketVFS2) Bind(t *kernel.Task, sockaddr []byte) *syserr.Error {
 			if t.IsNetworkNamespaced() {
 				return syserr.ErrInvalidEndpointState
 			}
-			if err := t.AbstractSockets().Bind(t, p[1:], bep, s); err != nil {
+			asn := t.AbstractSockets()
+			name := p[1:]
+			if err := asn.Bind(t, name, bep, s); err != nil {
 				// syserr.ErrPortInUse corresponds to EADDRINUSE.
 				return syserr.ErrPortInUse
 			}
+			s.abstractName = name
+			s.abstractNamespace = asn
 		} else {
 			path := fspath.Parse(p)
 			root := t.FSContext().RootDirectoryVFS2()

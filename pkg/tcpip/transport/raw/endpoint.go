@@ -352,18 +352,23 @@ func (e *endpoint) finishWrite(payloadBytes []byte, route *stack.Route) (int64, 
 	}
 
 	if e.hdrIncluded {
-		if err := route.WriteHeaderIncludedPacket(&stack.PacketBuffer{
+		pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
 			Data: buffer.View(payloadBytes).ToVectorisedView(),
-		}); err != nil {
+		})
+		if err := route.WriteHeaderIncludedPacket(pkt); err != nil {
 			return 0, nil, err
 		}
 	} else {
-		hdr := buffer.NewPrependable(len(payloadBytes) + int(route.MaxHeaderLength()))
-		if err := route.WritePacket(nil /* gso */, stack.NetworkHeaderParams{Protocol: e.TransProto, TTL: route.DefaultTTL(), TOS: stack.DefaultTOS}, &stack.PacketBuffer{
-			Header: hdr,
-			Data:   buffer.View(payloadBytes).ToVectorisedView(),
-			Owner:  e.owner,
-		}); err != nil {
+		pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
+			ReserveHeaderBytes: int(route.MaxHeaderLength()),
+			Data:               buffer.View(payloadBytes).ToVectorisedView(),
+		})
+		pkt.Owner = e.owner
+		if err := route.WritePacket(nil /* gso */, stack.NetworkHeaderParams{
+			Protocol: e.TransProto,
+			TTL:      route.DefaultTTL(),
+			TOS:      stack.DefaultTOS,
+		}, pkt); err != nil {
 			return 0, nil, err
 		}
 	}
@@ -505,9 +510,9 @@ func (e *endpoint) Readiness(mask waiter.EventMask) waiter.EventMask {
 }
 
 // SetSockOpt implements tcpip.Endpoint.SetSockOpt.
-func (e *endpoint) SetSockOpt(opt interface{}) *tcpip.Error {
+func (e *endpoint) SetSockOpt(opt tcpip.SettableSocketOption) *tcpip.Error {
 	switch opt.(type) {
-	case tcpip.SocketDetachFilterOption:
+	case *tcpip.SocketDetachFilterOption:
 		return nil
 
 	default:
@@ -572,14 +577,8 @@ func (e *endpoint) SetSockOptInt(opt tcpip.SockOptInt, v int) *tcpip.Error {
 }
 
 // GetSockOpt implements tcpip.Endpoint.GetSockOpt.
-func (e *endpoint) GetSockOpt(opt interface{}) *tcpip.Error {
-	switch opt.(type) {
-	case tcpip.ErrorOption:
-		return nil
-
-	default:
-		return tcpip.ErrUnknownProtocolOption
-	}
+func (*endpoint) GetSockOpt(tcpip.GettableSocketOption) *tcpip.Error {
+	return tcpip.ErrUnknownProtocolOption
 }
 
 // GetSockOptBool implements tcpip.Endpoint.GetSockOptBool.
@@ -691,12 +690,13 @@ func (e *endpoint) HandlePacket(route *stack.Route, pkt *stack.PacketBuffer) {
 	// slice. Save/restore doesn't support overlapping slices and will fail.
 	var combinedVV buffer.VectorisedView
 	if e.TransportEndpointInfo.NetProto == header.IPv4ProtocolNumber {
-		headers := make(buffer.View, 0, len(pkt.NetworkHeader)+len(pkt.TransportHeader))
-		headers = append(headers, pkt.NetworkHeader...)
-		headers = append(headers, pkt.TransportHeader...)
+		network, transport := pkt.NetworkHeader().View(), pkt.TransportHeader().View()
+		headers := make(buffer.View, 0, len(network)+len(transport))
+		headers = append(headers, network...)
+		headers = append(headers, transport...)
 		combinedVV = headers.ToVectorisedView()
 	} else {
-		combinedVV = append(buffer.View(nil), pkt.TransportHeader...).ToVectorisedView()
+		combinedVV = append(buffer.View(nil), pkt.TransportHeader().View()...).ToVectorisedView()
 	}
 	combinedVV.Append(pkt.Data)
 	packet.data = combinedVV
@@ -733,3 +733,7 @@ func (e *endpoint) Stats() tcpip.EndpointStats {
 
 // Wait implements stack.TransportEndpoint.Wait.
 func (*endpoint) Wait() {}
+
+func (*endpoint) LastError() *tcpip.Error {
+	return nil
+}

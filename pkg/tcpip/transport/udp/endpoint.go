@@ -209,7 +209,7 @@ func (e *endpoint) UniqueID() uint64 {
 	return e.uniqueID
 }
 
-func (e *endpoint) takeLastError() *tcpip.Error {
+func (e *endpoint) LastError() *tcpip.Error {
 	e.lastErrorMu.Lock()
 	defer e.lastErrorMu.Unlock()
 
@@ -268,7 +268,7 @@ func (e *endpoint) ModerateRecvBuf(copied int) {}
 // Read reads data from the endpoint. This method does not block if
 // there is no data pending.
 func (e *endpoint) Read(addr *tcpip.FullAddress) (buffer.View, tcpip.ControlMessages, *tcpip.Error) {
-	if err := e.takeLastError(); err != nil {
+	if err := e.LastError(); err != nil {
 		return buffer.View{}, tcpip.ControlMessages{}, err
 	}
 
@@ -411,7 +411,7 @@ func (e *endpoint) Write(p tcpip.Payloader, opts tcpip.WriteOptions) (int64, <-c
 }
 
 func (e *endpoint) write(p tcpip.Payloader, opts tcpip.WriteOptions) (int64, <-chan struct{}, *tcpip.Error) {
-	if err := e.takeLastError(); err != nil {
+	if err := e.LastError(); err != nil {
 		return 0, nil, err
 	}
 
@@ -499,7 +499,7 @@ func (e *endpoint) write(p tcpip.Payloader, opts tcpip.WriteOptions) (int64, <-c
 		resolve = route.Resolve
 	}
 
-	if !e.broadcast && route.IsBroadcast() {
+	if !e.broadcast && route.IsOutboundBroadcast() {
 		return 0, nil, tcpip.ErrBroadcastDisabled
 	}
 
@@ -683,9 +683,9 @@ func (e *endpoint) SetSockOptInt(opt tcpip.SockOptInt, v int) *tcpip.Error {
 }
 
 // SetSockOpt implements tcpip.Endpoint.SetSockOpt.
-func (e *endpoint) SetSockOpt(opt interface{}) *tcpip.Error {
+func (e *endpoint) SetSockOpt(opt tcpip.SettableSocketOption) *tcpip.Error {
 	switch v := opt.(type) {
-	case tcpip.MulticastInterfaceOption:
+	case *tcpip.MulticastInterfaceOption:
 		e.mu.Lock()
 		defer e.mu.Unlock()
 
@@ -721,7 +721,7 @@ func (e *endpoint) SetSockOpt(opt interface{}) *tcpip.Error {
 		e.multicastNICID = nic
 		e.multicastAddr = addr
 
-	case tcpip.AddMembershipOption:
+	case *tcpip.AddMembershipOption:
 		if !header.IsV4MulticastAddress(v.MulticastAddr) && !header.IsV6MulticastAddress(v.MulticastAddr) {
 			return tcpip.ErrInvalidOptionValue
 		}
@@ -764,7 +764,7 @@ func (e *endpoint) SetSockOpt(opt interface{}) *tcpip.Error {
 
 		e.multicastMemberships = append(e.multicastMemberships, memToInsert)
 
-	case tcpip.RemoveMembershipOption:
+	case *tcpip.RemoveMembershipOption:
 		if !header.IsV4MulticastAddress(v.MulticastAddr) && !header.IsV6MulticastAddress(v.MulticastAddr) {
 			return tcpip.ErrInvalidOptionValue
 		}
@@ -808,8 +808,8 @@ func (e *endpoint) SetSockOpt(opt interface{}) *tcpip.Error {
 		e.multicastMemberships[memToRemoveIndex] = e.multicastMemberships[len(e.multicastMemberships)-1]
 		e.multicastMemberships = e.multicastMemberships[:len(e.multicastMemberships)-1]
 
-	case tcpip.BindToDeviceOption:
-		id := tcpip.NICID(v)
+	case *tcpip.BindToDeviceOption:
+		id := tcpip.NICID(*v)
 		if id != 0 && !e.stack.HasNIC(id) {
 			return tcpip.ErrUnknownDevice
 		}
@@ -817,7 +817,7 @@ func (e *endpoint) SetSockOpt(opt interface{}) *tcpip.Error {
 		e.bindToDevice = id
 		e.mu.Unlock()
 
-	case tcpip.SocketDetachFilterOption:
+	case *tcpip.SocketDetachFilterOption:
 		return nil
 	}
 	return nil
@@ -960,10 +960,8 @@ func (e *endpoint) GetSockOptInt(opt tcpip.SockOptInt) (int, *tcpip.Error) {
 }
 
 // GetSockOpt implements tcpip.Endpoint.GetSockOpt.
-func (e *endpoint) GetSockOpt(opt interface{}) *tcpip.Error {
+func (e *endpoint) GetSockOpt(opt tcpip.GettableSocketOption) *tcpip.Error {
 	switch o := opt.(type) {
-	case tcpip.ErrorOption:
-		return e.takeLastError()
 	case *tcpip.MulticastInterfaceOption:
 		e.mu.Lock()
 		*o = tcpip.MulticastInterfaceOption{
@@ -986,13 +984,16 @@ func (e *endpoint) GetSockOpt(opt interface{}) *tcpip.Error {
 // sendUDP sends a UDP segment via the provided network endpoint and under the
 // provided identity.
 func sendUDP(r *stack.Route, data buffer.VectorisedView, localPort, remotePort uint16, ttl uint8, useDefaultTTL bool, tos uint8, owner tcpip.PacketOwner, noChecksum bool) *tcpip.Error {
-	// Allocate a buffer for the UDP header.
-	hdr := buffer.NewPrependable(header.UDPMinimumSize + int(r.MaxHeaderLength()))
+	pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
+		ReserveHeaderBytes: header.UDPMinimumSize + int(r.MaxHeaderLength()),
+		Data:               data,
+	})
+	pkt.Owner = owner
 
-	// Initialize the header.
-	udp := header.UDP(hdr.Prepend(header.UDPMinimumSize))
+	// Initialize the UDP header.
+	udp := header.UDP(pkt.TransportHeader().Push(header.UDPMinimumSize))
 
-	length := uint16(hdr.UsedLength() + data.Size())
+	length := uint16(pkt.Size())
 	udp.Encode(&header.UDPFields{
 		SrcPort: localPort,
 		DstPort: remotePort,
@@ -1019,12 +1020,7 @@ func sendUDP(r *stack.Route, data buffer.VectorisedView, localPort, remotePort u
 		Protocol: ProtocolNumber,
 		TTL:      ttl,
 		TOS:      tos,
-	}, &stack.PacketBuffer{
-		Header:          hdr,
-		Data:            data,
-		TransportHeader: buffer.View(udp),
-		Owner:           owner,
-	}); err != nil {
+	}, pkt); err != nil {
 		r.Stats().UDP.PacketSendErrors.Increment()
 		return err
 	}
@@ -1228,7 +1224,7 @@ func (*endpoint) Accept() (tcpip.Endpoint, *waiter.Queue, *tcpip.Error) {
 
 func (e *endpoint) registerWithStack(nicID tcpip.NICID, netProtos []tcpip.NetworkProtocolNumber, id stack.TransportEndpointID) (stack.TransportEndpointID, tcpip.NICID, *tcpip.Error) {
 	if e.ID.LocalPort == 0 {
-		port, err := e.stack.ReservePort(netProtos, ProtocolNumber, id.LocalAddress, id.LocalPort, e.portFlags, e.bindToDevice, tcpip.FullAddress{})
+		port, err := e.stack.ReservePort(netProtos, ProtocolNumber, id.LocalAddress, id.LocalPort, e.portFlags, e.bindToDevice, tcpip.FullAddress{}, nil /* testPort */)
 		if err != nil {
 			return id, e.bindToDevice, err
 		}
@@ -1368,11 +1364,27 @@ func (e *endpoint) Readiness(mask waiter.EventMask) waiter.EventMask {
 	return result
 }
 
+// verifyChecksum verifies the checksum unless RX checksum offload is enabled.
+// On IPv4, UDP checksum is optional, and a zero value means the transmitter
+// omitted the checksum generation (RFC768).
+// On IPv6, UDP checksum is not optional (RFC2460 Section 8.1).
+func verifyChecksum(r *stack.Route, hdr header.UDP, pkt *stack.PacketBuffer) bool {
+	if r.Capabilities()&stack.CapabilityRXChecksumOffload == 0 &&
+		(hdr.Checksum() != 0 || r.NetProto == header.IPv6ProtocolNumber) {
+		xsum := r.PseudoHeaderChecksum(ProtocolNumber, hdr.Length())
+		for _, v := range pkt.Data.Views() {
+			xsum = header.Checksum(v, xsum)
+		}
+		return hdr.CalculateChecksum(xsum) == 0xffff
+	}
+	return true
+}
+
 // HandlePacket is called by the stack when new packets arrive to this transport
 // endpoint.
 func (e *endpoint) HandlePacket(r *stack.Route, id stack.TransportEndpointID, pkt *stack.PacketBuffer) {
 	// Get the header then trim it from the view.
-	hdr := header.UDP(pkt.TransportHeader)
+	hdr := header.UDP(pkt.TransportHeader().View())
 	if int(hdr.Length()) > pkt.Data.Size()+header.UDPMinimumSize {
 		// Malformed packet.
 		e.stack.Stats().UDP.MalformedPacketsReceived.Increment()
@@ -1389,22 +1401,11 @@ func (e *endpoint) HandlePacket(r *stack.Route, id stack.TransportEndpointID, pk
 		return
 	}
 
-	// Verify checksum unless RX checksum offload is enabled.
-	// On IPv4, UDP checksum is optional, and a zero value means
-	// the transmitter omitted the checksum generation (RFC768).
-	// On IPv6, UDP checksum is not optional (RFC2460 Section 8.1).
-	if r.Capabilities()&stack.CapabilityRXChecksumOffload == 0 &&
-		(hdr.Checksum() != 0 || r.NetProto == header.IPv6ProtocolNumber) {
-		xsum := r.PseudoHeaderChecksum(ProtocolNumber, hdr.Length())
-		for _, v := range pkt.Data.Views() {
-			xsum = header.Checksum(v, xsum)
-		}
-		if hdr.CalculateChecksum(xsum) != 0xffff {
-			// Checksum Error.
-			e.stack.Stats().UDP.ChecksumErrors.Increment()
-			e.stats.ReceiveErrors.ChecksumErrors.Increment()
-			return
-		}
+	if !verifyChecksum(r, hdr, pkt) {
+		// Checksum Error.
+		e.stack.Stats().UDP.ChecksumErrors.Increment()
+		e.stats.ReceiveErrors.ChecksumErrors.Increment()
+		return
 	}
 
 	e.stack.Stats().UDP.PacketsReceived.Increment()
@@ -1443,14 +1444,17 @@ func (e *endpoint) HandlePacket(r *stack.Route, id stack.TransportEndpointID, pk
 	// Save any useful information from the network header to the packet.
 	switch r.NetProto {
 	case header.IPv4ProtocolNumber:
-		packet.tos, _ = header.IPv4(pkt.NetworkHeader).TOS()
-		packet.packetInfo.LocalAddr = r.LocalAddress
-		packet.packetInfo.DestinationAddr = r.RemoteAddress
-		packet.packetInfo.NIC = r.NICID()
+		packet.tos, _ = header.IPv4(pkt.NetworkHeader().View()).TOS()
 	case header.IPv6ProtocolNumber:
-		packet.tos, _ = header.IPv6(pkt.NetworkHeader).TOS()
+		packet.tos, _ = header.IPv6(pkt.NetworkHeader().View()).TOS()
 	}
 
+	// TODO(gvisor.dev/issue/3556): r.LocalAddress may be a multicast or broadcast
+	// address. packetInfo.LocalAddr should hold a unicast address that can be
+	// used to respond to the incoming packet.
+	packet.packetInfo.LocalAddr = r.LocalAddress
+	packet.packetInfo.DestinationAddr = r.LocalAddress
+	packet.packetInfo.NIC = r.NICID()
 	packet.timestamp = e.stack.Clock().NowNanoseconds()
 
 	e.rcvMu.Unlock()

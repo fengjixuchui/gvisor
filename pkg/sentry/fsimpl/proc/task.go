@@ -32,6 +32,7 @@ import (
 //
 // +stateify savable
 type taskInode struct {
+	taskInodeRefs
 	kernfs.InodeNotSymlink
 	kernfs.InodeDirectoryNoNewChildren
 	kernfs.InodeNoDynamicLookup
@@ -84,6 +85,7 @@ func (fs *filesystem) newTaskInode(task *kernel.Task, pidns *kernel.PIDNamespace
 	taskInode := &taskInode{task: task}
 	// Note: credentials are overridden by taskOwnedInode.
 	taskInode.InodeAttrs.Init(task.Credentials(), linux.UNNAMED_MAJOR, fs.devMinor, fs.NextIno(), linux.ModeDirectory|0555)
+	taskInode.EnableLeakCheck()
 
 	inode := &taskOwnedInode{Inode: taskInode, owner: task}
 	dentry := &kernfs.Dentry{}
@@ -105,7 +107,9 @@ func (i *taskInode) Valid(ctx context.Context) bool {
 
 // Open implements kernfs.Inode.
 func (i *taskInode) Open(ctx context.Context, rp *vfs.ResolvingPath, vfsd *vfs.Dentry, opts vfs.OpenOptions) (*vfs.FileDescription, error) {
-	fd, err := kernfs.NewGenericDirectoryFD(rp.Mount(), vfsd, &i.OrderedChildren, &i.locks, &opts)
+	fd, err := kernfs.NewGenericDirectoryFD(rp.Mount(), vfsd, &i.OrderedChildren, &i.locks, &opts, kernfs.GenericDirectoryFDOptions{
+		SeekEnd: kernfs.SeekEndZero,
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -115,6 +119,11 @@ func (i *taskInode) Open(ctx context.Context, rp *vfs.ResolvingPath, vfsd *vfs.D
 // SetStat implements Inode.SetStat not allowing inode attributes to be changed.
 func (*taskInode) SetStat(context.Context, *vfs.Filesystem, *auth.Credentials, vfs.SetStatOptions) error {
 	return syserror.EPERM
+}
+
+// DecRef implements kernfs.Inode.
+func (i *taskInode) DecRef(context.Context) {
+	i.taskInodeRefs.DecRef(i.Destroy)
 }
 
 // taskOwnedInode implements kernfs.Inode and overrides inode owner with task
@@ -142,7 +151,10 @@ func (fs *filesystem) newTaskOwnedDir(task *kernel.Task, ino uint64, perm linux.
 	dir := &kernfs.StaticDirectory{}
 
 	// Note: credentials are overridden by taskOwnedInode.
-	dir.Init(task.Credentials(), linux.UNNAMED_MAJOR, fs.devMinor, ino, perm)
+	dir.Init(task.Credentials(), linux.UNNAMED_MAJOR, fs.devMinor, ino, perm, kernfs.GenericDirectoryFDOptions{
+		SeekEnd: kernfs.SeekEndZero,
+	})
+	dir.EnableLeakCheck()
 
 	inode := &taskOwnedInode{Inode: dir, owner: task}
 	d := &kernfs.Dentry{}

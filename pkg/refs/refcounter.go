@@ -234,6 +234,39 @@ const (
 	LeaksLogTraces
 )
 
+// Set implements flag.Value.
+func (l *LeakMode) Set(v string) error {
+	switch v {
+	case "disabled":
+		*l = NoLeakChecking
+	case "log-names":
+		*l = LeaksLogWarning
+	case "log-traces":
+		*l = LeaksLogTraces
+	default:
+		return fmt.Errorf("invalid ref leak mode %q", v)
+	}
+	return nil
+}
+
+// Get implements flag.Value.
+func (l *LeakMode) Get() interface{} {
+	return *l
+}
+
+// String implements flag.Value.
+func (l *LeakMode) String() string {
+	switch *l {
+	case NoLeakChecking:
+		return "disabled"
+	case LeaksLogWarning:
+		return "log-names"
+	case LeaksLogTraces:
+		return "log-traces"
+	}
+	panic(fmt.Sprintf("invalid ref leak mode %q", *l))
+}
+
 // leakMode stores the current mode for the reference leak checker.
 //
 // Values must be one of the LeakMode values.
@@ -474,4 +507,14 @@ func (r *AtomicRefCount) DecRefWithDestructor(ctx context.Context, destroy func(
 //go:nosplit
 func (r *AtomicRefCount) DecRef(ctx context.Context) {
 	r.DecRefWithDestructor(ctx, nil)
+}
+
+// OnExit is called on sandbox exit. It runs GC to enqueue refcount finalizers,
+// which check for reference leaks. There is no way to guarantee that every
+// finalizer will run before exiting, but this at least ensures that they will
+// be discovered/enqueued by GC.
+func OnExit() {
+	if LeakMode(atomic.LoadUint32(&leakMode)) != NoLeakChecking {
+		runtime.GC()
+	}
 }

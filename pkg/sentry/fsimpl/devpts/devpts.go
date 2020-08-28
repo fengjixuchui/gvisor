@@ -83,6 +83,7 @@ func (fstype FilesystemType) newFilesystem(vfsObj *vfs.VirtualFilesystem, creds 
 	}
 	root.InodeAttrs.Init(creds, linux.UNNAMED_MAJOR, devMinor, 1, linux.ModeDirectory|0555)
 	root.OrderedChildren.Init(kernfs.OrderedChildrenOptions{})
+	root.EnableLeakCheck()
 	root.dentry.Init(root)
 
 	// Construct the pts master inode and dentry. Linux always uses inode
@@ -110,6 +111,7 @@ func (fs *filesystem) Release(ctx context.Context) {
 
 // rootInode is the root directory inode for the devpts mounts.
 type rootInode struct {
+	rootInodeRefs
 	kernfs.AlwaysValid
 	kernfs.InodeAttrs
 	kernfs.InodeDirectoryNoNewChildren
@@ -185,7 +187,9 @@ func (i *rootInode) masterClose(t *Terminal) {
 
 // Open implements kernfs.Inode.Open.
 func (i *rootInode) Open(ctx context.Context, rp *vfs.ResolvingPath, vfsd *vfs.Dentry, opts vfs.OpenOptions) (*vfs.FileDescription, error) {
-	fd, err := kernfs.NewGenericDirectoryFD(rp.Mount(), vfsd, &i.OrderedChildren, &i.locks, &opts)
+	fd, err := kernfs.NewGenericDirectoryFD(rp.Mount(), vfsd, &i.OrderedChildren, &i.locks, &opts, kernfs.GenericDirectoryFDOptions{
+		SeekEnd: kernfs.SeekEndStaticEntries,
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -230,4 +234,9 @@ func (i *rootInode) IterDirents(ctx context.Context, cb vfs.IterDirentsCallback,
 		offset++
 	}
 	return offset, nil
+}
+
+// DecRef implements kernfs.Inode.
+func (i *rootInode) DecRef(context.Context) {
+	i.rootInodeRefs.DecRef(i.Destroy)
 }

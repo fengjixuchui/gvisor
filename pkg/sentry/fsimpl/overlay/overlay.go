@@ -315,7 +315,11 @@ func clonePrivateMount(vfsObj *vfs.VirtualFilesystem, vd vfs.VirtualDentry, forc
 	if err != nil {
 		return vfs.VirtualDentry{}, err
 	}
-	return vfs.MakeVirtualDentry(newmnt, vd.Dentry()), nil
+	// Take a reference on the dentry which will be owned by the returned
+	// VirtualDentry.
+	d := vd.Dentry()
+	d.IncRef()
+	return vfs.MakeVirtualDentry(newmnt, d), nil
 }
 
 // Release implements vfs.FilesystemImpl.Release.
@@ -482,7 +486,9 @@ func (d *dentry) checkDropLocked(ctx context.Context) {
 
 // destroyLocked destroys the dentry.
 //
-// Preconditions: d.fs.renameMu must be locked for writing. d.refs == 0.
+// Preconditions:
+// * d.fs.renameMu must be locked for writing.
+// * d.refs == 0.
 func (d *dentry) destroyLocked(ctx context.Context) {
 	switch atomic.LoadInt64(&d.refs) {
 	case 0:

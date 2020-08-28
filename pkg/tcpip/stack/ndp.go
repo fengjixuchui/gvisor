@@ -728,7 +728,7 @@ func (ndp *ndpState) startDuplicateAddressDetection(addr tcpip.Address, ref *ref
 func (ndp *ndpState) sendDADPacket(addr tcpip.Address, ref *referencedNetworkEndpoint) *tcpip.Error {
 	snmc := header.SolicitedNodeAddr(addr)
 
-	r := makeRoute(header.IPv6ProtocolNumber, ref.ep.ID().LocalAddress, snmc, ndp.nic.linkEP.LinkAddress(), ref, false, false)
+	r := makeRoute(header.IPv6ProtocolNumber, ref.address(), snmc, ndp.nic.linkEP.LinkAddress(), ref, false, false)
 	defer r.Release()
 
 	// Route should resolve immediately since snmc is a multicast address so a
@@ -746,12 +746,16 @@ func (ndp *ndpState) sendDADPacket(addr tcpip.Address, ref *referencedNetworkEnd
 		panic(fmt.Sprintf("ndp: route resolution not immediate for route to send NDP NS for DAD (%s -> %s on NIC(%d))", header.IPv6Any, snmc, ndp.nic.ID()))
 	}
 
-	hdr := buffer.NewPrependable(int(r.MaxHeaderLength()) + header.ICMPv6NeighborSolicitMinimumSize)
-	pkt := header.ICMPv6(hdr.Prepend(header.ICMPv6NeighborSolicitMinimumSize))
-	pkt.SetType(header.ICMPv6NeighborSolicit)
-	ns := header.NDPNeighborSolicit(pkt.NDPPayload())
+	icmpData := header.ICMPv6(buffer.NewView(header.ICMPv6NeighborSolicitMinimumSize))
+	icmpData.SetType(header.ICMPv6NeighborSolicit)
+	ns := header.NDPNeighborSolicit(icmpData.NDPPayload())
 	ns.SetTargetAddress(addr)
-	pkt.SetChecksum(header.ICMPv6Checksum(pkt, r.LocalAddress, r.RemoteAddress, buffer.VectorisedView{}))
+	icmpData.SetChecksum(header.ICMPv6Checksum(icmpData, r.LocalAddress, r.RemoteAddress, buffer.VectorisedView{}))
+
+	pkt := NewPacketBuffer(PacketBufferOptions{
+		ReserveHeaderBytes: int(r.MaxHeaderLength()),
+		Data:               buffer.View(icmpData).ToVectorisedView(),
+	})
 
 	sent := r.Stats().ICMP.V6PacketsSent
 	if err := r.WritePacket(nil,
@@ -759,7 +763,7 @@ func (ndp *ndpState) sendDADPacket(addr tcpip.Address, ref *referencedNetworkEnd
 			Protocol: header.ICMPv6ProtocolNumber,
 			TTL:      header.NDPHopLimit,
 			TOS:      DefaultTOS,
-		}, &PacketBuffer{Header: hdr},
+		}, pkt,
 	); err != nil {
 		sent.Dropped.Increment()
 		return err
@@ -1349,7 +1353,7 @@ func (ndp *ndpState) generateTempSLAACAddr(prefix tcpip.Subnet, prefixState *sla
 		return false
 	}
 
-	stableAddr := prefixState.stableAddr.ref.ep.ID().LocalAddress
+	stableAddr := prefixState.stableAddr.ref.address()
 	now := time.Now()
 
 	// As per RFC 4941 section 3.3 step 4, the valid lifetime of a temporary
@@ -1686,7 +1690,7 @@ func (ndp *ndpState) cleanupSLAACAddrResourcesAndNotify(addr tcpip.AddressWithPr
 
 	prefix := addr.Subnet()
 	state, ok := ndp.slaacPrefixes[prefix]
-	if !ok || state.stableAddr.ref == nil || addr.Address != state.stableAddr.ref.ep.ID().LocalAddress {
+	if !ok || state.stableAddr.ref == nil || addr.Address != state.stableAddr.ref.address() {
 		return
 	}
 
@@ -1863,7 +1867,7 @@ func (ndp *ndpState) startSolicitingRouters() {
 		}
 		ndp.nic.mu.Unlock()
 
-		localAddr := ref.ep.ID().LocalAddress
+		localAddr := ref.address()
 		r := makeRoute(header.IPv6ProtocolNumber, localAddr, header.IPv6AllRoutersMulticastAddress, ndp.nic.linkEP.LinkAddress(), ref, false, false)
 		defer r.Release()
 
@@ -1897,12 +1901,16 @@ func (ndp *ndpState) startSolicitingRouters() {
 			}
 		}
 		payloadSize := header.ICMPv6HeaderSize + header.NDPRSMinimumSize + int(optsSerializer.Length())
-		hdr := buffer.NewPrependable(int(r.MaxHeaderLength()) + payloadSize)
-		pkt := header.ICMPv6(hdr.Prepend(payloadSize))
-		pkt.SetType(header.ICMPv6RouterSolicit)
-		rs := header.NDPRouterSolicit(pkt.NDPPayload())
+		icmpData := header.ICMPv6(buffer.NewView(payloadSize))
+		icmpData.SetType(header.ICMPv6RouterSolicit)
+		rs := header.NDPRouterSolicit(icmpData.NDPPayload())
 		rs.Options().Serialize(optsSerializer)
-		pkt.SetChecksum(header.ICMPv6Checksum(pkt, r.LocalAddress, r.RemoteAddress, buffer.VectorisedView{}))
+		icmpData.SetChecksum(header.ICMPv6Checksum(icmpData, r.LocalAddress, r.RemoteAddress, buffer.VectorisedView{}))
+
+		pkt := NewPacketBuffer(PacketBufferOptions{
+			ReserveHeaderBytes: int(r.MaxHeaderLength()),
+			Data:               buffer.View(icmpData).ToVectorisedView(),
+		})
 
 		sent := r.Stats().ICMP.V6PacketsSent
 		if err := r.WritePacket(nil,
@@ -1910,7 +1918,7 @@ func (ndp *ndpState) startSolicitingRouters() {
 				Protocol: header.ICMPv6ProtocolNumber,
 				TTL:      header.NDPHopLimit,
 				TOS:      DefaultTOS,
-			}, &PacketBuffer{Header: hdr},
+			}, pkt,
 		); err != nil {
 			sent.Dropped.Increment()
 			log.Printf("startSolicitingRouters: error writing NDP router solicit message on NIC(%d); err = %s", ndp.nic.ID(), err)

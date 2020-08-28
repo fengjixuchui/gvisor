@@ -16,7 +16,7 @@ func (x *abstractEndpoint) StateTypeName() string {
 func (x *abstractEndpoint) StateFields() []string {
 	return []string{
 		"ep",
-		"wr",
+		"socket",
 		"name",
 		"ns",
 	}
@@ -27,7 +27,7 @@ func (x *abstractEndpoint) beforeSave() {}
 func (x *abstractEndpoint) StateSave(m state.Sink) {
 	x.beforeSave()
 	m.Save(0, &x.ep)
-	m.Save(1, &x.wr)
+	m.Save(1, &x.socket)
 	m.Save(2, &x.name)
 	m.Save(3, &x.ns)
 }
@@ -36,7 +36,7 @@ func (x *abstractEndpoint) afterLoad() {}
 
 func (x *abstractEndpoint) StateLoad(m state.Source) {
 	m.Load(0, &x.ep)
-	m.Load(1, &x.wr)
+	m.Load(1, &x.socket)
 	m.Load(2, &x.name)
 	m.Load(3, &x.ns)
 }
@@ -122,7 +122,7 @@ func (x *FDTable) StateTypeName() string {
 
 func (x *FDTable) StateFields() []string {
 	return []string{
-		"AtomicRefCount",
+		"FDTableRefs",
 		"k",
 		"next",
 		"used",
@@ -136,7 +136,7 @@ func (x *FDTable) StateSave(m state.Sink) {
 	x.beforeSave()
 	var descriptorTable map[int32]descriptor = x.saveDescriptorTable()
 	m.SaveValue(4, descriptorTable)
-	m.Save(0, &x.AtomicRefCount)
+	m.Save(0, &x.FDTableRefs)
 	m.Save(1, &x.k)
 	m.Save(2, &x.next)
 	m.Save(3, &x.used)
@@ -145,11 +145,34 @@ func (x *FDTable) StateSave(m state.Sink) {
 func (x *FDTable) afterLoad() {}
 
 func (x *FDTable) StateLoad(m state.Source) {
-	m.Load(0, &x.AtomicRefCount)
+	m.Load(0, &x.FDTableRefs)
 	m.Load(1, &x.k)
 	m.Load(2, &x.next)
 	m.Load(3, &x.used)
 	m.LoadValue(4, new(map[int32]descriptor), func(y interface{}) { x.loadDescriptorTable(y.(map[int32]descriptor)) })
+}
+
+func (x *FDTableRefs) StateTypeName() string {
+	return "pkg/sentry/kernel.FDTableRefs"
+}
+
+func (x *FDTableRefs) StateFields() []string {
+	return []string{
+		"refCount",
+	}
+}
+
+func (x *FDTableRefs) beforeSave() {}
+
+func (x *FDTableRefs) StateSave(m state.Sink) {
+	x.beforeSave()
+	m.Save(0, &x.refCount)
+}
+
+func (x *FDTableRefs) afterLoad() {}
+
+func (x *FDTableRefs) StateLoad(m state.Source) {
+	m.Load(0, &x.refCount)
 }
 
 func (x *FSContext) StateTypeName() string {
@@ -158,7 +181,7 @@ func (x *FSContext) StateTypeName() string {
 
 func (x *FSContext) StateFields() []string {
 	return []string{
-		"AtomicRefCount",
+		"FSContextRefs",
 		"root",
 		"rootVFS2",
 		"cwd",
@@ -171,7 +194,7 @@ func (x *FSContext) beforeSave() {}
 
 func (x *FSContext) StateSave(m state.Sink) {
 	x.beforeSave()
-	m.Save(0, &x.AtomicRefCount)
+	m.Save(0, &x.FSContextRefs)
 	m.Save(1, &x.root)
 	m.Save(2, &x.rootVFS2)
 	m.Save(3, &x.cwd)
@@ -182,12 +205,35 @@ func (x *FSContext) StateSave(m state.Sink) {
 func (x *FSContext) afterLoad() {}
 
 func (x *FSContext) StateLoad(m state.Source) {
-	m.Load(0, &x.AtomicRefCount)
+	m.Load(0, &x.FSContextRefs)
 	m.Load(1, &x.root)
 	m.Load(2, &x.rootVFS2)
 	m.Load(3, &x.cwd)
 	m.Load(4, &x.cwdVFS2)
 	m.Load(5, &x.umask)
+}
+
+func (x *FSContextRefs) StateTypeName() string {
+	return "pkg/sentry/kernel.FSContextRefs"
+}
+
+func (x *FSContextRefs) StateFields() []string {
+	return []string{
+		"refCount",
+	}
+}
+
+func (x *FSContextRefs) beforeSave() {}
+
+func (x *FSContextRefs) StateSave(m state.Sink) {
+	x.beforeSave()
+	m.Save(0, &x.refCount)
+}
+
+func (x *FSContextRefs) afterLoad() {}
+
+func (x *FSContextRefs) StateLoad(m state.Source) {
+	m.Load(0, &x.refCount)
 }
 
 func (x *IPCNamespace) StateTypeName() string {
@@ -643,6 +689,29 @@ func (x *processGroupEntry) StateLoad(m state.Source) {
 	m.Load(1, &x.prev)
 }
 
+func (x *ProcessGroupRefs) StateTypeName() string {
+	return "pkg/sentry/kernel.ProcessGroupRefs"
+}
+
+func (x *ProcessGroupRefs) StateFields() []string {
+	return []string{
+		"refCount",
+	}
+}
+
+func (x *ProcessGroupRefs) beforeSave() {}
+
+func (x *ProcessGroupRefs) StateSave(m state.Sink) {
+	x.beforeSave()
+	m.Save(0, &x.refCount)
+}
+
+func (x *ProcessGroupRefs) afterLoad() {}
+
+func (x *ProcessGroupRefs) StateLoad(m state.Source) {
+	m.Load(0, &x.refCount)
+}
+
 func (x *ptraceOptions) StateTypeName() string {
 	return "pkg/sentry/kernel.ptraceOptions"
 }
@@ -794,13 +863,36 @@ func (x *sessionEntry) StateLoad(m state.Source) {
 	m.Load(1, &x.prev)
 }
 
+func (x *SessionRefs) StateTypeName() string {
+	return "pkg/sentry/kernel.SessionRefs"
+}
+
+func (x *SessionRefs) StateFields() []string {
+	return []string{
+		"refCount",
+	}
+}
+
+func (x *SessionRefs) beforeSave() {}
+
+func (x *SessionRefs) StateSave(m state.Sink) {
+	x.beforeSave()
+	m.Save(0, &x.refCount)
+}
+
+func (x *SessionRefs) afterLoad() {}
+
+func (x *SessionRefs) StateLoad(m state.Source) {
+	m.Load(0, &x.refCount)
+}
+
 func (x *Session) StateTypeName() string {
 	return "pkg/sentry/kernel.Session"
 }
 
 func (x *Session) StateFields() []string {
 	return []string{
-		"refs",
+		"SessionRefs",
 		"leader",
 		"id",
 		"foreground",
@@ -813,7 +905,7 @@ func (x *Session) beforeSave() {}
 
 func (x *Session) StateSave(m state.Sink) {
 	x.beforeSave()
-	m.Save(0, &x.refs)
+	m.Save(0, &x.SessionRefs)
 	m.Save(1, &x.leader)
 	m.Save(2, &x.id)
 	m.Save(3, &x.foreground)
@@ -824,7 +916,7 @@ func (x *Session) StateSave(m state.Sink) {
 func (x *Session) afterLoad() {}
 
 func (x *Session) StateLoad(m state.Source) {
-	m.Load(0, &x.refs)
+	m.Load(0, &x.SessionRefs)
 	m.Load(1, &x.leader)
 	m.Load(2, &x.id)
 	m.Load(3, &x.foreground)
@@ -1061,6 +1153,7 @@ func (x *Task) StateFields() []string {
 		"rseqSignature",
 		"robustList",
 		"startTime",
+		"kcov",
 	}
 }
 
@@ -1134,6 +1227,7 @@ func (x *Task) StateSave(m state.Sink) {
 	m.Save(58, &x.rseqSignature)
 	m.Save(59, &x.robustList)
 	m.Save(60, &x.startTime)
+	m.Save(61, &x.kcov)
 }
 
 func (x *Task) StateLoad(m state.Source) {
@@ -1196,6 +1290,7 @@ func (x *Task) StateLoad(m state.Source) {
 	m.Load(58, &x.rseqSignature)
 	m.Load(59, &x.robustList)
 	m.Load(60, &x.startTime)
+	m.Load(61, &x.kcov)
 	m.LoadValue(31, new(*Task), func(y interface{}) { x.loadPtraceTracer(y.(*Task)) })
 	m.LoadValue(47, new([]bpf.Program), func(y interface{}) { x.loadSyscallFilters(y.([]bpf.Program)) })
 	m.AfterLoad(x.afterLoad)
@@ -2164,7 +2259,9 @@ func init() {
 	state.Register((*FDFlags)(nil))
 	state.Register((*descriptor)(nil))
 	state.Register((*FDTable)(nil))
+	state.Register((*FDTableRefs)(nil))
 	state.Register((*FSContext)(nil))
+	state.Register((*FSContextRefs)(nil))
 	state.Register((*IPCNamespace)(nil))
 	state.Register((*Kernel)(nil))
 	state.Register((*SocketEntry)(nil))
@@ -2177,11 +2274,13 @@ func init() {
 	state.Register((*IntervalTimer)(nil))
 	state.Register((*processGroupList)(nil))
 	state.Register((*processGroupEntry)(nil))
+	state.Register((*ProcessGroupRefs)(nil))
 	state.Register((*ptraceOptions)(nil))
 	state.Register((*ptraceStop)(nil))
 	state.Register((*OldRSeqCriticalRegion)(nil))
 	state.Register((*sessionList)(nil))
 	state.Register((*sessionEntry)(nil))
+	state.Register((*SessionRefs)(nil))
 	state.Register((*Session)(nil))
 	state.Register((*ProcessGroup)(nil))
 	state.Register((*SignalHandlers)(nil))

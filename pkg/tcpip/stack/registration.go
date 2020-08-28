@@ -249,8 +249,8 @@ type NetworkEndpoint interface {
 	MaxHeaderLength() uint16
 
 	// WritePacket writes a packet to the given destination address and
-	// protocol. It takes ownership of pkt. pkt.TransportHeader must have already
-	// been set.
+	// protocol. It takes ownership of pkt. pkt.TransportHeader must have
+	// already been set.
 	WritePacket(r *Route, gso *GSO, params NetworkHeaderParams, pkt *PacketBuffer) *tcpip.Error
 
 	// WritePackets writes packets to the given destination address and
@@ -261,12 +261,6 @@ type NetworkEndpoint interface {
 	// WriteHeaderIncludedPacket writes a packet that includes a network
 	// header to the given destination address. It takes ownership of pkt.
 	WriteHeaderIncludedPacket(r *Route, pkt *PacketBuffer) *tcpip.Error
-
-	// ID returns the network protocol endpoint ID.
-	ID() *NetworkEndpointID
-
-	// PrefixLen returns the network endpoint's subnet prefix length in bits.
-	PrefixLen() int
 
 	// NICID returns the id of the NIC this endpoint belongs to.
 	NICID() tcpip.NICID
@@ -304,7 +298,7 @@ type NetworkProtocol interface {
 	ParseAddresses(v buffer.View) (src, dst tcpip.Address)
 
 	// NewEndpoint creates a new endpoint of this protocol.
-	NewEndpoint(nicID tcpip.NICID, addrWithPrefix tcpip.AddressWithPrefix, linkAddrCache LinkAddressCache, dispatcher TransportDispatcher, sender LinkEndpoint, st *Stack) (NetworkEndpoint, *tcpip.Error)
+	NewEndpoint(nicID tcpip.NICID, linkAddrCache LinkAddressCache, nud NUDHandler, dispatcher TransportDispatcher, sender LinkEndpoint, st *Stack) NetworkEndpoint
 
 	// SetOption allows enabling/disabling protocol specific features.
 	// SetOption returns an error if the option is not supported or the
@@ -494,7 +488,7 @@ type LinkAddressResolver interface {
 	ResolveStaticAddress(addr tcpip.Address) (tcpip.LinkAddress, bool)
 
 	// LinkAddressProtocol returns the network protocol of the
-	// addresses this this resolver can resolve.
+	// addresses this resolver can resolve.
 	LinkAddressProtocol() tcpip.NetworkProtocolNumber
 }
 

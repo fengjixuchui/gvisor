@@ -53,10 +53,9 @@ func IsCanonical(addr uint64) bool {
 
 //go:nosplit
 func (c *CPU) SwitchToUser(switchOpts SwitchOpts) (vector Vector) {
-	// Sanitize registers.
 	regs := switchOpts.Registers
 
-	regs.Pstate &= ^uint64(UserFlagsClear)
+	regs.Pstate &= ^uint64(PsrFlagsClear)
 	regs.Pstate |= UserFlagsSet
 
 	LoadFloatingPoint(switchOpts.FloatingPointState)
@@ -69,6 +68,5 @@ func (c *CPU) SwitchToUser(switchOpts SwitchOpts) (vector Vector) {
 
 	vector = c.vecCode
 
-	// Perform the switch.
 	return
 }

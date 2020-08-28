@@ -30,7 +30,7 @@ import (
 // _OVL_XATTR_OPAQUE is an extended attribute key whose value is set to "y" for
 // opaque directories.
 // Linux: fs/overlayfs/overlayfs.h:OVL_XATTR_OPAQUE
-const _OVL_XATTR_OPAQUE = "trusted.overlay.opaque"
+const _OVL_XATTR_OPAQUE = linux.XATTR_TRUSTED_PREFIX + "overlay.opaque"
 
 func isWhiteout(stat *linux.Statx) bool {
 	return stat.Mode&linux.S_IFMT == linux.S_IFCHR && stat.RdevMajor == 0 && stat.RdevMinor == 0
@@ -110,8 +110,10 @@ func (fs *filesystem) renameMuUnlockAndCheckDrop(ctx context.Context, ds **[]*de
 // Dentries which may have a reference count of zero, and which therefore
 // should be dropped once traversal is complete, are appended to ds.
 //
-// Preconditions: fs.renameMu must be locked. d.dirMu must be locked.
-// !rp.Done().
+// Preconditions:
+// * fs.renameMu must be locked.
+// * d.dirMu must be locked.
+// * !rp.Done().
 func (fs *filesystem) stepLocked(ctx context.Context, rp *vfs.ResolvingPath, d *dentry, mayFollowSymlinks bool, ds **[]*dentry) (*dentry, error) {
 	if !d.isDir() {
 		return nil, syserror.ENOTDIR
@@ -159,7 +161,9 @@ afterSymlink:
 	return child, nil
 }
 
-// Preconditions: fs.renameMu must be locked. d.dirMu must be locked.
+// Preconditions:
+// * fs.renameMu must be locked.
+// * d.dirMu must be locked.
 func (fs *filesystem) getChildLocked(ctx context.Context, parent *dentry, name string, ds **[]*dentry) (*dentry, error) {
 	if child, ok := parent.children[name]; ok {
 		return child, nil
@@ -177,7 +181,9 @@ func (fs *filesystem) getChildLocked(ctx context.Context, parent *dentry, name s
 	return child, nil
 }
 
-// Preconditions: fs.renameMu must be locked. parent.dirMu must be locked.
+// Preconditions:
+// * fs.renameMu must be locked.
+// * parent.dirMu must be locked.
 func (fs *filesystem) lookupLocked(ctx context.Context, parent *dentry, name string) (*dentry, error) {
 	childPath := fspath.Parse(name)
 	child := fs.newDentry()
@@ -300,7 +306,9 @@ func (fs *filesystem) lookupLocked(ctx context.Context, parent *dentry, name str
 // lookupLayerLocked is similar to lookupLocked, but only returns information
 // about the file rather than a dentry.
 //
-// Preconditions: fs.renameMu must be locked. parent.dirMu must be locked.
+// Preconditions:
+// * fs.renameMu must be locked.
+// * parent.dirMu must be locked.
 func (fs *filesystem) lookupLayerLocked(ctx context.Context, parent *dentry, name string) (lookupLayer, error) {
 	childPath := fspath.Parse(name)
 	lookupLayer := lookupLayerNone
@@ -385,7 +393,9 @@ func (ll lookupLayer) existsInOverlay() bool {
 // rp.Start().Impl().(*dentry)). It does not check that the returned directory
 // is searchable by the provider of rp.
 //
-// Preconditions: fs.renameMu must be locked. !rp.Done().
+// Preconditions:
+// * fs.renameMu must be locked.
+// * !rp.Done().
 func (fs *filesystem) walkParentDirLocked(ctx context.Context, rp *vfs.ResolvingPath, d *dentry, ds **[]*dentry) (*dentry, error) {
 	for !rp.Final() {
 		d.dirMu.Lock()
@@ -425,8 +435,9 @@ func (fs *filesystem) resolveLocked(ctx context.Context, rp *vfs.ResolvingPath, 
 // doCreateAt checks that creating a file at rp is permitted, then invokes
 // create to do so.
 //
-// Preconditions: !rp.Done(). For the final path component in rp,
-// !rp.ShouldFollowSymlink().
+// Preconditions:
+// * !rp.Done().
+// * For the final path component in rp, !rp.ShouldFollowSymlink().
 func (fs *filesystem) doCreateAt(ctx context.Context, rp *vfs.ResolvingPath, dir bool, create func(parent *dentry, name string, haveUpperWhiteout bool) error) error {
 	var ds *[]*dentry
 	fs.renameMu.RLock()
@@ -717,17 +728,33 @@ func (fs *filesystem) MknodAt(ctx context.Context, rp *vfs.ResolvingPath, opts v
 func (fs *filesystem) OpenAt(ctx context.Context, rp *vfs.ResolvingPath, opts vfs.OpenOptions) (*vfs.FileDescription, error) {
 	mayCreate := opts.Flags&linux.O_CREAT != 0
 	mustCreate := opts.Flags&(linux.O_CREAT|linux.O_EXCL) == (linux.O_CREAT | linux.O_EXCL)
+	mayWrite := vfs.AccessTypesForOpenFlags(&opts).MayWrite()
 
 	var ds *[]*dentry
 	fs.renameMu.RLock()
-	defer fs.renameMuRUnlockAndCheckDrop(ctx, &ds)
+	unlocked := false
+	unlock := func() {
+		if !unlocked {
+			fs.renameMuRUnlockAndCheckDrop(ctx, &ds)
+			unlocked = true
+		}
+	}
+	defer unlock()
 
 	start := rp.Start().Impl().(*dentry)
 	if rp.Done() {
 		if mustCreate {
 			return nil, syserror.EEXIST
 		}
-		return start.openLocked(ctx, rp, &opts)
+		if mayWrite {
+			if err := start.copyUpLocked(ctx); err != nil {
+				return nil, err
+			}
+		}
+		start.IncRef()
+		defer start.DecRef(ctx)
+		unlock()
+		return start.openCopiedUp(ctx, rp, &opts)
 	}
 
 afterTrailingSymlink:
@@ -767,19 +794,23 @@ afterTrailingSymlink:
 		start = parent
 		goto afterTrailingSymlink
 	}
-	return child.openLocked(ctx, rp, &opts)
+	if mayWrite {
+		if err := child.copyUpLocked(ctx); err != nil {
+			return nil, err
+		}
+	}
+	child.IncRef()
+	defer child.DecRef(ctx)
+	unlock()
+	return child.openCopiedUp(ctx, rp, &opts)
 }
 
-// Preconditions: fs.renameMu must be locked.
-func (d *dentry) openLocked(ctx context.Context, rp *vfs.ResolvingPath, opts *vfs.OpenOptions) (*vfs.FileDescription, error) {
+// Preconditions: If vfs.AccessTypesForOpenFlags(opts).MayWrite(), then d has
+// been copied up.
+func (d *dentry) openCopiedUp(ctx context.Context, rp *vfs.ResolvingPath, opts *vfs.OpenOptions) (*vfs.FileDescription, error) {
 	ats := vfs.AccessTypesForOpenFlags(opts)
 	if err := d.checkPermissions(rp.Credentials(), ats); err != nil {
 		return nil, err
-	}
-	if ats.MayWrite() {
-		if err := d.copyUpLocked(ctx); err != nil {
-			return nil, err
-		}
 	}
 	mnt := rp.Mount()
 
@@ -792,7 +823,7 @@ func (d *dentry) openLocked(ctx context.Context, rp *vfs.ResolvingPath, opts *vf
 			return nil, syserror.EISDIR
 		}
 		// Can't open directories writably.
-		if ats&vfs.MayWrite != 0 {
+		if ats.MayWrite() {
 			return nil, syserror.EISDIR
 		}
 		if opts.Flags&linux.O_DIRECT != 0 {
@@ -831,8 +862,9 @@ func (d *dentry) openLocked(ctx context.Context, rp *vfs.ResolvingPath, opts *vf
 	return &fd.vfsfd, nil
 }
 
-// Preconditions: parent.dirMu must be locked. parent does not already contain
-// a child named rp.Component().
+// Preconditions:
+// * parent.dirMu must be locked.
+// * parent does not already contain a child named rp.Component().
 func (fs *filesystem) createAndOpenLocked(ctx context.Context, rp *vfs.ResolvingPath, parent *dentry, opts *vfs.OpenOptions, ds **[]*dentry) (*vfs.FileDescription, error) {
 	creds := rp.Credentials()
 	if err := parent.checkPermissions(creds, vfs.MayWrite); err != nil {
