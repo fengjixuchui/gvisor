@@ -673,11 +673,11 @@ func (fs *filesystem) SetStatAt(ctx context.Context, rp *vfs.ResolvingPath, opts
 		fs.mu.RUnlock()
 		return err
 	}
-	if err := d.inode.setStat(ctx, rp.Credentials(), &opts); err != nil {
-		fs.mu.RUnlock()
+	err = d.inode.setStat(ctx, rp.Credentials(), &opts)
+	fs.mu.RUnlock()
+	if err != nil {
 		return err
 	}
-	fs.mu.RUnlock()
 
 	if ev := vfs.InotifyEventFromStatMask(opts.Stat.Mask); ev != 0 {
 		d.InotifyWithParent(ctx, ev, 0, vfs.InodeEvent)
@@ -770,7 +770,7 @@ func (fs *filesystem) UnlinkAt(ctx context.Context, rp *vfs.ResolvingPath) error
 	return nil
 }
 
-// BoundEndpointAt implements FilesystemImpl.BoundEndpointAt.
+// BoundEndpointAt implements vfs.FilesystemImpl.BoundEndpointAt.
 func (fs *filesystem) BoundEndpointAt(ctx context.Context, rp *vfs.ResolvingPath, opts vfs.BoundEndpointOptions) (transport.BoundEndpoint, error) {
 	fs.mu.RLock()
 	defer fs.mu.RUnlock()
@@ -792,59 +792,59 @@ func (fs *filesystem) BoundEndpointAt(ctx context.Context, rp *vfs.ResolvingPath
 	}
 }
 
-// ListxattrAt implements vfs.FilesystemImpl.ListxattrAt.
-func (fs *filesystem) ListxattrAt(ctx context.Context, rp *vfs.ResolvingPath, size uint64) ([]string, error) {
+// ListXattrAt implements vfs.FilesystemImpl.ListXattrAt.
+func (fs *filesystem) ListXattrAt(ctx context.Context, rp *vfs.ResolvingPath, size uint64) ([]string, error) {
 	fs.mu.RLock()
 	defer fs.mu.RUnlock()
 	d, err := resolveLocked(ctx, rp)
 	if err != nil {
 		return nil, err
 	}
-	return d.inode.listxattr(size)
+	return d.inode.listXattr(size)
 }
 
-// GetxattrAt implements vfs.FilesystemImpl.GetxattrAt.
-func (fs *filesystem) GetxattrAt(ctx context.Context, rp *vfs.ResolvingPath, opts vfs.GetxattrOptions) (string, error) {
+// GetXattrAt implements vfs.FilesystemImpl.GetXattrAt.
+func (fs *filesystem) GetXattrAt(ctx context.Context, rp *vfs.ResolvingPath, opts vfs.GetXattrOptions) (string, error) {
 	fs.mu.RLock()
 	defer fs.mu.RUnlock()
 	d, err := resolveLocked(ctx, rp)
 	if err != nil {
 		return "", err
 	}
-	return d.inode.getxattr(rp.Credentials(), &opts)
+	return d.inode.getXattr(rp.Credentials(), &opts)
 }
 
-// SetxattrAt implements vfs.FilesystemImpl.SetxattrAt.
-func (fs *filesystem) SetxattrAt(ctx context.Context, rp *vfs.ResolvingPath, opts vfs.SetxattrOptions) error {
+// SetXattrAt implements vfs.FilesystemImpl.SetXattrAt.
+func (fs *filesystem) SetXattrAt(ctx context.Context, rp *vfs.ResolvingPath, opts vfs.SetXattrOptions) error {
 	fs.mu.RLock()
 	d, err := resolveLocked(ctx, rp)
 	if err != nil {
 		fs.mu.RUnlock()
 		return err
 	}
-	if err := d.inode.setxattr(rp.Credentials(), &opts); err != nil {
-		fs.mu.RUnlock()
+	err = d.inode.setXattr(rp.Credentials(), &opts)
+	fs.mu.RUnlock()
+	if err != nil {
 		return err
 	}
-	fs.mu.RUnlock()
 
 	d.InotifyWithParent(ctx, linux.IN_ATTRIB, 0, vfs.InodeEvent)
 	return nil
 }
 
-// RemovexattrAt implements vfs.FilesystemImpl.RemovexattrAt.
-func (fs *filesystem) RemovexattrAt(ctx context.Context, rp *vfs.ResolvingPath, name string) error {
+// RemoveXattrAt implements vfs.FilesystemImpl.RemoveXattrAt.
+func (fs *filesystem) RemoveXattrAt(ctx context.Context, rp *vfs.ResolvingPath, name string) error {
 	fs.mu.RLock()
 	d, err := resolveLocked(ctx, rp)
 	if err != nil {
 		fs.mu.RUnlock()
 		return err
 	}
-	if err := d.inode.removexattr(rp.Credentials(), name); err != nil {
-		fs.mu.RUnlock()
+	err = d.inode.removeXattr(rp.Credentials(), name)
+	fs.mu.RUnlock()
+	if err != nil {
 		return err
 	}
-	fs.mu.RUnlock()
 
 	d.InotifyWithParent(ctx, linux.IN_ATTRIB, 0, vfs.InodeEvent)
 	return nil
@@ -865,8 +865,16 @@ func (fs *filesystem) PrependPath(ctx context.Context, vfsroot, vd vfs.VirtualDe
 		}
 		if d.parent == nil {
 			if d.name != "" {
-				// This must be an anonymous memfd file.
+				// This file must have been created by
+				// newUnlinkedRegularFileDescription(). In Linux,
+				// mm/shmem.c:__shmem_file_setup() =>
+				// fs/file_table.c:alloc_file_pseudo() sets the created
+				// dentry's dentry_operations to anon_ops, for which d_dname ==
+				// simple_dname. fs/d_path.c:simple_dname() defines the
+				// dentry's pathname to be its name, prefixed with "/" and
+				// suffixed with " (deleted)".
 				b.PrependComponent("/" + d.name)
+				b.AppendString(" (deleted)")
 				return vfs.PrependPathSyntheticError{}
 			}
 			return vfs.PrependPathAtNonMountRootError{}

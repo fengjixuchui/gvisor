@@ -14,91 +14,97 @@
 package network
 
 import (
-	"context"
 	"fmt"
 	"testing"
 
 	"gvisor.dev/gvisor/pkg/test/dockerutil"
-	"gvisor.dev/gvisor/test/benchmarks/harness"
 	"gvisor.dev/gvisor/test/benchmarks/tools"
 )
 
+// see Dockerfile '//images/benchmarks/nginx'.
+var nginxDocs = map[string]string{
+	"notfound": "notfound",
+	"1Kb":      "latin1k.txt",
+	"10Kb":     "latin10k.txt",
+	"100Kb":    "latin100k.txt",
+	"1Mb":      "latin1024k.txt",
+	"10Mb":     "latin10240k.txt",
+}
+
 // BenchmarkNginxConcurrency iterates the concurrency argument and tests
 // how well the runtime under test handles requests in parallel.
-// TODO(gvisor.dev/issue/3536): Update with different doc sizes like Httpd.
 func BenchmarkNginxConcurrency(b *testing.B) {
-	// Grab a machine for the client and server.
-	clientMachine, err := h.GetMachine()
-	if err != nil {
-		b.Fatalf("failed to get client: %v", err)
-	}
-	defer clientMachine.CleanUp()
-
-	serverMachine, err := h.GetMachine()
-	if err != nil {
-		b.Fatalf("failed to get server: %v", err)
-	}
-	defer serverMachine.CleanUp()
-
-	concurrency := []int{1, 5, 10, 25}
+	concurrency := []int{1, 25, 100, 1000}
 	for _, c := range concurrency {
-		b.Run(fmt.Sprintf("%d", c), func(b *testing.B) {
-			hey := &tools.Hey{
-				Requests:    10000,
-				Concurrency: c,
+		for _, tmpfs := range []bool{true, false} {
+			fs := "Gofer"
+			if tmpfs {
+				fs = "Tmpfs"
 			}
-			runNginx(b, clientMachine, serverMachine, hey)
-		})
+			name := fmt.Sprintf("%d_%s", c, fs)
+			b.Run(name, func(b *testing.B) {
+				hey := &tools.Hey{
+					Requests:    c * b.N,
+					Concurrency: c,
+					Doc:         nginxDocs["10kb"], // see Dockerfile '//images/benchmarks/nginx' and httpd_test.
+				}
+				runNginx(b, hey, false /* reverse */, tmpfs /* tmpfs */)
+			})
+		}
+
 	}
 }
 
-// runHttpd runs a single test run.
-func runNginx(b *testing.B, clientMachine, serverMachine harness.Machine, hey *tools.Hey) {
-	b.Helper()
+// BenchmarkNginxDocSize iterates over different sized payloads, testing how
+// well the runtime handles sending different payload sizes.
+func BenchmarkNginxDocSize(b *testing.B) {
+	benchmarkNginxDocSize(b, false /* reverse */, true /* tmpfs */)
+	benchmarkNginxDocSize(b, false /* reverse */, false /* tmpfs */)
+}
 
-	// Grab a container from the server.
-	ctx := context.Background()
-	server := serverMachine.GetContainer(ctx, b)
-	defer server.CleanUp(ctx)
+// BenchmarkReverseNginxDocSize iterates over different sized payloads, testing
+// how well the runtime handles receiving different payload sizes.
+func BenchmarkReverseNginxDocSize(b *testing.B) {
+	benchmarkNginxDocSize(b, true /* reverse */, true /* tmpfs */)
+}
 
-	port := 80
-	// Start the server.
-	if err := server.Spawn(ctx,
-		dockerutil.RunOpts{
-			Image: "benchmarks/nginx",
-			Ports: []int{port},
-		}); err != nil {
-		b.Fatalf("server failed to start: %v", err)
-	}
-
-	ip, err := serverMachine.IPAddress()
-	if err != nil {
-		b.Fatalf("failed to find server ip: %v", err)
-	}
-
-	servingPort, err := server.FindPort(ctx, port)
-	if err != nil {
-		b.Fatalf("failed to find server port %d: %v", port, err)
-	}
-
-	// Check the server is serving.
-	harness.WaitUntilServing(ctx, clientMachine, ip, servingPort)
-
-	// Grab a client.
-	client := clientMachine.GetNativeContainer(ctx, b)
-	defer client.CleanUp(ctx)
-
-	b.ResetTimer()
-	server.RestartProfiles()
-	for i := 0; i < b.N; i++ {
-		out, err := client.Run(ctx, dockerutil.RunOpts{
-			Image: "benchmarks/hey",
-		}, hey.MakeCmd(ip, servingPort)...)
-		if err != nil {
-			b.Fatalf("run failed with: %v", err)
+// benchmarkNginxDocSize iterates through all doc sizes, running subbenchmarks
+// for each size.
+func benchmarkNginxDocSize(b *testing.B, reverse, tmpfs bool) {
+	for name, filename := range nginxDocs {
+		concurrency := []int{1, 25, 50, 100, 1000}
+		for _, c := range concurrency {
+			fs := "Gofer"
+			if tmpfs {
+				fs = "Tmpfs"
+			}
+			benchName := fmt.Sprintf("%s_%d_%s", name, c, fs)
+			b.Run(benchName, func(b *testing.B) {
+				hey := &tools.Hey{
+					Requests:    c * b.N,
+					Concurrency: c,
+					Doc:         filename,
+				}
+				runNginx(b, hey, reverse, tmpfs)
+			})
 		}
-		b.StopTimer()
-		hey.Report(b, out)
-		b.StartTimer()
 	}
+}
+
+// runNginx configures the static serving methods to run httpd.
+func runNginx(b *testing.B, hey *tools.Hey, reverse, tmpfs bool) {
+	// nginx runs on port 80.
+	port := 80
+	nginxRunOpts := dockerutil.RunOpts{
+		Image: "benchmarks/nginx",
+		Ports: []int{port},
+	}
+
+	nginxCmd := []string{"nginx", "-c", "/etc/nginx/nginx_gofer.conf"}
+	if tmpfs {
+		nginxCmd = []string{"sh", "-c", "mkdir -p /tmp/html && cp -a /local/* /tmp/html && nginx -c /etc/nginx/nginx.conf"}
+	}
+
+	// Command copies nginxDocs to tmpfs serving directory and runs nginx.
+	runStaticServer(b, nginxRunOpts, nginxCmd, port, hey, reverse)
 }

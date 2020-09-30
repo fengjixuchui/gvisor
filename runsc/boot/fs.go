@@ -34,6 +34,7 @@ import (
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/context"
+	"gvisor.dev/gvisor/pkg/fd"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/sentry/fs"
 	"gvisor.dev/gvisor/pkg/sentry/fs/gofer"
@@ -253,7 +254,7 @@ func mustFindFilesystem(name string) fs.Filesystem {
 
 // addSubmountOverlay overlays the inode over a ramfs tree containing the given
 // paths.
-func addSubmountOverlay(ctx context.Context, inode *fs.Inode, submounts []string) (*fs.Inode, error) {
+func addSubmountOverlay(ctx context.Context, inode *fs.Inode, submounts []string, mf fs.MountSourceFlags) (*fs.Inode, error) {
 	// Construct a ramfs tree of mount points. The contents never
 	// change, so this can be fully caching. There's no real
 	// filesystem backing this tree, so we set the filesystem to
@@ -263,7 +264,7 @@ func addSubmountOverlay(ctx context.Context, inode *fs.Inode, submounts []string
 	if err != nil {
 		return nil, fmt.Errorf("creating mount tree: %v", err)
 	}
-	overlayInode, err := fs.NewOverlayRoot(ctx, inode, mountTree, fs.MountSourceFlags{})
+	overlayInode, err := fs.NewOverlayRoot(ctx, inode, mountTree, mf)
 	if err != nil {
 		return nil, fmt.Errorf("adding mount overlay: %v", err)
 	}
@@ -320,14 +321,14 @@ func adjustDirentCache(k *kernel.Kernel) error {
 }
 
 type fdDispenser struct {
-	fds []int
+	fds []*fd.FD
 }
 
 func (f *fdDispenser) remove() int {
 	if f.empty() {
 		panic("fdDispenser out of fds")
 	}
-	rv := f.fds[0]
+	rv := f.fds[0].Release()
 	f.fds = f.fds[1:]
 	return rv
 }
@@ -453,17 +454,17 @@ func (m *mountHint) isSupported() bool {
 func (m *mountHint) checkCompatible(mount specs.Mount) error {
 	// Remove options that don't affect to mount's behavior.
 	masterOpts := filterUnsupportedOptions(m.mount)
-	slaveOpts := filterUnsupportedOptions(mount)
+	replicaOpts := filterUnsupportedOptions(mount)
 
-	if len(masterOpts) != len(slaveOpts) {
-		return fmt.Errorf("mount options in annotations differ from container mount, annotation: %s, mount: %s", masterOpts, slaveOpts)
+	if len(masterOpts) != len(replicaOpts) {
+		return fmt.Errorf("mount options in annotations differ from container mount, annotation: %s, mount: %s", masterOpts, replicaOpts)
 	}
 
 	sort.Strings(masterOpts)
-	sort.Strings(slaveOpts)
+	sort.Strings(replicaOpts)
 	for i, opt := range masterOpts {
-		if opt != slaveOpts[i] {
-			return fmt.Errorf("mount options in annotations differ from container mount, annotation: %s, mount: %s", masterOpts, slaveOpts)
+		if opt != replicaOpts[i] {
+			return fmt.Errorf("mount options in annotations differ from container mount, annotation: %s, mount: %s", masterOpts, replicaOpts)
 		}
 	}
 	return nil
@@ -564,7 +565,7 @@ type containerMounter struct {
 	hints *podMountHints
 }
 
-func newContainerMounter(spec *specs.Spec, goferFDs []int, k *kernel.Kernel, hints *podMountHints) *containerMounter {
+func newContainerMounter(spec *specs.Spec, goferFDs []*fd.FD, k *kernel.Kernel, hints *podMountHints) *containerMounter {
 	return &containerMounter{
 		root:   spec.Root,
 		mounts: compileMounts(spec),
@@ -740,7 +741,7 @@ func (c *containerMounter) createRootMount(ctx context.Context, conf *config.Con
 	// for submount paths.  "/dev" "/sys" "/proc" and "/tmp" are always
 	// mounted even if they are not in the spec.
 	submounts := append(subtargets("/", c.mounts), "/dev", "/sys", "/proc", "/tmp")
-	rootInode, err = addSubmountOverlay(ctx, rootInode, submounts)
+	rootInode, err = addSubmountOverlay(ctx, rootInode, submounts, mf)
 	if err != nil {
 		return nil, fmt.Errorf("adding submount overlay: %v", err)
 	}
@@ -850,7 +851,7 @@ func (c *containerMounter) mountSubmount(ctx context.Context, conf *config.Confi
 	submounts := subtargets(m.Destination, c.mounts)
 	if len(submounts) > 0 {
 		log.Infof("Adding submount overlay over %q", m.Destination)
-		inode, err = addSubmountOverlay(ctx, inode, submounts)
+		inode, err = addSubmountOverlay(ctx, inode, submounts, mf)
 		if err != nil {
 			return fmt.Errorf("adding submount overlay: %v", err)
 		}

@@ -39,11 +39,12 @@ func (d *dentry) isRegularFile() bool {
 	return d.fileType() == linux.S_IFREG
 }
 
+// +stateify savable
 type regularFileFD struct {
 	fileDescription
 
 	// off is the file offset. off is protected by mu.
-	mu  sync.Mutex
+	mu  sync.Mutex `state:"nosave"`
 	off int64
 }
 
@@ -79,28 +80,11 @@ func (fd *regularFileFD) OnClose(ctx context.Context) error {
 // Allocate implements vfs.FileDescriptionImpl.Allocate.
 func (fd *regularFileFD) Allocate(ctx context.Context, mode, offset, length uint64) error {
 	d := fd.dentry()
-	d.metadataMu.Lock()
-	defer d.metadataMu.Unlock()
-
-	// Allocating a smaller size is a noop.
-	size := offset + length
-	if d.cachedMetadataAuthoritative() && size <= d.size {
-		return nil
-	}
-
-	d.handleMu.RLock()
-	err := d.writeFile.allocate(ctx, p9.ToAllocateMode(mode), offset, length)
-	d.handleMu.RUnlock()
-	if err != nil {
-		return err
-	}
-	d.dataMu.Lock()
-	atomic.StoreUint64(&d.size, size)
-	d.dataMu.Unlock()
-	if d.cachedMetadataAuthoritative() {
-		d.touchCMtimeLocked()
-	}
-	return nil
+	return d.doAllocate(ctx, offset, length, func() error {
+		d.handleMu.RLock()
+		defer d.handleMu.RUnlock()
+		return d.writeFile.allocate(ctx, p9.ToAllocateMode(mode), offset, length)
+	})
 }
 
 // PRead implements vfs.FileDescriptionImpl.PRead.
@@ -915,6 +899,8 @@ func (d *dentry) Evict(ctx context.Context, er pgalloc.EvictableRange) {
 // dentryPlatformFile is only used when a host FD representing the remote file
 // is available (i.e. dentry.hostFD >= 0), and that FD is used for application
 // memory mappings (i.e. !filesystem.opts.forcePageCache).
+//
+// +stateify savable
 type dentryPlatformFile struct {
 	*dentry
 
@@ -927,7 +913,7 @@ type dentryPlatformFile struct {
 	hostFileMapper fsutil.HostFileMapper
 
 	// hostFileMapperInitOnce is used to lazily initialize hostFileMapper.
-	hostFileMapperInitOnce sync.Once
+	hostFileMapperInitOnce sync.Once `state:"nosave"` // FIXME(gvisor.dev/issue/1663): not yet supported.
 }
 
 // IncRef implements memmap.File.IncRef.

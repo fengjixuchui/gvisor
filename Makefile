@@ -121,18 +121,22 @@ smoke-tests: ## Runs a simple smoke test after build runsc.
 	@$(call submake,run DOCKER_PRIVILEGED="" ARGS="--alsologtostderr --network none --debug --TESTONLY-unsafe-nonroot=true --rootless do true")
 .PHONY: smoke-tests
 
+fuse-tests:
+	@$(call submake,test OPTIONS="--test_tag_filters fuse" TARGETS="test/fuse/...")
+.PHONY: fuse-tests
+
 unit-tests: ## Local package unit tests in pkg/..., runsc/, tools/.., etc.
 	@$(call submake,test TARGETS="pkg/... runsc/... tools/...")
+.PHONY: unit-tests
 
 tests: ## Runs all unit tests and syscall tests.
 tests: unit-tests
 	@$(call submake,test TARGETS="test/syscalls/...")
 .PHONY: tests
 
-
 integration-tests: ## Run all standard integration tests.
 integration-tests: docker-tests overlay-tests hostnet-tests swgso-tests
-integration-tests: do-tests kvm-tests root-tests containerd-tests
+integration-tests: do-tests kvm-tests containerd-test-1.3.4
 .PHONY: integration-tests
 
 network-tests: ## Run all networking integration tests.
@@ -156,6 +160,10 @@ syscall-tests: syscall-ptrace-tests syscall-kvm-tests syscall-native-tests
 %-runtime-tests: load-runtimes_%
 	@$(call submake,install-test-runtime)
 	@$(call submake,test-runtime OPTIONS="--test_timeout=10800" TARGETS="//test/runtimes:$*")
+
+%-runtime-tests_vfs2: load-runtimes_%
+	@$(call submake,install-test-runtime RUNTIME="vfs2" ARGS="--vfs2")
+	@$(call submake,test-runtime RUNTIME="vfs2" OPTIONS="--test_timeout=10800" TARGETS="//test/runtimes:$*")
 
 do-tests: runsc
 	@$(call submake,run TARGETS="//runsc" ARGS="--rootless do true")
@@ -182,6 +190,7 @@ swgso-tests: load-basic-images
 	@$(call submake,install-test-runtime RUNTIME="swgso" ARGS="--software-gso=true --gso=false")
 	@$(call submake,test-runtime RUNTIME="swgso" TARGETS="$(INTEGRATION_TARGETS)")
 .PHONY: swgso-tests
+
 hostnet-tests: load-basic-images
 	@$(call submake,install-test-runtime RUNTIME="hostnet" ARGS="--network=host")
 	@$(call submake,test-runtime RUNTIME="hostnet" OPTIONS="--test_arg=-checkpoint=false" TARGETS="$(INTEGRATION_TARGETS)")
@@ -196,6 +205,8 @@ kvm-tests: load-basic-images
 .PHONY: kvm-tests
 
 iptables-tests: load-iptables
+	@sudo modprobe iptable_filter
+	@sudo modprobe ip6table_filter
 	@$(call submake,test-runtime RUNTIME="runc" TARGETS="//test/iptables:iptables_test")
 	@$(call submake,install-test-runtime RUNTIME="iptables" ARGS="--net-raw")
 	@$(call submake,test-runtime RUNTIME="iptables" TARGETS="//test/iptables:iptables_test")
@@ -207,21 +218,18 @@ packetdrill-tests: load-packetdrill
 .PHONY: packetdrill-tests
 
 packetimpact-tests: load-packetimpact
-	@sudo modprobe iptable_filter ip6table_filter
+	@sudo modprobe iptable_filter
+	@sudo modprobe ip6table_filter
 	@$(call submake,install-test-runtime RUNTIME="packetimpact")
 	@$(call submake,test-runtime OPTIONS="--jobs=HOST_CPUS*3 --local_test_jobs=HOST_CPUS*3" RUNTIME="packetimpact" TARGETS="$(shell $(MAKE) query TARGETS='attr(tags, packetimpact, tests(//...))')")
 .PHONY: packetimpact-tests
 
-root-tests: load-basic-images
-	@$(call submake,install-test-runtime)
-	@$(call submake,sudo TARGETS="//test/root:root_test" ARGS="-test.v")
-.PHONY: root-tests
-
 # Specific containerd version tests.
-containerd-test-%: load-basic_alpine load-basic_python load-basic_busybox load-basic_resolv load-basic_httpd install-test-runtime
+containerd-test-%: load-basic_alpine load-basic_python load-basic_busybox load-basic_resolv load-basic_httpd load-basic_ubuntu
+	@$(call submake,install-test-runtime RUNTIME="root")
 	@CONTAINERD_VERSION=$* $(MAKE) sudo TARGETS="tools/installers:containerd"
 	@$(MAKE) sudo TARGETS="tools/installers:shim"
-	@$(MAKE) sudo TARGETS="test/root:root_test" ARGS="-test.v"
+	@$(MAKE) sudo TARGETS="test/root:root_test" ARGS="--runtime=root -test.v"
 
 # Note that we can't run containerd-test-1.1.8 tests here.
 #
@@ -294,8 +302,8 @@ $(RELEASE_KEY):
 	echo Name-Email: test@example.com >> $$C && \
 	echo Expire-Date: 0 >> $$C && \
 	echo %commit >> $$C && \
-	gpg --batch $(GPG_TEST_OPTIONS) --passphrase '' --no-default-keyring --keyring $$T --no-tty --gen-key $$C && \
-	gpg --batch $(GPG_TEST_OPTIONS) --export-secret-keys --no-default-keyring --keyring $$T --secret-keyring $$T > $@; \
+	gpg --batch $(GPG_TEST_OPTIONS) --passphrase '' --no-default-keyring --secret-keyring $$T --no-tty --gen-key $$C && \
+	gpg --batch $(GPG_TEST_OPTIONS) --export-secret-keys --no-default-keyring --secret-keyring $$T > $@; \
 	rc=$$?; rm -f $$T $$C; exit $$rc
 
 release: $(RELEASE_KEY) ## Builds a release.
@@ -371,3 +379,8 @@ configure: ## Configures a single runtime. Requires sudo. Typically called from 
 test-runtime: ## A convenient wrapper around test that provides the runtime argument. Target must still be provided.
 	@$(call submake,test OPTIONS="$(OPTIONS) --test_arg=--runtime=$(RUNTIME)")
 .PHONY: test-runtime
+
+nogo: ## Surfaces all nogo findings.
+	@$(call submake,build OPTIONS="--build_tag_filters nogo" TARGETS="//...")
+	@$(call submake,run TARGETS="//tools/github" ARGS="-path=$(BUILD_ROOT) -dry-run nogo")
+.PHONY: nogo

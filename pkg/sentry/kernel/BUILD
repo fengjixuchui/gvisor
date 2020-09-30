@@ -69,8 +69,8 @@ go_template_instance(
     prefix = "socket",
     template = "//pkg/ilist:generic_list",
     types = {
-        "Element": "*SocketEntry",
-        "Linker": "*SocketEntry",
+        "Element": "*SocketRecordVFS1",
+        "Linker": "*SocketRecordVFS1",
     },
 )
 
@@ -197,6 +197,7 @@ go_library(
         "gvisor.dev/gvisor/pkg/sentry/device",
         "gvisor.dev/gvisor/pkg/tcpip",
     ],
+    marshal = True,
     visibility = ["//:sandbox"],
     deps = [
         ":uncaught_signal_go_proto",
@@ -212,6 +213,8 @@ go_library(
         "//pkg/eventchannel",
         "//pkg/fspath",
         "//pkg/log",
+        "//pkg/marshal",
+        "//pkg/marshal/primitive",
         "//pkg/metric",
         "//pkg/refs",
         "//pkg/refs_vfs2",
@@ -261,7 +264,6 @@ go_library(
         "//pkg/tcpip/stack",
         "//pkg/usermem",
         "//pkg/waiter",
-        "//tools/go_marshal/marshal",
     ],
 )
 

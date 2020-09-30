@@ -19,6 +19,7 @@ SHELL=/bin/bash -o pipefail
 BRANCH_NAME := $(shell (git branch --show-current 2>/dev/null || \
 			git rev-parse --abbrev-ref HEAD 2>/dev/null) | \
 			xargs -n 1 basename 2>/dev/null)
+BUILD_ROOT := $(CURDIR)/bazel-bin/
 
 # Bazel container configuration (see below).
 USER ?= gvisor
@@ -31,6 +32,7 @@ DOCKER_PRIVILEGED ?= --privileged
 BAZEL_CACHE := $(shell readlink -m ~/.cache/bazel/)
 GCLOUD_CONFIG := $(shell readlink -m ~/.config/gcloud/)
 DOCKER_SOCKET := /var/run/docker.sock
+DOCKER_CONFIG := /etc/docker/daemon.json
 
 # Bazel flags.
 BAZEL := bazel $(STARTUP_OPTIONS)
@@ -56,6 +58,9 @@ endif
 # Add docker passthrough options.
 ifneq ($(DOCKER_PRIVILEGED),)
 FULL_DOCKER_RUN_OPTIONS += -v "$(DOCKER_SOCKET):$(DOCKER_SOCKET)"
+# TODO(gvisor.dev/issue/1624): Remove docker config volume. This is required
+# temporarily for checking VFS1 vs VFS2 by some tests.
+FULL_DOCKER_RUN_OPTIONS += -v "$(DOCKER_CONFIG):$(DOCKER_CONFIG)"
 FULL_DOCKER_RUN_OPTIONS += $(DOCKER_PRIVILEGED)
 FULL_DOCKER_EXEC_OPTIONS += $(DOCKER_PRIVILEGED)
 DOCKER_GROUP := $(shell stat -c '%g' $(DOCKER_SOCKET))
@@ -127,7 +132,7 @@ bazel-server-start: bazel-image ## Starts the bazel server.
 		--workdir "$(CURDIR)" \
 		$(FULL_DOCKER_RUN_OPTIONS) \
 		$(BUILDER_IMAGE) \
-		sh -c "tail -f --pid=\$$($(BAZEL) info server_pid)"
+		sh -c "tail -f --pid=\$$($(BAZEL) info server_pid) /dev/null"
 .PHONY: bazel-server-start
 
 bazel-shutdown: ## Shuts down a running bazel server.

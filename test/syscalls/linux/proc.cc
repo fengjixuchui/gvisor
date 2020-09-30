@@ -16,6 +16,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <linux/magic.h>
 #include <sched.h>
 #include <signal.h>
 #include <stddef.h>
@@ -26,6 +27,7 @@
 #include <sys/mman.h>
 #include <sys/prctl.h>
 #include <sys/stat.h>
+#include <sys/statfs.h>
 #include <sys/utsname.h>
 #include <syscall.h>
 #include <unistd.h>
@@ -45,6 +47,7 @@
 
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
+#include "absl/container/node_hash_set.h"
 #include "absl/strings/ascii.h"
 #include "absl/strings/match.h"
 #include "absl/strings/numbers.h"
@@ -61,6 +64,7 @@
 #include "test/util/fs_util.h"
 #include "test/util/memory_util.h"
 #include "test/util/posix_error.h"
+#include "test/util/proc_util.h"
 #include "test/util/temp_path.h"
 #include "test/util/test_util.h"
 #include "test/util/thread_util.h"
@@ -670,6 +674,23 @@ TEST(ProcSelfMaps, Mprotect) {
                                                    3 * kPageSize, PROT_READ)));
 }
 
+TEST(ProcSelfMaps, SharedAnon) {
+  const Mapping m = ASSERT_NO_ERRNO_AND_VALUE(
+      MmapAnon(kPageSize, PROT_READ, MAP_SHARED | MAP_ANONYMOUS));
+
+  const auto proc_self_maps =
+      ASSERT_NO_ERRNO_AND_VALUE(GetContents("/proc/self/maps"));
+  for (const auto& line : absl::StrSplit(proc_self_maps, '\n')) {
+    const auto entry = ASSERT_NO_ERRNO_AND_VALUE(ParseProcMapsLine(line));
+    if (entry.start <= m.addr() && m.addr() < entry.end) {
+      // cf. proc(5), "/proc/[pid]/map_files/"
+      EXPECT_EQ(entry.filename, "/dev/zero (deleted)");
+      return;
+    }
+  }
+  FAIL() << "no maps entry containing mapping at " << m.ptr();
+}
+
 TEST(ProcSelfFd, OpenFd) {
   int pipe_fds[2];
   ASSERT_THAT(pipe2(pipe_fds, O_CLOEXEC), SyscallSucceeds());
@@ -690,6 +711,30 @@ TEST(ProcSelfFd, OpenFd) {
   // Cleanup.
   ASSERT_THAT(close(pipe_fds[0]), SyscallSucceeds());
   ASSERT_THAT(close(pipe_fds[1]), SyscallSucceeds());
+}
+
+static void CheckFdDirGetdentsDuplicates(const std::string& path) {
+  const FileDescriptor fd =
+      ASSERT_NO_ERRNO_AND_VALUE(Open(path.c_str(), O_RDONLY | O_DIRECTORY));
+  // Open a FD whose value is supposed to be much larger than
+  // the number of FDs opened by current process.
+  auto newfd = fcntl(fd.get(), F_DUPFD, 1024);
+  EXPECT_GE(newfd, 1024);
+  auto fd_closer = Cleanup([newfd]() { close(newfd); });
+  auto fd_files = ASSERT_NO_ERRNO_AND_VALUE(ListDir(path.c_str(), false));
+  absl::node_hash_set<std::string> fd_files_dedup(fd_files.begin(),
+                                                  fd_files.end());
+  EXPECT_EQ(fd_files.size(), fd_files_dedup.size());
+}
+
+// This is a regression test for gvisor.dev/issues/3894
+TEST(ProcSelfFd, GetdentsDuplicates) {
+  CheckFdDirGetdentsDuplicates("/proc/self/fd");
+}
+
+// This is a regression test for gvisor.dev/issues/3894
+TEST(ProcSelfFdInfo, GetdentsDuplicates) {
+  CheckFdDirGetdentsDuplicates("/proc/self/fdinfo");
 }
 
 TEST(ProcSelfFdInfo, CorrectFds) {
@@ -735,8 +780,12 @@ TEST(ProcSelfFdInfo, Flags) {
 }
 
 TEST(ProcSelfExe, Absolute) {
-  auto exe = ASSERT_NO_ERRNO_AND_VALUE(
-      ReadLink(absl::StrCat("/proc/", getpid(), "/exe")));
+  auto exe = ASSERT_NO_ERRNO_AND_VALUE(ReadLink("/proc/self/exe"));
+  EXPECT_EQ(exe[0], '/');
+}
+
+TEST(ProcSelfCwd, Absolute) {
+  auto exe = ASSERT_NO_ERRNO_AND_VALUE(ReadLink("/proc/self/cwd"));
   EXPECT_EQ(exe[0], '/');
 }
 
@@ -771,17 +820,12 @@ TEST(ProcCpuinfo, DeniesWriteNonRoot) {
     constexpr int kNobody = 65534;
     EXPECT_THAT(syscall(SYS_setuid, kNobody), SyscallSucceeds());
     EXPECT_THAT(open("/proc/cpuinfo", O_WRONLY), SyscallFailsWithErrno(EACCES));
-    // TODO(gvisor.dev/issue/1193): Properly support setting size attributes in
-    // kernfs.
-    if (!IsRunningOnGvisor() || IsRunningWithVFS1()) {
-      EXPECT_THAT(truncate("/proc/cpuinfo", 123),
-                  SyscallFailsWithErrno(EACCES));
-    }
+    EXPECT_THAT(truncate("/proc/cpuinfo", 123), SyscallFailsWithErrno(EACCES));
   });
 }
 
 // With root privileges, it is possible to open /proc/cpuinfo with write mode,
-// but all write operations will return EIO.
+// but all write operations should fail.
 TEST(ProcCpuinfo, DeniesWriteRoot) {
   // VFS1 does not behave differently for root/non-root.
   SKIP_IF(IsRunningWithVFS1());
@@ -790,16 +834,10 @@ TEST(ProcCpuinfo, DeniesWriteRoot) {
   int fd;
   EXPECT_THAT(fd = open("/proc/cpuinfo", O_WRONLY), SyscallSucceeds());
   if (fd > 0) {
-    EXPECT_THAT(write(fd, "x", 1), SyscallFailsWithErrno(EIO));
-    EXPECT_THAT(pwrite(fd, "x", 1, 123), SyscallFailsWithErrno(EIO));
-  }
-  // TODO(gvisor.dev/issue/1193): Properly support setting size attributes in
-  // kernfs.
-  if (!IsRunningOnGvisor() || IsRunningWithVFS1()) {
-    if (fd > 0) {
-      EXPECT_THAT(ftruncate(fd, 123), SyscallFailsWithErrno(EIO));
-    }
-    EXPECT_THAT(truncate("/proc/cpuinfo", 123), SyscallFailsWithErrno(EIO));
+    // Truncate is not tested--it may succeed on some kernels without doing
+    // anything.
+    EXPECT_THAT(write(fd, "x", 1), SyscallFails());
+    EXPECT_THAT(pwrite(fd, "x", 1, 123), SyscallFails());
   }
 }
 
@@ -1437,6 +1475,16 @@ TEST(ProcPidExe, Subprocess) {
   ASSERT_THAT(ReadlinkWhileRunning("exe", actual, sizeof(actual)),
               SyscallSucceedsWithValue(Gt(0)));
   EXPECT_EQ(actual, expected_absolute_path);
+}
+
+// /proc/PID/cwd points to the correct directory.
+TEST(ProcPidCwd, Subprocess) {
+  auto want = ASSERT_NO_ERRNO_AND_VALUE(GetCWD());
+
+  char got[PATH_MAX + 1] = {};
+  ASSERT_THAT(ReadlinkWhileRunning("cwd", got, sizeof(got)),
+              SyscallSucceedsWithValue(Gt(0)));
+  EXPECT_EQ(got, want);
 }
 
 // Test whether /proc/PID/ files can be read for a running process.
@@ -2157,6 +2205,18 @@ TEST(Proc, PidTidIOAccounting) {
 
   writer.Join();
   noop.Join();
+}
+
+TEST(Proc, Statfs) {
+  struct statfs st;
+  EXPECT_THAT(statfs("/proc", &st), SyscallSucceeds());
+  if (IsRunningWithVFS1()) {
+    EXPECT_EQ(st.f_type, ANON_INODE_FS_MAGIC);
+  } else {
+    EXPECT_EQ(st.f_type, PROC_SUPER_MAGIC);
+  }
+  EXPECT_EQ(st.f_bsize, getpagesize());
+  EXPECT_EQ(st.f_namelen, NAME_MAX);
 }
 
 }  // namespace

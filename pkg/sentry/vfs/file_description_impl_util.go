@@ -42,6 +42,8 @@ import (
 // FileDescriptionDefaultImpl may be embedded by implementations of
 // FileDescriptionImpl to obtain implementations of many FileDescriptionImpl
 // methods with default behavior analogous to Linux's.
+//
+// +stateify savable
 type FileDescriptionDefaultImpl struct{}
 
 // OnClose implements FileDescriptionImpl.OnClose analogously to
@@ -57,7 +59,11 @@ func (FileDescriptionDefaultImpl) StatFS(ctx context.Context) (linux.Statfs, err
 }
 
 // Allocate implements FileDescriptionImpl.Allocate analogously to
-// fallocate called on regular file, directory or FIFO in Linux.
+// fallocate called on an invalid type of file in Linux.
+//
+// Note that directories can rely on this implementation even though they
+// should technically return EISDIR. Allocate should never be called for a
+// directory, because it requires a writable fd.
 func (FileDescriptionDefaultImpl) Allocate(ctx context.Context, mode, offset, length uint64) error {
 	return syserror.ENODEV
 }
@@ -134,34 +140,36 @@ func (FileDescriptionDefaultImpl) Ioctl(ctx context.Context, uio usermem.IO, arg
 	return 0, syserror.ENOTTY
 }
 
-// Listxattr implements FileDescriptionImpl.Listxattr analogously to
+// ListXattr implements FileDescriptionImpl.ListXattr analogously to
 // inode_operations::listxattr == NULL in Linux.
-func (FileDescriptionDefaultImpl) Listxattr(ctx context.Context, size uint64) ([]string, error) {
-	// This isn't exactly accurate; see FileDescription.Listxattr.
+func (FileDescriptionDefaultImpl) ListXattr(ctx context.Context, size uint64) ([]string, error) {
+	// This isn't exactly accurate; see FileDescription.ListXattr.
 	return nil, syserror.ENOTSUP
 }
 
-// Getxattr implements FileDescriptionImpl.Getxattr analogously to
+// GetXattr implements FileDescriptionImpl.GetXattr analogously to
 // inode::i_opflags & IOP_XATTR == 0 in Linux.
-func (FileDescriptionDefaultImpl) Getxattr(ctx context.Context, opts GetxattrOptions) (string, error) {
+func (FileDescriptionDefaultImpl) GetXattr(ctx context.Context, opts GetXattrOptions) (string, error) {
 	return "", syserror.ENOTSUP
 }
 
-// Setxattr implements FileDescriptionImpl.Setxattr analogously to
+// SetXattr implements FileDescriptionImpl.SetXattr analogously to
 // inode::i_opflags & IOP_XATTR == 0 in Linux.
-func (FileDescriptionDefaultImpl) Setxattr(ctx context.Context, opts SetxattrOptions) error {
+func (FileDescriptionDefaultImpl) SetXattr(ctx context.Context, opts SetXattrOptions) error {
 	return syserror.ENOTSUP
 }
 
-// Removexattr implements FileDescriptionImpl.Removexattr analogously to
+// RemoveXattr implements FileDescriptionImpl.RemoveXattr analogously to
 // inode::i_opflags & IOP_XATTR == 0 in Linux.
-func (FileDescriptionDefaultImpl) Removexattr(ctx context.Context, name string) error {
+func (FileDescriptionDefaultImpl) RemoveXattr(ctx context.Context, name string) error {
 	return syserror.ENOTSUP
 }
 
 // DirectoryFileDescriptionDefaultImpl may be embedded by implementations of
 // FileDescriptionImpl that always represent directories to obtain
 // implementations of non-directory I/O methods that return EISDIR.
+//
+// +stateify savable
 type DirectoryFileDescriptionDefaultImpl struct{}
 
 // Allocate implements DirectoryFileDescriptionDefaultImpl.Allocate.
@@ -192,6 +200,8 @@ func (DirectoryFileDescriptionDefaultImpl) Write(ctx context.Context, src userme
 // DentryMetadataFileDescriptionImpl may be embedded by implementations of
 // FileDescriptionImpl for which FileDescriptionOptions.UseDentryMetadata is
 // true to obtain implementations of Stat and SetStat that panic.
+//
+// +stateify savable
 type DentryMetadataFileDescriptionImpl struct{}
 
 // Stat implements FileDescriptionImpl.Stat.
@@ -206,12 +216,16 @@ func (DentryMetadataFileDescriptionImpl) SetStat(ctx context.Context, opts SetSt
 
 // DynamicBytesSource represents a data source for a
 // DynamicBytesFileDescriptionImpl.
+//
+// +stateify savable
 type DynamicBytesSource interface {
 	// Generate writes the file's contents to buf.
 	Generate(ctx context.Context, buf *bytes.Buffer) error
 }
 
 // StaticData implements DynamicBytesSource over a static string.
+//
+// +stateify savable
 type StaticData struct {
 	Data string
 }
@@ -238,12 +252,22 @@ type WritableDynamicBytesSource interface {
 //
 // DynamicBytesFileDescriptionImpl.SetDataSource() must be called before first
 // use.
+//
+// +stateify savable
 type DynamicBytesFileDescriptionImpl struct {
 	data     DynamicBytesSource // immutable
-	mu       sync.Mutex         // protects the following fields
-	buf      bytes.Buffer
+	mu       sync.Mutex         `state:"nosave"` // protects the following fields
+	buf      bytes.Buffer       `state:".([]byte)"`
 	off      int64
 	lastRead int64 // offset at which the last Read, PRead, or Seek ended
+}
+
+func (fd *DynamicBytesFileDescriptionImpl) saveBuf() []byte {
+	return fd.buf.Bytes()
+}
+
+func (fd *DynamicBytesFileDescriptionImpl) loadBuf(p []byte) {
+	fd.buf.Write(p)
 }
 
 // SetDataSource must be called exactly once on fd before first use.
@@ -378,6 +402,8 @@ func GenericConfigureMMap(fd *FileDescription, m memmap.Mappable, opts *memmap.M
 
 // LockFD may be used by most implementations of FileDescriptionImpl.Lock*
 // functions. Caller must call Init().
+//
+// +stateify savable
 type LockFD struct {
 	locks *FileLocks
 }
@@ -405,6 +431,8 @@ func (fd *LockFD) UnlockBSD(ctx context.Context, uid fslock.UniqueID) error {
 
 // NoLockFD implements Lock*/Unlock* portion of FileDescriptionImpl interface
 // returning ENOLCK.
+//
+// +stateify savable
 type NoLockFD struct{}
 
 // LockBSD implements vfs.FileDescriptionImpl.LockBSD.

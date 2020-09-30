@@ -54,8 +54,8 @@ go_template_instance(
 go_library(
     name = "stack",
     srcs = [
+        "addressable_endpoint_state.go",
         "conntrack.go",
-        "dhcpv6configurationfromndpra_string.go",
         "forwarder.go",
         "headertype_string.go",
         "icmp_rate_limit.go",
@@ -65,7 +65,6 @@ go_library(
         "iptables_types.go",
         "linkaddrcache.go",
         "linkaddrentry_list.go",
-        "ndp.go",
         "neighbor_cache.go",
         "neighbor_entry.go",
         "neighbor_entry_list.go",
@@ -106,6 +105,7 @@ go_test(
     name = "stack_x_test",
     size = "medium",
     srcs = [
+        "addressable_endpoint_state_test.go",
         "ndp_test.go",
         "nud_test.go",
         "stack_test.go",
@@ -116,6 +116,7 @@ go_test(
     deps = [
         ":stack",
         "//pkg/rand",
+        "//pkg/sync",
         "//pkg/tcpip",
         "//pkg/tcpip/buffer",
         "//pkg/tcpip/checker",
@@ -138,7 +139,6 @@ go_test(
     name = "stack_test",
     size = "small",
     srcs = [
-        "fake_time_test.go",
         "forwarder_test.go",
         "linkaddrcache_test.go",
         "neighbor_cache_test.go",
@@ -152,8 +152,8 @@ go_test(
         "//pkg/sync",
         "//pkg/tcpip",
         "//pkg/tcpip/buffer",
+        "//pkg/tcpip/faketime",
         "//pkg/tcpip/header",
-        "@com_github_dpjacques_clockwork//:go_default_library",
         "@com_github_google_go_cmp//cmp:go_default_library",
         "@com_github_google_go_cmp//cmp/cmpopts:go_default_library",
     ],

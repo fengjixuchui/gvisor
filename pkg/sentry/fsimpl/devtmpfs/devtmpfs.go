@@ -33,8 +33,10 @@ import (
 const Name = "devtmpfs"
 
 // FilesystemType implements vfs.FilesystemType.
+//
+// +stateify savable
 type FilesystemType struct {
-	initOnce sync.Once
+	initOnce sync.Once `state:"nosave"` // FIXME(gvisor.dev/issue/1664): not yet supported.
 	initErr  error
 
 	// fs is the tmpfs filesystem that backs all mounts of this FilesystemType.
@@ -80,7 +82,7 @@ type Accessor struct {
 // NewAccessor returns an Accessor that supports creation of device special
 // files in the devtmpfs instance registered with name fsTypeName in vfsObj.
 func NewAccessor(ctx context.Context, vfsObj *vfs.VirtualFilesystem, creds *auth.Credentials, fsTypeName string) (*Accessor, error) {
-	mntns, err := vfsObj.NewMountNamespace(ctx, creds, "devtmpfs" /* source */, fsTypeName, &vfs.GetFilesystemOptions{})
+	mntns, err := vfsObj.NewMountNamespace(ctx, creds, "devtmpfs" /* source */, fsTypeName, &vfs.MountOptions{})
 	if err != nil {
 		return nil, err
 	}

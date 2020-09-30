@@ -51,9 +51,13 @@ import (
 const Name = "tmpfs"
 
 // FilesystemType implements vfs.FilesystemType.
+//
+// +stateify savable
 type FilesystemType struct{}
 
 // filesystem implements vfs.FilesystemImpl.
+//
+// +stateify savable
 type filesystem struct {
 	vfsfs vfs.Filesystem
 
@@ -67,7 +71,7 @@ type filesystem struct {
 	devMinor uint32
 
 	// mu serializes changes to the Dentry tree.
-	mu sync.RWMutex
+	mu sync.RWMutex `state:"nosave"`
 
 	nextInoMinusOne uint64 // accessed using atomic memory operations
 }
@@ -78,6 +82,8 @@ func (FilesystemType) Name() string {
 }
 
 // FilesystemOpts is used to pass configuration data to tmpfs.
+//
+// +stateify savable
 type FilesystemOpts struct {
 	// RootFileType is the FileType of the filesystem root. Valid values
 	// are: S_IFDIR, S_IFREG, and S_IFLNK. Defaults to S_IFDIR.
@@ -221,6 +227,8 @@ var globalStatfs = linux.Statfs{
 }
 
 // dentry implements vfs.DentryImpl.
+//
+// +stateify savable
 type dentry struct {
 	vfsd vfs.Dentry
 
@@ -300,6 +308,8 @@ func (d *dentry) Watches() *vfs.Watches {
 func (d *dentry) OnZeroWatches(context.Context) {}
 
 // inode represents a filesystem object.
+//
+// +stateify savable
 type inode struct {
 	// fs is the owning filesystem. fs is immutable.
 	fs *filesystem
@@ -316,12 +326,12 @@ type inode struct {
 
 	// Inode metadata. Writing multiple fields atomically requires holding
 	// mu, othewise atomic operations can be used.
-	mu    sync.Mutex
-	mode  uint32 // file type and mode
-	nlink uint32 // protected by filesystem.mu instead of inode.mu
-	uid   uint32 // auth.KUID, but stored as raw uint32 for sync/atomic
-	gid   uint32 // auth.KGID, but ...
-	ino   uint64 // immutable
+	mu    sync.Mutex `state:"nosave"`
+	mode  uint32     // file type and mode
+	nlink uint32     // protected by filesystem.mu instead of inode.mu
+	uid   uint32     // auth.KUID, but stored as raw uint32 for sync/atomic
+	gid   uint32     // auth.KGID, but ...
+	ino   uint64     // immutable
 
 	// Linux's tmpfs has no concept of btime.
 	atime int64 // nanoseconds
@@ -626,74 +636,50 @@ func (i *inode) touchCMtimeLocked() {
 	atomic.StoreInt64(&i.ctime, now)
 }
 
-func (i *inode) listxattr(size uint64) ([]string, error) {
-	return i.xattrs.Listxattr(size)
+func (i *inode) listXattr(size uint64) ([]string, error) {
+	return i.xattrs.ListXattr(size)
 }
 
-func (i *inode) getxattr(creds *auth.Credentials, opts *vfs.GetxattrOptions) (string, error) {
+func (i *inode) getXattr(creds *auth.Credentials, opts *vfs.GetXattrOptions) (string, error) {
 	if err := i.checkXattrPermissions(creds, opts.Name, vfs.MayRead); err != nil {
 		return "", err
 	}
-	return i.xattrs.Getxattr(opts)
+	return i.xattrs.GetXattr(opts)
 }
 
-func (i *inode) setxattr(creds *auth.Credentials, opts *vfs.SetxattrOptions) error {
+func (i *inode) setXattr(creds *auth.Credentials, opts *vfs.SetXattrOptions) error {
 	if err := i.checkXattrPermissions(creds, opts.Name, vfs.MayWrite); err != nil {
 		return err
 	}
-	return i.xattrs.Setxattr(opts)
+	return i.xattrs.SetXattr(opts)
 }
 
-func (i *inode) removexattr(creds *auth.Credentials, name string) error {
+func (i *inode) removeXattr(creds *auth.Credentials, name string) error {
 	if err := i.checkXattrPermissions(creds, name, vfs.MayWrite); err != nil {
 		return err
 	}
-	return i.xattrs.Removexattr(name)
+	return i.xattrs.RemoveXattr(name)
 }
 
 func (i *inode) checkXattrPermissions(creds *auth.Credentials, name string, ats vfs.AccessTypes) error {
-	switch {
-	case ats&vfs.MayRead == vfs.MayRead:
-		if err := i.checkPermissions(creds, vfs.MayRead); err != nil {
-			return err
-		}
-	case ats&vfs.MayWrite == vfs.MayWrite:
-		if err := i.checkPermissions(creds, vfs.MayWrite); err != nil {
-			return err
-		}
-	default:
-		panic(fmt.Sprintf("checkXattrPermissions called with impossible AccessTypes: %v", ats))
+	// We currently only support extended attributes in the user.* and
+	// trusted.* namespaces. See b/148380782.
+	if !strings.HasPrefix(name, linux.XATTR_USER_PREFIX) && !strings.HasPrefix(name, linux.XATTR_TRUSTED_PREFIX) {
+		return syserror.EOPNOTSUPP
 	}
-
-	switch {
-	case strings.HasPrefix(name, linux.XATTR_TRUSTED_PREFIX):
-		// The trusted.* namespace can only be accessed by privileged
-		// users.
-		if creds.HasCapability(linux.CAP_SYS_ADMIN) {
-			return nil
-		}
-		if ats&vfs.MayWrite == vfs.MayWrite {
-			return syserror.EPERM
-		}
-		return syserror.ENODATA
-	case strings.HasPrefix(name, linux.XATTR_USER_PREFIX):
-		// Extended attributes in the user.* namespace are only
-		// supported for regular files and directories.
-		filetype := linux.S_IFMT & atomic.LoadUint32(&i.mode)
-		if filetype == linux.S_IFREG || filetype == linux.S_IFDIR {
-			return nil
-		}
-		if ats&vfs.MayWrite == vfs.MayWrite {
-			return syserror.EPERM
-		}
-		return syserror.ENODATA
-
+	mode := linux.FileMode(atomic.LoadUint32(&i.mode))
+	kuid := auth.KUID(atomic.LoadUint32(&i.uid))
+	kgid := auth.KGID(atomic.LoadUint32(&i.gid))
+	if err := vfs.GenericCheckPermissions(creds, ats, mode, kuid, kgid); err != nil {
+		return err
 	}
-	return syserror.EOPNOTSUPP
+	return vfs.CheckXattrPermissions(creds, ats, mode, kuid, name)
 }
 
 // fileDescription is embedded by tmpfs implementations of
 // vfs.FileDescriptionImpl.
+//
+// +stateify savable
 type fileDescription struct {
 	vfsfd vfs.FileDescription
 	vfs.FileDescriptionDefaultImpl
@@ -738,20 +724,20 @@ func (fd *fileDescription) StatFS(ctx context.Context) (linux.Statfs, error) {
 	return globalStatfs, nil
 }
 
-// Listxattr implements vfs.FileDescriptionImpl.Listxattr.
-func (fd *fileDescription) Listxattr(ctx context.Context, size uint64) ([]string, error) {
-	return fd.inode().listxattr(size)
+// ListXattr implements vfs.FileDescriptionImpl.ListXattr.
+func (fd *fileDescription) ListXattr(ctx context.Context, size uint64) ([]string, error) {
+	return fd.inode().listXattr(size)
 }
 
-// Getxattr implements vfs.FileDescriptionImpl.Getxattr.
-func (fd *fileDescription) Getxattr(ctx context.Context, opts vfs.GetxattrOptions) (string, error) {
-	return fd.inode().getxattr(auth.CredentialsFromContext(ctx), &opts)
+// GetXattr implements vfs.FileDescriptionImpl.GetXattr.
+func (fd *fileDescription) GetXattr(ctx context.Context, opts vfs.GetXattrOptions) (string, error) {
+	return fd.inode().getXattr(auth.CredentialsFromContext(ctx), &opts)
 }
 
-// Setxattr implements vfs.FileDescriptionImpl.Setxattr.
-func (fd *fileDescription) Setxattr(ctx context.Context, opts vfs.SetxattrOptions) error {
+// SetXattr implements vfs.FileDescriptionImpl.SetXattr.
+func (fd *fileDescription) SetXattr(ctx context.Context, opts vfs.SetXattrOptions) error {
 	d := fd.dentry()
-	if err := d.inode.setxattr(auth.CredentialsFromContext(ctx), &opts); err != nil {
+	if err := d.inode.setXattr(auth.CredentialsFromContext(ctx), &opts); err != nil {
 		return err
 	}
 
@@ -760,47 +746,16 @@ func (fd *fileDescription) Setxattr(ctx context.Context, opts vfs.SetxattrOption
 	return nil
 }
 
-// Removexattr implements vfs.FileDescriptionImpl.Removexattr.
-func (fd *fileDescription) Removexattr(ctx context.Context, name string) error {
+// RemoveXattr implements vfs.FileDescriptionImpl.RemoveXattr.
+func (fd *fileDescription) RemoveXattr(ctx context.Context, name string) error {
 	d := fd.dentry()
-	if err := d.inode.removexattr(auth.CredentialsFromContext(ctx), name); err != nil {
+	if err := d.inode.removeXattr(auth.CredentialsFromContext(ctx), name); err != nil {
 		return err
 	}
 
 	// Generate inotify events.
 	d.InotifyWithParent(ctx, linux.IN_ATTRIB, 0, vfs.InodeEvent)
 	return nil
-}
-
-// NewMemfd creates a new tmpfs regular file and file description that can back
-// an anonymous fd created by memfd_create.
-func NewMemfd(ctx context.Context, creds *auth.Credentials, mount *vfs.Mount, allowSeals bool, name string) (*vfs.FileDescription, error) {
-	fs, ok := mount.Filesystem().Impl().(*filesystem)
-	if !ok {
-		panic("NewMemfd() called with non-tmpfs mount")
-	}
-
-	// Per Linux, mm/shmem.c:__shmem_file_setup(), memfd inodes are set up with
-	// S_IRWXUGO.
-	inode := fs.newRegularFile(creds.EffectiveKUID, creds.EffectiveKGID, 0777)
-	rf := inode.impl.(*regularFile)
-	if allowSeals {
-		rf.seals = 0
-	}
-
-	d := fs.newDentry(inode)
-	defer d.DecRef(ctx)
-	d.name = name
-
-	// Per Linux, mm/shmem.c:__shmem_file_setup(), memfd files are set up with
-	// FMODE_READ | FMODE_WRITE.
-	var fd regularFileFD
-	fd.Init(&inode.locks)
-	flags := uint32(linux.O_RDWR)
-	if err := fd.vfsfd.Init(&fd, flags, mount, &d.vfsd, &vfs.FileDescriptionOptions{}); err != nil {
-		return nil, err
-	}
-	return &fd.vfsfd, nil
 }
 
 // LockPOSIX implements vfs.FileDescriptionImpl.LockPOSIX.

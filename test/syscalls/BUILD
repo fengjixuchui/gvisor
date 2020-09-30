@@ -238,7 +238,7 @@ syscall_test(
 
 syscall_test(
     size = "medium",
-    add_overlay = False,  # TODO(gvisor.dev/issue/317): enable when fixed.
+    add_overlay = True,
     test = "//test/syscalls/linux:inotify_test",
 )
 
@@ -803,6 +803,7 @@ syscall_test(
 syscall_test(
     add_overlay = True,
     test = "//test/syscalls/linux:statfs_test",
+    use_tmpfs = True,  # Test specifically relies on TEST_TMPDIR to be tmpfs.
 )
 
 syscall_test(

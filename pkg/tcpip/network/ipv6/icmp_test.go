@@ -75,7 +75,8 @@ type stubDispatcher struct {
 	stack.TransportDispatcher
 }
 
-func (*stubDispatcher) DeliverTransportPacket(*stack.Route, tcpip.TransportProtocolNumber, *stack.PacketBuffer) {
+func (*stubDispatcher) DeliverTransportPacket(*stack.Route, tcpip.TransportProtocolNumber, *stack.PacketBuffer) stack.TransportPacketDisposition {
+	return stack.TransportPacketHandled
 }
 
 type stubLinkAddressCache struct {
@@ -102,6 +103,30 @@ func (*stubNUDHandler) HandleConfirmation(addr tcpip.Address, linkAddr tcpip.Lin
 func (*stubNUDHandler) HandleUpperLevelConfirmation(addr tcpip.Address) {
 }
 
+var _ stack.NetworkInterface = (*testInterface)(nil)
+
+type testInterface struct{}
+
+func (*testInterface) ID() tcpip.NICID {
+	return 0
+}
+
+func (*testInterface) IsLoopback() bool {
+	return false
+}
+
+func (*testInterface) Name() string {
+	return ""
+}
+
+func (*testInterface) Enabled() bool {
+	return true
+}
+
+func (*testInterface) LinkEndpoint() stack.LinkEndpoint {
+	return nil
+}
+
 func TestICMPCounts(t *testing.T) {
 	tests := []struct {
 		name             string
@@ -120,8 +145,8 @@ func TestICMPCounts(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			s := stack.New(stack.Options{
-				NetworkProtocols:   []stack.NetworkProtocol{NewProtocol()},
-				TransportProtocols: []stack.TransportProtocol{icmp.NewProtocol6()},
+				NetworkProtocols:   []stack.NetworkProtocolFactory{NewProtocol},
+				TransportProtocols: []stack.TransportProtocolFactory{icmp.NewProtocol6},
 				UseNeighborCache:   test.useNeighborCache,
 			})
 			{
@@ -149,8 +174,12 @@ func TestICMPCounts(t *testing.T) {
 			if netProto == nil {
 				t.Fatalf("cannot find protocol instance for network protocol %d", ProtocolNumber)
 			}
-			ep := netProto.NewEndpoint(0, &stubLinkAddressCache{}, &stubNUDHandler{}, &stubDispatcher{}, nil, s)
+			ep := netProto.NewEndpoint(&testInterface{}, &stubLinkAddressCache{}, &stubNUDHandler{}, &stubDispatcher{})
 			defer ep.Close()
+
+			if err := ep.Enable(); err != nil {
+				t.Fatalf("ep.Enable(): %s", err)
+			}
 
 			r, err := s.FindRoute(nicID, lladdr0, lladdr1, ProtocolNumber, false /* multicastLoop */)
 			if err != nil {
@@ -258,8 +287,8 @@ func TestICMPCounts(t *testing.T) {
 
 func TestICMPCountsWithNeighborCache(t *testing.T) {
 	s := stack.New(stack.Options{
-		NetworkProtocols:   []stack.NetworkProtocol{NewProtocol()},
-		TransportProtocols: []stack.TransportProtocol{icmp.NewProtocol6()},
+		NetworkProtocols:   []stack.NetworkProtocolFactory{NewProtocol},
+		TransportProtocols: []stack.TransportProtocolFactory{icmp.NewProtocol6},
 		UseNeighborCache:   true,
 	})
 	{
@@ -287,8 +316,12 @@ func TestICMPCountsWithNeighborCache(t *testing.T) {
 	if netProto == nil {
 		t.Fatalf("cannot find protocol instance for network protocol %d", ProtocolNumber)
 	}
-	ep := netProto.NewEndpoint(0, nil, &stubNUDHandler{}, &stubDispatcher{}, nil, s)
+	ep := netProto.NewEndpoint(&testInterface{}, nil, &stubNUDHandler{}, &stubDispatcher{})
 	defer ep.Close()
+
+	if err := ep.Enable(); err != nil {
+		t.Fatalf("ep.Enable(): %s", err)
+	}
 
 	r, err := s.FindRoute(nicID, lladdr0, lladdr1, ProtocolNumber, false /* multicastLoop */)
 	if err != nil {
@@ -423,12 +456,12 @@ func (e endpointWithResolutionCapability) Capabilities() stack.LinkEndpointCapab
 func newTestContext(t *testing.T) *testContext {
 	c := &testContext{
 		s0: stack.New(stack.Options{
-			NetworkProtocols:   []stack.NetworkProtocol{NewProtocol()},
-			TransportProtocols: []stack.TransportProtocol{icmp.NewProtocol6()},
+			NetworkProtocols:   []stack.NetworkProtocolFactory{NewProtocol},
+			TransportProtocols: []stack.TransportProtocolFactory{icmp.NewProtocol6},
 		}),
 		s1: stack.New(stack.Options{
-			NetworkProtocols:   []stack.NetworkProtocol{NewProtocol()},
-			TransportProtocols: []stack.TransportProtocol{icmp.NewProtocol6()},
+			NetworkProtocols:   []stack.NetworkProtocolFactory{NewProtocol},
+			TransportProtocols: []stack.TransportProtocolFactory{icmp.NewProtocol6},
 		}),
 	}
 
@@ -723,12 +756,12 @@ func TestICMPChecksumValidationSimple(t *testing.T) {
 						e.LinkEPCapabilities |= stack.CapabilityResolutionRequired
 
 						s := stack.New(stack.Options{
-							NetworkProtocols: []stack.NetworkProtocol{NewProtocol()},
+							NetworkProtocols: []stack.NetworkProtocolFactory{NewProtocol},
 							UseNeighborCache: test.useNeighborCache,
 						})
 						if isRouter {
 							// Enabling forwarding makes the stack act as a router.
-							s.SetForwarding(true)
+							s.SetForwarding(ProtocolNumber, true)
 						}
 						if err := s.CreateNIC(nicID, e); err != nil {
 							t.Fatalf("CreateNIC(_, _) = %s", err)
@@ -919,7 +952,7 @@ func TestICMPChecksumValidationWithPayload(t *testing.T) {
 		t.Run(typ.name, func(t *testing.T) {
 			e := channel.New(10, 1280, linkAddr0)
 			s := stack.New(stack.Options{
-				NetworkProtocols: []stack.NetworkProtocol{NewProtocol()},
+				NetworkProtocols: []stack.NetworkProtocolFactory{NewProtocol},
 			})
 			if err := s.CreateNIC(nicID, e); err != nil {
 				t.Fatalf("CreateNIC(_, _) = %s", err)
@@ -1097,7 +1130,7 @@ func TestICMPChecksumValidationWithPayloadMultipleViews(t *testing.T) {
 		t.Run(typ.name, func(t *testing.T) {
 			e := channel.New(10, 1280, linkAddr0)
 			s := stack.New(stack.Options{
-				NetworkProtocols: []stack.NetworkProtocol{NewProtocol()},
+				NetworkProtocols: []stack.NetworkProtocolFactory{NewProtocol},
 			})
 			if err := s.CreateNIC(nicID, e); err != nil {
 				t.Fatalf("CreateNIC(%d, _) = %s", nicID, err)
@@ -1203,7 +1236,10 @@ func TestLinkAddressRequest(t *testing.T) {
 	}
 
 	for _, test := range tests {
-		p := NewProtocol()
+		s := stack.New(stack.Options{
+			NetworkProtocols: []stack.NetworkProtocolFactory{NewProtocol},
+		})
+		p := s.NetworkProtocolInstance(ProtocolNumber)
 		linkRes, ok := p.(stack.LinkAddressResolver)
 		if !ok {
 			t.Fatalf("expected IPv6 protocol to implement stack.LinkAddressResolver")

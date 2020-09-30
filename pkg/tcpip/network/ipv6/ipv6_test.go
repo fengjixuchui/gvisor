@@ -15,6 +15,7 @@
 package ipv6
 
 import (
+	"math"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
@@ -22,6 +23,7 @@ import (
 	"gvisor.dev/gvisor/pkg/tcpip/buffer"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
 	"gvisor.dev/gvisor/pkg/tcpip/link/channel"
+	"gvisor.dev/gvisor/pkg/tcpip/network/testutil"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
 	"gvisor.dev/gvisor/pkg/tcpip/transport/icmp"
 	"gvisor.dev/gvisor/pkg/tcpip/transport/udp"
@@ -139,18 +141,18 @@ func testReceiveUDP(t *testing.T, s *stack.Stack, e *channel.Endpoint, src, dst 
 func TestReceiveOnAllNodesMulticastAddr(t *testing.T) {
 	tests := []struct {
 		name            string
-		protocolFactory stack.TransportProtocol
+		protocolFactory stack.TransportProtocolFactory
 		rxf             func(t *testing.T, s *stack.Stack, e *channel.Endpoint, src, dst tcpip.Address, want uint64)
 	}{
-		{"ICMP", icmp.NewProtocol6(), testReceiveICMP},
-		{"UDP", udp.NewProtocol(), testReceiveUDP},
+		{"ICMP", icmp.NewProtocol6, testReceiveICMP},
+		{"UDP", udp.NewProtocol, testReceiveUDP},
 	}
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			s := stack.New(stack.Options{
-				NetworkProtocols:   []stack.NetworkProtocol{NewProtocol()},
-				TransportProtocols: []stack.TransportProtocol{test.protocolFactory},
+				NetworkProtocols:   []stack.NetworkProtocolFactory{NewProtocol},
+				TransportProtocols: []stack.TransportProtocolFactory{test.protocolFactory},
 			})
 			e := channel.New(10, 1280, linkAddr1)
 			if err := s.CreateNIC(1, e); err != nil {
@@ -172,11 +174,11 @@ func TestReceiveOnSolicitedNodeAddr(t *testing.T) {
 
 	tests := []struct {
 		name            string
-		protocolFactory stack.TransportProtocol
+		protocolFactory stack.TransportProtocolFactory
 		rxf             func(t *testing.T, s *stack.Stack, e *channel.Endpoint, src, dst tcpip.Address, want uint64)
 	}{
-		{"ICMP", icmp.NewProtocol6(), testReceiveICMP},
-		{"UDP", udp.NewProtocol(), testReceiveUDP},
+		{"ICMP", icmp.NewProtocol6, testReceiveICMP},
+		{"UDP", udp.NewProtocol, testReceiveUDP},
 	}
 
 	snmc := header.SolicitedNodeAddr(addr2)
@@ -184,8 +186,8 @@ func TestReceiveOnSolicitedNodeAddr(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			s := stack.New(stack.Options{
-				NetworkProtocols:   []stack.NetworkProtocol{NewProtocol()},
-				TransportProtocols: []stack.TransportProtocol{test.protocolFactory},
+				NetworkProtocols:   []stack.NetworkProtocolFactory{NewProtocol},
+				TransportProtocols: []stack.TransportProtocolFactory{test.protocolFactory},
 			})
 			e := channel.New(1, 1280, linkAddr1)
 			if err := s.CreateNIC(nicID, e); err != nil {
@@ -271,7 +273,7 @@ func TestAddIpv6Address(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			s := stack.New(stack.Options{
-				NetworkProtocols: []stack.NetworkProtocol{NewProtocol()},
+				NetworkProtocols: []stack.NetworkProtocolFactory{NewProtocol},
 			})
 			if err := s.CreateNIC(1, &stubLinkEndpoint{}); err != nil {
 				t.Fatalf("CreateNIC(_) = %s", err)
@@ -577,8 +579,8 @@ func TestReceiveIPv6ExtHdrs(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			s := stack.New(stack.Options{
-				NetworkProtocols:   []stack.NetworkProtocol{NewProtocol()},
-				TransportProtocols: []stack.TransportProtocol{udp.NewProtocol()},
+				NetworkProtocols:   []stack.NetworkProtocolFactory{NewProtocol},
+				TransportProtocols: []stack.TransportProtocolFactory{udp.NewProtocol},
 			})
 			e := channel.New(0, 1280, linkAddr1)
 			if err := s.CreateNIC(nicID, e); err != nil {
@@ -687,6 +689,7 @@ func TestReceiveIPv6Fragments(t *testing.T) {
 		// Used to test cases where the fragment blocks are not a multiple of
 		// the fragment block size of 8 (RFC 8200 section 4.5).
 		udpPayload3Length = 127
+		udpPayload4Length = header.IPv6MaximumPayloadSize - header.UDPMinimumSize
 		fragmentExtHdrLen = 8
 		// Note, not all routing extension headers will be 8 bytes but this test
 		// uses 8 byte routing extension headers for most sub tests.
@@ -730,6 +733,10 @@ func TestReceiveIPv6Fragments(t *testing.T) {
 	var udpPayload3Addr1ToAddr2Buf [udpPayload3Length]byte
 	udpPayload3Addr1ToAddr2 := udpPayload3Addr1ToAddr2Buf[:]
 	ipv6Payload3Addr1ToAddr2 := udpGen(udpPayload3Addr1ToAddr2, 3, addr1, addr2)
+
+	var udpPayload4Addr1ToAddr2Buf [udpPayload4Length]byte
+	udpPayload4Addr1ToAddr2 := udpPayload4Addr1ToAddr2Buf[:]
+	ipv6Payload4Addr1ToAddr2 := udpGen(udpPayload4Addr1ToAddr2, 4, addr1, addr2)
 
 	tests := []struct {
 		name             string
@@ -1018,6 +1025,44 @@ func TestReceiveIPv6Fragments(t *testing.T) {
 				},
 			},
 			expectedPayloads: nil,
+		},
+		{
+			name: "Two fragments reassembled into a maximum UDP packet",
+			fragments: []fragmentData{
+				{
+					srcAddr: addr1,
+					dstAddr: addr2,
+					nextHdr: fragmentExtHdrID,
+					data: buffer.NewVectorisedView(
+						fragmentExtHdrLen+65520,
+						[]buffer.View{
+							// Fragment extension header.
+							//
+							// Fragment offset = 0, More = true, ID = 1
+							buffer.View([]byte{uint8(header.UDPProtocolNumber), 0, 0, 1, 0, 0, 0, 1}),
+
+							ipv6Payload4Addr1ToAddr2[:65520],
+						},
+					),
+				},
+				{
+					srcAddr: addr1,
+					dstAddr: addr2,
+					nextHdr: fragmentExtHdrID,
+					data: buffer.NewVectorisedView(
+						fragmentExtHdrLen+len(ipv6Payload4Addr1ToAddr2)-65520,
+						[]buffer.View{
+							// Fragment extension header.
+							//
+							// Fragment offset = 8190, More = false, ID = 1
+							buffer.View([]byte{uint8(header.UDPProtocolNumber), 0, 255, 240, 0, 0, 0, 1}),
+
+							ipv6Payload4Addr1ToAddr2[65520:],
+						},
+					),
+				},
+			},
+			expectedPayloads: [][]byte{udpPayload4Addr1ToAddr2},
 		},
 		{
 			name: "Two fragments with per-fragment routing header with zero segments left",
@@ -1504,8 +1549,8 @@ func TestReceiveIPv6Fragments(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			s := stack.New(stack.Options{
-				NetworkProtocols:   []stack.NetworkProtocol{NewProtocol()},
-				TransportProtocols: []stack.TransportProtocol{udp.NewProtocol()},
+				NetworkProtocols:   []stack.NetworkProtocolFactory{NewProtocol},
+				TransportProtocols: []stack.TransportProtocolFactory{udp.NewProtocol},
 			})
 			e := channel.New(0, 1280, linkAddr1)
 			if err := s.CreateNIC(nicID, e); err != nil {
@@ -1570,5 +1615,310 @@ func TestReceiveIPv6Fragments(t *testing.T) {
 				t.Fatalf("(last) got Read(nil) = (%x, _, %v), want = (_, _, %s)", gotPayload, err, tcpip.ErrWouldBlock)
 			}
 		})
+	}
+}
+
+func TestInvalidIPv6Fragments(t *testing.T) {
+	const (
+		nicID             = 1
+		fragmentExtHdrLen = 8
+	)
+
+	payloadGen := func(payloadLen int) []byte {
+		payload := make([]byte, payloadLen)
+		for i := 0; i < len(payload); i++ {
+			payload[i] = 0x30
+		}
+		return payload
+	}
+
+	tests := []struct {
+		name                   string
+		fragments              []fragmentData
+		wantMalformedIPPackets uint64
+		wantMalformedFragments uint64
+	}{
+		{
+			name: "fragments reassembled into a payload exceeding the max IPv6 payload size",
+			fragments: []fragmentData{
+				{
+					srcAddr: addr1,
+					dstAddr: addr2,
+					nextHdr: fragmentExtHdrID,
+					data: buffer.NewVectorisedView(
+						fragmentExtHdrLen+(header.IPv6MaximumPayloadSize+1)-16,
+						[]buffer.View{
+							// Fragment extension header.
+							// Fragment offset = 8190, More = false, ID = 1
+							buffer.View([]byte{uint8(header.UDPProtocolNumber), 0,
+								((header.IPv6MaximumPayloadSize + 1) - 16) >> 8,
+								((header.IPv6MaximumPayloadSize + 1) - 16) & math.MaxUint8,
+								0, 0, 0, 1}),
+							// Payload length = 16
+							payloadGen(16),
+						},
+					),
+				},
+			},
+			wantMalformedIPPackets: 1,
+			wantMalformedFragments: 1,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			s := stack.New(stack.Options{
+				NetworkProtocols: []stack.NetworkProtocolFactory{
+					NewProtocol,
+				},
+			})
+			e := channel.New(0, 1500, linkAddr1)
+			if err := s.CreateNIC(nicID, e); err != nil {
+				t.Fatalf("CreateNIC(%d, _) = %s", nicID, err)
+			}
+			if err := s.AddAddress(nicID, ProtocolNumber, addr2); err != nil {
+				t.Fatalf("AddAddress(%d, %d, %s) = %s", nicID, ProtocolNumber, addr2, err)
+			}
+
+			for _, f := range test.fragments {
+				hdr := buffer.NewPrependable(header.IPv6MinimumSize)
+
+				// Serialize IPv6 fixed header.
+				ip := header.IPv6(hdr.Prepend(header.IPv6MinimumSize))
+				ip.Encode(&header.IPv6Fields{
+					PayloadLength: uint16(f.data.Size()),
+					NextHeader:    f.nextHdr,
+					HopLimit:      255,
+					SrcAddr:       f.srcAddr,
+					DstAddr:       f.dstAddr,
+				})
+
+				vv := hdr.View().ToVectorisedView()
+				vv.Append(f.data)
+
+				e.InjectInbound(ProtocolNumber, stack.NewPacketBuffer(stack.PacketBufferOptions{
+					Data: vv,
+				}))
+			}
+
+			if got, want := s.Stats().IP.MalformedPacketsReceived.Value(), test.wantMalformedIPPackets; got != want {
+				t.Errorf("got Stats.IP.MalformedPacketsReceived = %d, want = %d", got, want)
+			}
+			if got, want := s.Stats().IP.MalformedFragmentsReceived.Value(), test.wantMalformedFragments; got != want {
+				t.Errorf("got Stats.IP.MalformedFragmentsReceived = %d, want = %d", got, want)
+			}
+		})
+	}
+}
+
+func TestWriteStats(t *testing.T) {
+	const nPackets = 3
+	tests := []struct {
+		name          string
+		setup         func(*testing.T, *stack.Stack)
+		allowPackets  int
+		expectSent    int
+		expectDropped int
+		expectWritten int
+	}{
+		{
+			name: "Accept all",
+			// No setup needed, tables accept everything by default.
+			setup:         func(*testing.T, *stack.Stack) {},
+			allowPackets:  math.MaxInt32,
+			expectSent:    nPackets,
+			expectDropped: 0,
+			expectWritten: nPackets,
+		}, {
+			name: "Accept all with error",
+			// No setup needed, tables accept everything by default.
+			setup:         func(*testing.T, *stack.Stack) {},
+			allowPackets:  nPackets - 1,
+			expectSent:    nPackets - 1,
+			expectDropped: 0,
+			expectWritten: nPackets - 1,
+		}, {
+			name: "Drop all",
+			setup: func(t *testing.T, stk *stack.Stack) {
+				// Install Output DROP rule.
+				t.Helper()
+				ipt := stk.IPTables()
+				filter, ok := ipt.GetTable(stack.FilterTable, true /* ipv6 */)
+				if !ok {
+					t.Fatalf("failed to find filter table")
+				}
+				ruleIdx := filter.BuiltinChains[stack.Output]
+				filter.Rules[ruleIdx].Target = &stack.DropTarget{}
+				if err := ipt.ReplaceTable(stack.FilterTable, filter, true /* ipv6 */); err != nil {
+					t.Fatalf("failed to replace table: %v", err)
+				}
+			},
+			allowPackets:  math.MaxInt32,
+			expectSent:    0,
+			expectDropped: nPackets,
+			expectWritten: nPackets,
+		}, {
+			name: "Drop some",
+			setup: func(t *testing.T, stk *stack.Stack) {
+				// Install Output DROP rule that matches only 1
+				// of the 3 packets.
+				t.Helper()
+				ipt := stk.IPTables()
+				filter, ok := ipt.GetTable(stack.FilterTable, true /* ipv6 */)
+				if !ok {
+					t.Fatalf("failed to find filter table")
+				}
+				// We'll match and DROP the last packet.
+				ruleIdx := filter.BuiltinChains[stack.Output]
+				filter.Rules[ruleIdx].Target = &stack.DropTarget{}
+				filter.Rules[ruleIdx].Matchers = []stack.Matcher{&limitedMatcher{nPackets - 1}}
+				// Make sure the next rule is ACCEPT.
+				filter.Rules[ruleIdx+1].Target = &stack.AcceptTarget{}
+				if err := ipt.ReplaceTable(stack.FilterTable, filter, true /* ipv6 */); err != nil {
+					t.Fatalf("failed to replace table: %v", err)
+				}
+			},
+			allowPackets:  math.MaxInt32,
+			expectSent:    nPackets - 1,
+			expectDropped: 1,
+			expectWritten: nPackets,
+		},
+	}
+
+	writers := []struct {
+		name         string
+		writePackets func(*stack.Route, stack.PacketBufferList) (int, *tcpip.Error)
+	}{
+		{
+			name: "WritePacket",
+			writePackets: func(rt *stack.Route, pkts stack.PacketBufferList) (int, *tcpip.Error) {
+				nWritten := 0
+				for pkt := pkts.Front(); pkt != nil; pkt = pkt.Next() {
+					if err := rt.WritePacket(nil, stack.NetworkHeaderParams{}, pkt); err != nil {
+						return nWritten, err
+					}
+					nWritten++
+				}
+				return nWritten, nil
+			},
+		}, {
+			name: "WritePackets",
+			writePackets: func(rt *stack.Route, pkts stack.PacketBufferList) (int, *tcpip.Error) {
+				return rt.WritePackets(nil, pkts, stack.NetworkHeaderParams{})
+			},
+		},
+	}
+
+	for _, writer := range writers {
+		t.Run(writer.name, func(t *testing.T) {
+			for _, test := range tests {
+				t.Run(test.name, func(t *testing.T) {
+					ep := testutil.NewMockLinkEndpoint(header.IPv6MinimumMTU, tcpip.ErrInvalidEndpointState, test.allowPackets)
+					rt := buildRoute(t, ep)
+
+					var pkts stack.PacketBufferList
+					for i := 0; i < nPackets; i++ {
+						pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
+							ReserveHeaderBytes: header.UDPMinimumSize + int(rt.MaxHeaderLength()),
+							Data:               buffer.NewView(0).ToVectorisedView(),
+						})
+						pkt.TransportHeader().Push(header.UDPMinimumSize)
+						pkts.PushBack(pkt)
+					}
+
+					test.setup(t, rt.Stack())
+
+					nWritten, _ := writer.writePackets(&rt, pkts)
+
+					if got := int(rt.Stats().IP.PacketsSent.Value()); got != test.expectSent {
+						t.Errorf("sent %d packets, but expected to send %d", got, test.expectSent)
+					}
+					if got := int(rt.Stats().IP.IPTablesOutputDropped.Value()); got != test.expectDropped {
+						t.Errorf("dropped %d packets, but expected to drop %d", got, test.expectDropped)
+					}
+					if nWritten != test.expectWritten {
+						t.Errorf("wrote %d packets, but expected WritePackets to return %d", nWritten, test.expectWritten)
+					}
+				})
+			}
+		})
+	}
+}
+
+func buildRoute(t *testing.T, ep stack.LinkEndpoint) stack.Route {
+	s := stack.New(stack.Options{
+		NetworkProtocols: []stack.NetworkProtocolFactory{NewProtocol},
+	})
+	if err := s.CreateNIC(1, ep); err != nil {
+		t.Fatalf("CreateNIC(1, _) failed: %s", err)
+	}
+	const (
+		src = "\xfc\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x01"
+		dst = "\xfc\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x02"
+	)
+	if err := s.AddAddress(1, ProtocolNumber, src); err != nil {
+		t.Fatalf("AddAddress(1, %d, _) failed: %s", ProtocolNumber, err)
+	}
+	{
+		subnet, err := tcpip.NewSubnet(dst, tcpip.AddressMask("\xfc\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff"))
+		if err != nil {
+			t.Fatalf("NewSubnet(_, _) failed: %v", err)
+		}
+		s.SetRouteTable([]tcpip.Route{{
+			Destination: subnet,
+			NIC:         1,
+		}})
+	}
+	rt, err := s.FindRoute(1, src, dst, ProtocolNumber, false /* multicastLoop */)
+	if err != nil {
+		t.Fatalf("got FindRoute(1, _, _, %d, false) = %s, want = nil", ProtocolNumber, err)
+	}
+	return rt
+}
+
+// limitedMatcher is an iptables matcher that matches after a certain number of
+// packets are checked against it.
+type limitedMatcher struct {
+	limit int
+}
+
+// Name implements Matcher.Name.
+func (*limitedMatcher) Name() string {
+	return "limitedMatcher"
+}
+
+// Match implements Matcher.Match.
+func (lm *limitedMatcher) Match(stack.Hook, *stack.PacketBuffer, string) (bool, bool) {
+	if lm.limit == 0 {
+		return true, false
+	}
+	lm.limit--
+	return false, false
+}
+
+func TestClearEndpointFromProtocolOnClose(t *testing.T) {
+	s := stack.New(stack.Options{
+		NetworkProtocols: []stack.NetworkProtocolFactory{NewProtocol},
+	})
+	proto := s.NetworkProtocolInstance(ProtocolNumber).(*protocol)
+	ep := proto.NewEndpoint(&testInterface{}, nil, nil, nil).(*endpoint)
+	{
+		proto.mu.Lock()
+		_, hasEP := proto.mu.eps[ep]
+		proto.mu.Unlock()
+		if !hasEP {
+			t.Fatalf("expected protocol to have ep = %p in set of endpoints", ep)
+		}
+	}
+
+	ep.Close()
+
+	{
+		proto.mu.Lock()
+		_, hasEP := proto.mu.eps[ep]
+		proto.mu.Unlock()
+		if hasEP {
+			t.Fatalf("unexpectedly found ep = %p in set of protocol's endpoints", ep)
+		}
 	}
 }

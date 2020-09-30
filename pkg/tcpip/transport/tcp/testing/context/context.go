@@ -53,11 +53,11 @@ const (
 	TestPort = 4096
 
 	// StackV6Addr is the IPv6 address assigned to the stack.
-	StackV6Addr = "\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x01"
+	StackV6Addr = "\x0a\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x01"
 
 	// TestV6Addr is the source address for packets sent to the stack via
 	// the link layer endpoint.
-	TestV6Addr = "\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x02"
+	TestV6Addr = "\x0a\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x02"
 
 	// StackV4MappedAddr is StackAddr as a mapped v6 address.
 	StackV4MappedAddr = "\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\xff\xff" + StackAddr
@@ -72,6 +72,18 @@ const (
 	// are sent in response to a SYN or in the initial SYN sent to the stack.
 	testInitialSequenceNumber = 789
 )
+
+// StackAddrWithPrefix is StackAddr with its associated prefix length.
+var StackAddrWithPrefix = tcpip.AddressWithPrefix{
+	Address:   StackAddr,
+	PrefixLen: 24,
+}
+
+// StackV6AddrWithPrefix is StackV6Addr with its associated prefix length.
+var StackV6AddrWithPrefix = tcpip.AddressWithPrefix{
+	Address:   StackV6Addr,
+	PrefixLen: header.IIDOffsetInIPv6Address * 8,
+}
 
 // Headers is used to represent the TCP header fields when building a
 // new packet.
@@ -133,32 +145,39 @@ type Context struct {
 	// WindowScale is the expected window scale in SYN packets sent by
 	// the stack.
 	WindowScale uint8
+
+	// RcvdWindowScale is the actual window scale sent by the stack in
+	// SYN/SYN-ACK.
+	RcvdWindowScale uint8
 }
 
 // New allocates and initializes a test context containing a new
 // stack and a link-layer endpoint.
 func New(t *testing.T, mtu uint32) *Context {
 	s := stack.New(stack.Options{
-		NetworkProtocols:   []stack.NetworkProtocol{ipv4.NewProtocol(), ipv6.NewProtocol()},
-		TransportProtocols: []stack.TransportProtocol{tcp.NewProtocol()},
+		NetworkProtocols:   []stack.NetworkProtocolFactory{ipv4.NewProtocol, ipv6.NewProtocol},
+		TransportProtocols: []stack.TransportProtocolFactory{tcp.NewProtocol},
 	})
 
 	const sendBufferSize = 1 << 20 // 1 MiB
 	const recvBufferSize = 1 << 20 // 1 MiB
 	// Allow minimum send/receive buffer sizes to be 1 during tests.
-	if err := s.SetTransportProtocolOption(tcp.ProtocolNumber, tcp.SendBufferSizeOption{Min: 1, Default: sendBufferSize, Max: 10 * sendBufferSize}); err != nil {
-		t.Fatalf("SetTransportProtocolOption failed: %s", err)
+	sendBufOpt := tcpip.TCPSendBufferSizeRangeOption{Min: 1, Default: sendBufferSize, Max: 10 * sendBufferSize}
+	if err := s.SetTransportProtocolOption(tcp.ProtocolNumber, &sendBufOpt); err != nil {
+		t.Fatalf("SetTransportProtocolOption(%d, &%#v) failed: %s", tcp.ProtocolNumber, sendBufOpt, err)
 	}
 
-	if err := s.SetTransportProtocolOption(tcp.ProtocolNumber, tcp.ReceiveBufferSizeOption{Min: 1, Default: recvBufferSize, Max: 10 * recvBufferSize}); err != nil {
-		t.Fatalf("SetTransportProtocolOption failed: %s", err)
+	rcvBufOpt := tcpip.TCPReceiveBufferSizeRangeOption{Min: 1, Default: recvBufferSize, Max: 10 * recvBufferSize}
+	if err := s.SetTransportProtocolOption(tcp.ProtocolNumber, &rcvBufOpt); err != nil {
+		t.Fatalf("SetTransportProtocolOption(%d, &%#v) failed: %s", tcp.ProtocolNumber, rcvBufOpt, err)
 	}
 
 	// Increase minimum RTO in tests to avoid test flakes due to early
 	// retransmit in case the test executors are overloaded and cause timers
 	// to fire earlier than expected.
-	if err := s.SetTransportProtocolOption(tcp.ProtocolNumber, tcpip.TCPMinRTOOption(3*time.Second)); err != nil {
-		t.Fatalf("failed to set stack-wide minRTO: %s", err)
+	minRTOOpt := tcpip.TCPMinRTOOption(3 * time.Second)
+	if err := s.SetTransportProtocolOption(tcp.ProtocolNumber, &minRTOOpt); err != nil {
+		t.Fatalf("s.SetTransportProtocolOption(%d, &%T(%d)): %s", tcp.ProtocolNumber, minRTOOpt, minRTOOpt, err)
 	}
 
 	// Some of the congestion control tests send up to 640 packets, we so
@@ -181,12 +200,20 @@ func New(t *testing.T, mtu uint32) *Context {
 		t.Fatalf("CreateNICWithOptions(_, _, %+v) failed: %v", opts2, err)
 	}
 
-	if err := s.AddAddress(1, ipv4.ProtocolNumber, StackAddr); err != nil {
-		t.Fatalf("AddAddress failed: %v", err)
+	v4ProtocolAddr := tcpip.ProtocolAddress{
+		Protocol:          ipv4.ProtocolNumber,
+		AddressWithPrefix: StackAddrWithPrefix,
+	}
+	if err := s.AddProtocolAddress(1, v4ProtocolAddr); err != nil {
+		t.Fatalf("AddProtocolAddress(1, %#v): %s", v4ProtocolAddr, err)
 	}
 
-	if err := s.AddAddress(1, ipv6.ProtocolNumber, StackV6Addr); err != nil {
-		t.Fatalf("AddAddress failed: %v", err)
+	v6ProtocolAddr := tcpip.ProtocolAddress{
+		Protocol:          ipv6.ProtocolNumber,
+		AddressWithPrefix: StackV6AddrWithPrefix,
+	}
+	if err := s.AddProtocolAddress(1, v6ProtocolAddr); err != nil {
+		t.Fatalf("AddProtocolAddress(1, %#v): %s", v6ProtocolAddr, err)
 	}
 
 	s.SetRouteTable([]tcpip.Route{
@@ -238,23 +265,30 @@ func (c *Context) CheckNoPacket(errMsg string) {
 	c.CheckNoPacketTimeout(errMsg, 1*time.Second)
 }
 
-// GetPacket reads a packet from the link layer endpoint and verifies
+// GetPacketWithTimeout reads a packet from the link layer endpoint and verifies
 // that it is an IPv4 packet with the expected source and destination
-// addresses. It will fail with an error if no packet is received for
-// 2 seconds.
-func (c *Context) GetPacket() []byte {
+// addresses. If no packet is received in the specified timeout it will return
+// nil.
+func (c *Context) GetPacketWithTimeout(timeout time.Duration) []byte {
 	c.t.Helper()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 	p, ok := c.linkEP.ReadContext(ctx)
 	if !ok {
-		c.t.Fatalf("Packet wasn't written out")
 		return nil
 	}
 
 	if p.Proto != ipv4.ProtocolNumber {
 		c.t.Fatalf("Bad network protocol: got %v, wanted %v", p.Proto, ipv4.ProtocolNumber)
+	}
+
+	// Just check that the stack set the transport protocol number for outbound
+	// TCP messages.
+	// TODO(gvisor.dev/issues/3810): Remove when protocol numbers are part
+	// of the headerinfo.
+	if p.Pkt.TransportProtocolNumber != tcp.ProtocolNumber {
+		c.t.Fatalf("got p.Pkt.TransportProtocolNumber = %d, want = %d", p.Pkt.TransportProtocolNumber, tcp.ProtocolNumber)
 	}
 
 	vv := buffer.NewVectorisedView(p.Pkt.Size(), p.Pkt.Views())
@@ -266,6 +300,21 @@ func (c *Context) GetPacket() []byte {
 
 	checker.IPv4(c.t, b, checker.SrcAddr(StackAddr), checker.DstAddr(TestAddr))
 	return b
+}
+
+// GetPacket reads a packet from the link layer endpoint and verifies
+// that it is an IPv4 packet with the expected source and destination
+// addresses.
+func (c *Context) GetPacket() []byte {
+	c.t.Helper()
+
+	p := c.GetPacketWithTimeout(5 * time.Second)
+	if p == nil {
+		c.t.Fatalf("Packet wasn't written out")
+		return nil
+	}
+
+	return p
 }
 
 // GetPacketNonBlocking reads a packet from the link layer endpoint
@@ -282,6 +331,14 @@ func (c *Context) GetPacketNonBlocking() []byte {
 
 	if p.Proto != ipv4.ProtocolNumber {
 		c.t.Fatalf("Bad network protocol: got %v, wanted %v", p.Proto, ipv4.ProtocolNumber)
+	}
+
+	// Just check that the stack set the transport protocol number for outbound
+	// TCP messages.
+	// TODO(gvisor.dev/issues/3810): Remove when protocol numbers are part
+	// of the headerinfo.
+	if p.Pkt.TransportProtocolNumber != tcp.ProtocolNumber {
+		c.t.Fatalf("got p.Pkt.TransportProtocolNumber = %d, want = %d", p.Pkt.TransportProtocolNumber, tcp.ProtocolNumber)
 	}
 
 	vv := buffer.NewVectorisedView(p.Pkt.Size(), p.Pkt.Views())
@@ -447,8 +504,8 @@ func (c *Context) ReceiveAndCheckPacketWithOptions(data []byte, offset, size, op
 		checker.PayloadLen(size+header.TCPMinimumSize+optlen),
 		checker.TCP(
 			checker.DstPort(TestPort),
-			checker.SeqNum(uint32(c.IRS.Add(seqnum.Size(1+offset)))),
-			checker.AckNum(uint32(seqnum.Value(testInitialSequenceNumber).Add(1))),
+			checker.TCPSeqNum(uint32(c.IRS.Add(seqnum.Size(1+offset)))),
+			checker.TCPAckNum(uint32(seqnum.Value(testInitialSequenceNumber).Add(1))),
 			checker.TCPFlagsMatch(header.TCPFlagAck, ^uint8(header.TCPFlagPsh)),
 		),
 	)
@@ -474,8 +531,8 @@ func (c *Context) ReceiveNonBlockingAndCheckPacket(data []byte, offset, size int
 		checker.PayloadLen(size+header.TCPMinimumSize),
 		checker.TCP(
 			checker.DstPort(TestPort),
-			checker.SeqNum(uint32(c.IRS.Add(seqnum.Size(1+offset)))),
-			checker.AckNum(uint32(seqnum.Value(testInitialSequenceNumber).Add(1))),
+			checker.TCPSeqNum(uint32(c.IRS.Add(seqnum.Size(1+offset)))),
+			checker.TCPAckNum(uint32(seqnum.Value(testInitialSequenceNumber).Add(1))),
 			checker.TCPFlagsMatch(header.TCPFlagAck, ^uint8(header.TCPFlagPsh)),
 		),
 	)
@@ -613,6 +670,7 @@ func (c *Context) Connect(iss seqnum.Value, rcvWnd seqnum.Size, options []byte) 
 	}
 
 	tcpHdr := header.TCP(header.IPv4(b).Payload())
+	synOpts := header.ParseSynOptions(tcpHdr.Options(), false /* isAck */)
 	c.IRS = seqnum.Value(tcpHdr.SequenceNumber())
 
 	c.SendPacket(nil, &Headers{
@@ -630,8 +688,8 @@ func (c *Context) Connect(iss seqnum.Value, rcvWnd seqnum.Size, options []byte) 
 		checker.TCP(
 			checker.DstPort(TestPort),
 			checker.TCPFlags(header.TCPFlagAck),
-			checker.SeqNum(uint32(c.IRS)+1),
-			checker.AckNum(uint32(iss)+1),
+			checker.TCPSeqNum(uint32(c.IRS)+1),
+			checker.TCPAckNum(uint32(iss)+1),
 		),
 	)
 
@@ -648,6 +706,7 @@ func (c *Context) Connect(iss seqnum.Value, rcvWnd seqnum.Size, options []byte) 
 		c.t.Fatalf("Unexpected endpoint state: want %v, got %v", want, got)
 	}
 
+	c.RcvdWindowScale = uint8(synOpts.WS)
 	c.Port = tcpHdr.SourcePort()
 }
 
@@ -719,17 +778,18 @@ func (r *RawEndpoint) SendPacket(payload []byte, opts []byte) {
 	r.NextSeqNum = r.NextSeqNum.Add(seqnum.Size(len(payload)))
 }
 
-// VerifyACKWithTS verifies that the tsEcr field in the ack matches the provided
-// tsVal.
-func (r *RawEndpoint) VerifyACKWithTS(tsVal uint32) {
+// VerifyAndReturnACKWithTS verifies that the tsEcr field int he ACK matches
+// the provided tsVal as well as returns the original packet.
+func (r *RawEndpoint) VerifyAndReturnACKWithTS(tsVal uint32) []byte {
+	r.C.t.Helper()
 	// Read ACK and verify that tsEcr of ACK packet is [1,2,3,4]
 	ackPacket := r.C.GetPacket()
 	checker.IPv4(r.C.t, ackPacket,
 		checker.TCP(
 			checker.DstPort(r.SrcPort),
 			checker.TCPFlags(header.TCPFlagAck),
-			checker.SeqNum(uint32(r.AckNum)),
-			checker.AckNum(uint32(r.NextSeqNum)),
+			checker.TCPSeqNum(uint32(r.AckNum)),
+			checker.TCPAckNum(uint32(r.NextSeqNum)),
 			checker.TCPTimestampChecker(true, 0, tsVal),
 		),
 	)
@@ -737,19 +797,28 @@ func (r *RawEndpoint) VerifyACKWithTS(tsVal uint32) {
 	tcpSeg := header.TCP(header.IPv4(ackPacket).Payload())
 	opts := tcpSeg.ParsedOptions()
 	r.RecentTS = opts.TSVal
+	return ackPacket
+}
+
+// VerifyACKWithTS verifies that the tsEcr field in the ack matches the provided
+// tsVal.
+func (r *RawEndpoint) VerifyACKWithTS(tsVal uint32) {
+	r.C.t.Helper()
+	_ = r.VerifyAndReturnACKWithTS(tsVal)
 }
 
 // VerifyACKRcvWnd verifies that the window advertised by the incoming ACK
 // matches the provided rcvWnd.
 func (r *RawEndpoint) VerifyACKRcvWnd(rcvWnd uint16) {
+	r.C.t.Helper()
 	ackPacket := r.C.GetPacket()
 	checker.IPv4(r.C.t, ackPacket,
 		checker.TCP(
 			checker.DstPort(r.SrcPort),
 			checker.TCPFlags(header.TCPFlagAck),
-			checker.SeqNum(uint32(r.AckNum)),
-			checker.AckNum(uint32(r.NextSeqNum)),
-			checker.Window(rcvWnd),
+			checker.TCPSeqNum(uint32(r.AckNum)),
+			checker.TCPAckNum(uint32(r.NextSeqNum)),
+			checker.TCPWindow(rcvWnd),
 		),
 	)
 }
@@ -768,8 +837,8 @@ func (r *RawEndpoint) VerifyACKHasSACK(sackBlocks []header.SACKBlock) {
 		checker.TCP(
 			checker.DstPort(r.SrcPort),
 			checker.TCPFlags(header.TCPFlagAck),
-			checker.SeqNum(uint32(r.AckNum)),
-			checker.AckNum(uint32(r.NextSeqNum)),
+			checker.TCPSeqNum(uint32(r.AckNum)),
+			checker.TCPAckNum(uint32(r.NextSeqNum)),
 			checker.TCPSACKBlockChecker(sackBlocks),
 		),
 	)
@@ -861,8 +930,8 @@ func (c *Context) CreateConnectedWithOptions(wantOptions header.TCPSynOptions) *
 	tcpCheckers := []checker.TransportChecker{
 		checker.DstPort(TestPort),
 		checker.TCPFlags(header.TCPFlagAck),
-		checker.SeqNum(uint32(c.IRS) + 1),
-		checker.AckNum(uint32(iss) + 1),
+		checker.TCPSeqNum(uint32(c.IRS) + 1),
+		checker.TCPAckNum(uint32(iss) + 1),
 	}
 
 	// Verify that tsEcr of ACK packet is wantOptions.TSVal if the
@@ -897,7 +966,7 @@ func (c *Context) CreateConnectedWithOptions(wantOptions header.TCPSynOptions) *
 
 	// Mark in context that timestamp option is enabled for this endpoint.
 	c.TimeStampEnabled = true
-
+	c.RcvdWindowScale = uint8(synOptions.WS)
 	return &RawEndpoint{
 		C:             c,
 		SrcPort:       tcpSeg.DestinationPort(),
@@ -948,12 +1017,12 @@ func (c *Context) AcceptWithOptions(wndScale int, synOptions header.TCPSynOption
 	wq.EventRegister(&we, waiter.EventIn)
 	defer wq.EventUnregister(&we)
 
-	c.EP, _, err = ep.Accept()
+	c.EP, _, err = ep.Accept(nil)
 	if err == tcpip.ErrWouldBlock {
 		// Wait for connection to be established.
 		select {
 		case <-ch:
-			c.EP, _, err = ep.Accept()
+			c.EP, _, err = ep.Accept(nil)
 			if err != nil {
 				c.t.Fatalf("Accept failed: %v", err)
 			}
@@ -990,6 +1059,7 @@ func (c *Context) PassiveConnect(maxPayload, wndScale int, synOptions header.TCP
 // value of the window scaling option to be sent in the SYN. If synOptions.WS >
 // 0 then we send the WindowScale option.
 func (c *Context) PassiveConnectWithOptions(maxPayload, wndScale int, synOptions header.TCPSynOptions) *RawEndpoint {
+	c.t.Helper()
 	opts := make([]byte, header.TCPOptionsMaximumSize)
 	offset := 0
 	offset += header.EncodeMSSOption(uint32(maxPayload), opts)
@@ -1028,13 +1098,14 @@ func (c *Context) PassiveConnectWithOptions(maxPayload, wndScale int, synOptions
 	// are present.
 	b := c.GetPacket()
 	tcp := header.TCP(header.IPv4(b).Payload())
+	rcvdSynOptions := header.ParseSynOptions(tcp.Options(), true /* isAck */)
 	c.IRS = seqnum.Value(tcp.SequenceNumber())
 
 	tcpCheckers := []checker.TransportChecker{
 		checker.SrcPort(StackPort),
 		checker.DstPort(TestPort),
 		checker.TCPFlags(header.TCPFlagAck | header.TCPFlagSyn),
-		checker.AckNum(uint32(iss) + 1),
+		checker.TCPAckNum(uint32(iss) + 1),
 		checker.TCPSynOptions(header.TCPSynOptions{MSS: synOptions.MSS, WS: wndScale, SACKPermitted: synOptions.SACKPermitted && c.SACKEnabled()}),
 	}
 
@@ -1077,6 +1148,7 @@ func (c *Context) PassiveConnectWithOptions(maxPayload, wndScale int, synOptions
 	// Send ACK.
 	c.SendPacket(nil, ackHeaders)
 
+	c.RcvdWindowScale = uint8(rcvdSynOptions.WS)
 	c.Port = StackPort
 
 	return &RawEndpoint{
@@ -1096,7 +1168,7 @@ func (c *Context) PassiveConnectWithOptions(maxPayload, wndScale int, synOptions
 // SACKEnabled returns true if the TCP Protocol option SACKEnabled is set to true
 // for the Stack in the context.
 func (c *Context) SACKEnabled() bool {
-	var v tcp.SACKEnabled
+	var v tcpip.TCPSACKEnabled
 	if err := c.Stack().TransportProtocolOption(tcp.ProtocolNumber, &v); err != nil {
 		// Stack doesn't support SACK. So just return.
 		return false

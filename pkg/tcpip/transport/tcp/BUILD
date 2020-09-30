@@ -69,6 +69,7 @@ go_library(
         "//pkg/tcpip/buffer",
         "//pkg/tcpip/hash/jenkins",
         "//pkg/tcpip/header",
+        "//pkg/tcpip/header/parse",
         "//pkg/tcpip/ports",
         "//pkg/tcpip/seqnum",
         "//pkg/tcpip/stack",
@@ -93,6 +94,7 @@ go_test(
     shard_count = 10,
     deps = [
         ":tcp",
+        "//pkg/rand",
         "//pkg/sync",
         "//pkg/tcpip",
         "//pkg/tcpip/buffer",

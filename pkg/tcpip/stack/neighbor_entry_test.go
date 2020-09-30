@@ -27,6 +27,8 @@ import (
 	"github.com/google/go-cmp/cmp/cmpopts"
 	"gvisor.dev/gvisor/pkg/sleep"
 	"gvisor.dev/gvisor/pkg/tcpip"
+	"gvisor.dev/gvisor/pkg/tcpip/faketime"
+	"gvisor.dev/gvisor/pkg/tcpip/header"
 )
 
 const (
@@ -221,8 +223,8 @@ func (r *entryTestLinkResolver) LinkAddressProtocol() tcpip.NetworkProtocolNumbe
 	return entryTestNetNumber
 }
 
-func entryTestSetup(c NUDConfigurations) (*neighborEntry, *testNUDDispatcher, *entryTestLinkResolver, *fakeClock) {
-	clock := newFakeClock()
+func entryTestSetup(c NUDConfigurations) (*neighborEntry, *testNUDDispatcher, *entryTestLinkResolver, *faketime.ManualClock) {
+	clock := faketime.NewManualClock()
 	disp := testNUDDispatcher{}
 	nic := NIC{
 		id:     entryTestNICID,
@@ -232,17 +234,14 @@ func entryTestSetup(c NUDConfigurations) (*neighborEntry, *testNUDDispatcher, *e
 			nudDisp: &disp,
 		},
 	}
+	nic.networkEndpoints = map[tcpip.NetworkProtocolNumber]NetworkEndpoint{
+		header.IPv6ProtocolNumber: (&testIPv6Protocol{}).NewEndpoint(&nic, nil, nil, nil),
+	}
 
 	rng := rand.New(rand.NewSource(time.Now().UnixNano()))
 	nudState := NewNUDState(c, rng)
 	linkRes := entryTestLinkResolver{}
 	entry := newNeighborEntry(&nic, entryTestAddr1 /* remoteAddr */, entryTestAddr2 /* localAddr */, nudState, &linkRes)
-
-	// Stub out ndpState to verify modification of default routers.
-	nic.mu.ndp = ndpState{
-		nic:            &nic,
-		defaultRouters: make(map[tcpip.Address]defaultRouterState),
-	}
 
 	// Stub out the neighbor cache to verify deletion from the cache.
 	nic.neigh = &neighborCache{
@@ -267,7 +266,7 @@ func TestEntryInitiallyUnknown(t *testing.T) {
 	}
 	e.mu.Unlock()
 
-	clock.advance(c.RetransmitTimer)
+	clock.Advance(c.RetransmitTimer)
 
 	// No probes should have been sent.
 	linkRes.mu.Lock()
@@ -300,7 +299,7 @@ func TestEntryUnknownToUnknownWhenConfirmationWithUnknownAddress(t *testing.T) {
 	}
 	e.mu.Unlock()
 
-	clock.advance(time.Hour)
+	clock.Advance(time.Hour)
 
 	// No probes should have been sent.
 	linkRes.mu.Lock()
@@ -410,7 +409,7 @@ func TestEntryIncompleteToIncompleteDoesNotChangeUpdatedAt(t *testing.T) {
 	updatedAt := e.neigh.UpdatedAt
 	e.mu.Unlock()
 
-	clock.advance(c.RetransmitTimer)
+	clock.Advance(c.RetransmitTimer)
 
 	// UpdatedAt should remain the same during address resolution.
 	wantProbes := []entryTestProbeInfo{
@@ -439,7 +438,7 @@ func TestEntryIncompleteToIncompleteDoesNotChangeUpdatedAt(t *testing.T) {
 	}
 	e.mu.Unlock()
 
-	clock.advance(c.RetransmitTimer)
+	clock.Advance(c.RetransmitTimer)
 
 	// UpdatedAt should change after failing address resolution. Timing out after
 	// sending the last probe transitions the entry to Failed.
@@ -459,7 +458,7 @@ func TestEntryIncompleteToIncompleteDoesNotChangeUpdatedAt(t *testing.T) {
 		}
 	}
 
-	clock.advance(c.RetransmitTimer)
+	clock.Advance(c.RetransmitTimer)
 
 	wantEvents := []testEntryEventInfo{
 		{
@@ -748,7 +747,7 @@ func TestEntryIncompleteToFailed(t *testing.T) {
 	e.mu.Unlock()
 
 	waitFor := c.RetransmitTimer * time.Duration(c.MaxMulticastProbes)
-	clock.advance(waitFor)
+	clock.Advance(waitFor)
 
 	wantProbes := []entryTestProbeInfo{
 		// The Incomplete-to-Incomplete state transition is tested here by
@@ -816,6 +815,8 @@ func TestEntryStaysReachableWhenConfirmationWithRouterFlag(t *testing.T) {
 	c := DefaultNUDConfigurations()
 	e, nudDisp, linkRes, _ := entryTestSetup(c)
 
+	ipv6EP := e.nic.networkEndpoints[header.IPv6ProtocolNumber].(*testIPv6Endpoint)
+
 	e.mu.Lock()
 	e.handlePacketQueuedLocked()
 	e.handleConfirmationLocked(entryTestLinkAddr1, ReachabilityConfirmationFlags{
@@ -829,9 +830,7 @@ func TestEntryStaysReachableWhenConfirmationWithRouterFlag(t *testing.T) {
 	if got, want := e.isRouter, true; got != want {
 		t.Errorf("got e.isRouter = %t, want = %t", got, want)
 	}
-	e.nic.mu.ndp.defaultRouters[entryTestAddr1] = defaultRouterState{
-		invalidationJob: e.nic.stack.newJob(&testLocker{}, func() {}),
-	}
+
 	e.handleConfirmationLocked(entryTestLinkAddr1, ReachabilityConfirmationFlags{
 		Solicited: false,
 		Override:  false,
@@ -840,8 +839,8 @@ func TestEntryStaysReachableWhenConfirmationWithRouterFlag(t *testing.T) {
 	if got, want := e.isRouter, false; got != want {
 		t.Errorf("got e.isRouter = %t, want = %t", got, want)
 	}
-	if _, ok := e.nic.mu.ndp.defaultRouters[entryTestAddr1]; ok {
-		t.Errorf("unexpected defaultRouter for %s", entryTestAddr1)
+	if ipv6EP.invalidatedRtr != e.neigh.Addr {
+		t.Errorf("got ipv6EP.invalidatedRtr = %s, want = %s", ipv6EP.invalidatedRtr, e.neigh.Addr)
 	}
 	e.mu.Unlock()
 
@@ -983,7 +982,7 @@ func TestEntryReachableToStaleWhenTimeout(t *testing.T) {
 		t.Fatalf("link address resolver probes mismatch (-got, +want):\n%s", diff)
 	}
 
-	clock.advance(c.BaseReachableTime)
+	clock.Advance(c.BaseReachableTime)
 
 	wantEvents := []testEntryEventInfo{
 		{
@@ -1612,7 +1611,7 @@ func TestEntryDelayToReachableWhenUpperLevelConfirmation(t *testing.T) {
 		t.Fatalf("link address resolver probes mismatch (-got, +want):\n%s", diff)
 	}
 
-	clock.advance(c.BaseReachableTime)
+	clock.Advance(c.BaseReachableTime)
 
 	wantEvents := []testEntryEventInfo{
 		{
@@ -1706,7 +1705,7 @@ func TestEntryDelayToReachableWhenSolicitedOverrideConfirmation(t *testing.T) {
 		t.Fatalf("link address resolver probes mismatch (-got, +want):\n%s", diff)
 	}
 
-	clock.advance(c.BaseReachableTime)
+	clock.Advance(c.BaseReachableTime)
 
 	wantEvents := []testEntryEventInfo{
 		{
@@ -1989,7 +1988,7 @@ func TestEntryDelayToProbe(t *testing.T) {
 	}
 	e.mu.Unlock()
 
-	clock.advance(c.DelayFirstProbeTime)
+	clock.Advance(c.DelayFirstProbeTime)
 
 	wantProbes := []entryTestProbeInfo{
 		// The first probe is caused by the Unknown-to-Incomplete transition.
@@ -2069,7 +2068,7 @@ func TestEntryProbeToStaleWhenProbeWithDifferentAddress(t *testing.T) {
 	e.handlePacketQueuedLocked()
 	e.mu.Unlock()
 
-	clock.advance(c.DelayFirstProbeTime)
+	clock.Advance(c.DelayFirstProbeTime)
 
 	wantProbes := []entryTestProbeInfo{
 		// The first probe is caused by the Unknown-to-Incomplete transition.
@@ -2166,7 +2165,7 @@ func TestEntryProbeToStaleWhenConfirmationWithDifferentAddress(t *testing.T) {
 	e.handlePacketQueuedLocked()
 	e.mu.Unlock()
 
-	clock.advance(c.DelayFirstProbeTime)
+	clock.Advance(c.DelayFirstProbeTime)
 
 	wantProbes := []entryTestProbeInfo{
 		// The first probe is caused by the Unknown-to-Incomplete transition.
@@ -2267,7 +2266,7 @@ func TestEntryStaysProbeWhenOverrideConfirmationWithSameAddress(t *testing.T) {
 	e.handlePacketQueuedLocked()
 	e.mu.Unlock()
 
-	clock.advance(c.DelayFirstProbeTime)
+	clock.Advance(c.DelayFirstProbeTime)
 
 	wantProbes := []entryTestProbeInfo{
 		// The first probe is caused by the Unknown-to-Incomplete transition.
@@ -2364,7 +2363,7 @@ func TestEntryUnknownToStaleToProbeToReachable(t *testing.T) {
 	e.handlePacketQueuedLocked()
 	e.mu.Unlock()
 
-	clock.advance(c.DelayFirstProbeTime)
+	clock.Advance(c.DelayFirstProbeTime)
 
 	wantProbes := []entryTestProbeInfo{
 		// Probe caused by the Delay-to-Probe transition
@@ -2398,7 +2397,7 @@ func TestEntryUnknownToStaleToProbeToReachable(t *testing.T) {
 	}
 	e.mu.Unlock()
 
-	clock.advance(c.BaseReachableTime)
+	clock.Advance(c.BaseReachableTime)
 
 	wantEvents := []testEntryEventInfo{
 		{
@@ -2463,7 +2462,7 @@ func TestEntryProbeToReachableWhenSolicitedOverrideConfirmation(t *testing.T) {
 	e.handlePacketQueuedLocked()
 	e.mu.Unlock()
 
-	clock.advance(c.DelayFirstProbeTime)
+	clock.Advance(c.DelayFirstProbeTime)
 
 	wantProbes := []entryTestProbeInfo{
 		// The first probe is caused by the Unknown-to-Incomplete transition.
@@ -2503,7 +2502,7 @@ func TestEntryProbeToReachableWhenSolicitedOverrideConfirmation(t *testing.T) {
 	}
 	e.mu.Unlock()
 
-	clock.advance(c.BaseReachableTime)
+	clock.Advance(c.BaseReachableTime)
 
 	wantEvents := []testEntryEventInfo{
 		{
@@ -2575,7 +2574,7 @@ func TestEntryProbeToReachableWhenSolicitedConfirmationWithSameAddress(t *testin
 	e.handlePacketQueuedLocked()
 	e.mu.Unlock()
 
-	clock.advance(c.DelayFirstProbeTime)
+	clock.Advance(c.DelayFirstProbeTime)
 
 	wantProbes := []entryTestProbeInfo{
 		// The first probe is caused by the Unknown-to-Incomplete transition.
@@ -2612,7 +2611,7 @@ func TestEntryProbeToReachableWhenSolicitedConfirmationWithSameAddress(t *testin
 	}
 	e.mu.Unlock()
 
-	clock.advance(c.BaseReachableTime)
+	clock.Advance(c.BaseReachableTime)
 
 	wantEvents := []testEntryEventInfo{
 		{
@@ -2682,7 +2681,7 @@ func TestEntryProbeToFailed(t *testing.T) {
 	e.mu.Unlock()
 
 	waitFor := c.DelayFirstProbeTime + c.RetransmitTimer*time.Duration(c.MaxUnicastProbes)
-	clock.advance(waitFor)
+	clock.Advance(waitFor)
 
 	wantProbes := []entryTestProbeInfo{
 		// The first probe is caused by the Unknown-to-Incomplete transition.
@@ -2787,7 +2786,7 @@ func TestEntryFailedGetsDeleted(t *testing.T) {
 	e.mu.Unlock()
 
 	waitFor := c.DelayFirstProbeTime + c.RetransmitTimer*time.Duration(c.MaxUnicastProbes) + c.UnreachableTime
-	clock.advance(waitFor)
+	clock.Advance(waitFor)
 
 	wantProbes := []entryTestProbeInfo{
 		// The first probe is caused by the Unknown-to-Incomplete transition.

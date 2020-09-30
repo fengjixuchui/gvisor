@@ -23,6 +23,7 @@ import (
 	"gvisor.dev/gvisor/pkg/tcpip/buffer"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
 	"gvisor.dev/gvisor/pkg/tcpip/link/channel"
+	"gvisor.dev/gvisor/pkg/tcpip/link/loopback"
 	"gvisor.dev/gvisor/pkg/tcpip/network/ipv4"
 	"gvisor.dev/gvisor/pkg/tcpip/network/ipv6"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
@@ -139,11 +140,9 @@ func TestPingMulticastBroadcast(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			ipv4Proto := ipv4.NewProtocol()
-			ipv6Proto := ipv6.NewProtocol()
 			s := stack.New(stack.Options{
-				NetworkProtocols:   []stack.NetworkProtocol{ipv4Proto, ipv6Proto},
-				TransportProtocols: []stack.TransportProtocol{icmp.NewProtocol4(), icmp.NewProtocol6()},
+				NetworkProtocols:   []stack.NetworkProtocolFactory{ipv4.NewProtocol, ipv6.NewProtocol},
+				TransportProtocols: []stack.TransportProtocolFactory{icmp.NewProtocol4, icmp.NewProtocol6},
 			})
 			// We only expect a single packet in response to our ICMP Echo Request.
 			e := channel.New(1, defaultMTU, "")
@@ -175,18 +174,18 @@ func TestPingMulticastBroadcast(t *testing.T) {
 			var rxICMP func(*channel.Endpoint, tcpip.Address)
 			var expectedSrc tcpip.Address
 			var expectedDst tcpip.Address
-			var proto stack.NetworkProtocol
+			var protoNum tcpip.NetworkProtocolNumber
 			switch l := len(test.dstAddr); l {
 			case header.IPv4AddressSize:
 				rxICMP = rxIPv4ICMP
 				expectedSrc = ipv4Addr.Address
 				expectedDst = remoteIPv4Addr
-				proto = ipv4Proto
+				protoNum = header.IPv4ProtocolNumber
 			case header.IPv6AddressSize:
 				rxICMP = rxIPv6ICMP
 				expectedSrc = ipv6Addr.Address
 				expectedDst = remoteIPv6Addr
-				proto = ipv6Proto
+				protoNum = header.IPv6ProtocolNumber
 			default:
 				t.Fatalf("got unexpected address length = %d bytes", l)
 			}
@@ -204,7 +203,7 @@ func TestPingMulticastBroadcast(t *testing.T) {
 				t.Errorf("got pkt.Route.RemoteAddress = %s, want = %s", pkt.Route.RemoteAddress, expectedDst)
 			}
 
-			src, dst := proto.ParseAddresses(pkt.Pkt.NetworkHeader().View())
+			src, dst := s.NetworkProtocolInstance(protoNum).ParseAddresses(pkt.Pkt.NetworkHeader().View())
 			if src != expectedSrc {
 				t.Errorf("got pkt source = %s, want = %s", src, expectedSrc)
 			}
@@ -379,8 +378,8 @@ func TestIncomingMulticastAndBroadcast(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			s := stack.New(stack.Options{
-				NetworkProtocols:   []stack.NetworkProtocol{ipv4.NewProtocol(), ipv6.NewProtocol()},
-				TransportProtocols: []stack.TransportProtocol{udp.NewProtocol()},
+				NetworkProtocols:   []stack.NetworkProtocolFactory{ipv4.NewProtocol, ipv6.NewProtocol},
+				TransportProtocols: []stack.TransportProtocolFactory{udp.NewProtocol},
 			})
 			e := channel.New(0, defaultMTU, "")
 			if err := s.CreateNIC(nicID, e); err != nil {
@@ -431,6 +430,125 @@ func TestIncomingMulticastAndBroadcast(t *testing.T) {
 			} else {
 				if err != tcpip.ErrWouldBlock {
 					t.Fatalf("got Read(nil) = (%x, _, %s), want = (_, _, %s)", gotPayload, err, tcpip.ErrWouldBlock)
+				}
+			}
+		})
+	}
+}
+
+// TestReuseAddrAndBroadcast makes sure broadcast packets are received by all
+// interested endpoints.
+func TestReuseAddrAndBroadcast(t *testing.T) {
+	const (
+		nicID             = 1
+		localPort         = 9000
+		loopbackBroadcast = tcpip.Address("\x7f\xff\xff\xff")
+	)
+
+	data := tcpip.SlicePayload([]byte{1, 2, 3, 4})
+
+	tests := []struct {
+		name          string
+		broadcastAddr tcpip.Address
+	}{
+		{
+			name:          "Subnet directed broadcast",
+			broadcastAddr: loopbackBroadcast,
+		},
+		{
+			name:          "IPv4 broadcast",
+			broadcastAddr: header.IPv4Broadcast,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			s := stack.New(stack.Options{
+				NetworkProtocols:   []stack.NetworkProtocolFactory{ipv4.NewProtocol, ipv6.NewProtocol},
+				TransportProtocols: []stack.TransportProtocolFactory{udp.NewProtocol},
+			})
+			if err := s.CreateNIC(nicID, loopback.New()); err != nil {
+				t.Fatalf("CreateNIC(%d, _): %s", nicID, err)
+			}
+			protoAddr := tcpip.ProtocolAddress{
+				Protocol: header.IPv4ProtocolNumber,
+				AddressWithPrefix: tcpip.AddressWithPrefix{
+					Address:   "\x7f\x00\x00\x01",
+					PrefixLen: 8,
+				},
+			}
+			if err := s.AddProtocolAddress(nicID, protoAddr); err != nil {
+				t.Fatalf("AddProtocolAddress(%d, %+v): %s", nicID, protoAddr, err)
+			}
+
+			s.SetRouteTable([]tcpip.Route{
+				tcpip.Route{
+					// We use the empty subnet instead of just the loopback subnet so we
+					// also have a route to the IPv4 Broadcast address.
+					Destination: header.IPv4EmptySubnet,
+					NIC:         nicID,
+				},
+			})
+
+			// We create endpoints that bind to both the wildcard address and the
+			// broadcast address to make sure both of these types of "broadcast
+			// interested" endpoints receive broadcast packets.
+			wq := waiter.Queue{}
+			var eps []tcpip.Endpoint
+			for _, bindWildcard := range []bool{false, true} {
+				// Create multiple endpoints for each type of "broadcast interested"
+				// endpoint so we can test that all endpoints receive the broadcast
+				// packet.
+				for i := 0; i < 2; i++ {
+					ep, err := s.NewEndpoint(udp.ProtocolNumber, ipv4.ProtocolNumber, &wq)
+					if err != nil {
+						t.Fatalf("(eps[%d]) NewEndpoint(%d, %d, _): %s", len(eps), udp.ProtocolNumber, ipv4.ProtocolNumber, err)
+					}
+					defer ep.Close()
+
+					if err := ep.SetSockOptBool(tcpip.ReuseAddressOption, true); err != nil {
+						t.Fatalf("eps[%d].SetSockOptBool(tcpip.ReuseAddressOption, true): %s", len(eps), err)
+					}
+
+					if err := ep.SetSockOptBool(tcpip.BroadcastOption, true); err != nil {
+						t.Fatalf("eps[%d].SetSockOptBool(tcpip.BroadcastOption, true): %s", len(eps), err)
+					}
+
+					bindAddr := tcpip.FullAddress{Port: localPort}
+					if bindWildcard {
+						if err := ep.Bind(bindAddr); err != nil {
+							t.Fatalf("eps[%d].Bind(%+v): %s", len(eps), bindAddr, err)
+						}
+					} else {
+						bindAddr.Addr = test.broadcastAddr
+						if err := ep.Bind(bindAddr); err != nil {
+							t.Fatalf("eps[%d].Bind(%+v): %s", len(eps), bindAddr, err)
+						}
+					}
+
+					eps = append(eps, ep)
+				}
+			}
+
+			for i, wep := range eps {
+				writeOpts := tcpip.WriteOptions{
+					To: &tcpip.FullAddress{
+						Addr: test.broadcastAddr,
+						Port: localPort,
+					},
+				}
+				if n, _, err := wep.Write(data, writeOpts); err != nil {
+					t.Fatalf("eps[%d].Write(_, _): %s", i, err)
+				} else if want := int64(len(data)); n != want {
+					t.Fatalf("got eps[%d].Write(_, _) = (%d, nil, nil), want = (%d, nil, nil)", i, n, want)
+				}
+
+				for j, rep := range eps {
+					if gotPayload, _, err := rep.Read(nil); err != nil {
+						t.Errorf("(eps[%d] write) eps[%d].Read(nil): %s", i, j, err)
+					} else if diff := cmp.Diff(buffer.View(data), gotPayload); diff != "" {
+						t.Errorf("(eps[%d] write) got UDP payload from eps[%d] mismatch (-want +got):\n%s", i, j, diff)
+					}
 				}
 			}
 		})

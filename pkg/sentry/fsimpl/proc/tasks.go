@@ -37,12 +37,13 @@ const (
 //
 // +stateify savable
 type tasksInode struct {
-	tasksInodeRefs
-	kernfs.InodeNotSymlink
-	kernfs.InodeDirectoryNoNewChildren
-	kernfs.InodeAttrs
-	kernfs.OrderedChildren
+	implStatFS
 	kernfs.AlwaysValid
+	kernfs.InodeAttrs
+	kernfs.InodeDirectoryNoNewChildren
+	kernfs.InodeNotSymlink
+	kernfs.OrderedChildren
+	tasksInodeRefs
 
 	locks vfs.FileLocks
 
@@ -51,8 +52,8 @@ type tasksInode struct {
 
 	// '/proc/self' and '/proc/thread-self' have custom directory offsets in
 	// Linux. So handle them outside of OrderedChildren.
-	selfSymlink       *vfs.Dentry
-	threadSelfSymlink *vfs.Dentry
+	selfSymlink       *kernfs.Dentry
+	threadSelfSymlink *kernfs.Dentry
 
 	// cgroupControllers is a map of controller name to directory in the
 	// cgroup hierarchy. These controllers are immutable and will be listed
@@ -80,8 +81,8 @@ func (fs *filesystem) newTasksInode(k *kernel.Kernel, pidns *kernel.PIDNamespace
 	inode := &tasksInode{
 		pidns:             pidns,
 		fs:                fs,
-		selfSymlink:       fs.newSelfSymlink(root, fs.NextIno(), pidns).VFSDentry(),
-		threadSelfSymlink: fs.newThreadSelfSymlink(root, fs.NextIno(), pidns).VFSDentry(),
+		selfSymlink:       fs.newSelfSymlink(root, fs.NextIno(), pidns),
+		threadSelfSymlink: fs.newThreadSelfSymlink(root, fs.NextIno(), pidns),
 		cgroupControllers: cgroupControllers,
 	}
 	inode.InodeAttrs.Init(root, linux.UNNAMED_MAJOR, fs.devMinor, fs.NextIno(), linux.ModeDirectory|0555)
@@ -97,8 +98,8 @@ func (fs *filesystem) newTasksInode(k *kernel.Kernel, pidns *kernel.PIDNamespace
 	return inode, dentry
 }
 
-// Lookup implements kernfs.inodeDynamicLookup.
-func (i *tasksInode) Lookup(ctx context.Context, name string) (*vfs.Dentry, error) {
+// Lookup implements kernfs.inodeDynamicLookup.Lookup.
+func (i *tasksInode) Lookup(ctx context.Context, name string) (*kernfs.Dentry, error) {
 	// Try to lookup a corresponding task.
 	tid, err := strconv.ParseUint(name, 10, 64)
 	if err != nil {
@@ -117,11 +118,10 @@ func (i *tasksInode) Lookup(ctx context.Context, name string) (*vfs.Dentry, erro
 		return nil, syserror.ENOENT
 	}
 
-	taskDentry := i.fs.newTaskInode(task, i.pidns, true, i.cgroupControllers)
-	return taskDentry.VFSDentry(), nil
+	return i.fs.newTaskInode(task, i.pidns, true, i.cgroupControllers), nil
 }
 
-// IterDirents implements kernfs.inodeDynamicLookup.
+// IterDirents implements kernfs.inodeDynamicLookup.IterDirents.
 func (i *tasksInode) IterDirents(ctx context.Context, cb vfs.IterDirentsCallback, offset, _ int64) (int64, error) {
 	// fs/proc/internal.h: #define FIRST_PROCESS_ENTRY 256
 	const FIRST_PROCESS_ENTRY = 256
@@ -199,9 +199,9 @@ func (i *tasksInode) IterDirents(ctx context.Context, cb vfs.IterDirentsCallback
 	return maxTaskID, nil
 }
 
-// Open implements kernfs.Inode.
-func (i *tasksInode) Open(ctx context.Context, rp *vfs.ResolvingPath, vfsd *vfs.Dentry, opts vfs.OpenOptions) (*vfs.FileDescription, error) {
-	fd, err := kernfs.NewGenericDirectoryFD(rp.Mount(), vfsd, &i.OrderedChildren, &i.locks, &opts, kernfs.GenericDirectoryFDOptions{
+// Open implements kernfs.Inode.Open.
+func (i *tasksInode) Open(ctx context.Context, rp *vfs.ResolvingPath, d *kernfs.Dentry, opts vfs.OpenOptions) (*vfs.FileDescription, error) {
+	fd, err := kernfs.NewGenericDirectoryFD(rp.Mount(), d, &i.OrderedChildren, &i.locks, &opts, kernfs.GenericDirectoryFDOptions{
 		SeekEnd: kernfs.SeekEndZero,
 	})
 	if err != nil {
@@ -228,7 +228,7 @@ func (i *tasksInode) Stat(ctx context.Context, vsfs *vfs.Filesystem, opts vfs.St
 	return stat, nil
 }
 
-// DecRef implements kernfs.Inode.
+// DecRef implements kernfs.Inode.DecRef.
 func (i *tasksInode) DecRef(context.Context) {
 	i.tasksInodeRefs.DecRef(i.Destroy)
 }
@@ -236,6 +236,8 @@ func (i *tasksInode) DecRef(context.Context) {
 // staticFileSetStat implements a special static file that allows inode
 // attributes to be set. This is to support /proc files that are readonly, but
 // allow attributes to be set.
+//
+// +stateify savable
 type staticFileSetStat struct {
 	dynamicBytesFileSetAttr
 	vfs.StaticData

@@ -56,6 +56,7 @@ go_library(
         "sys_xattr.go",
         "timespec.go",
     ],
+    marshal = True,
     visibility = ["//:sandbox"],
     deps = [
         "//pkg/abi",
@@ -64,6 +65,8 @@ go_library(
         "//pkg/bpf",
         "//pkg/context",
         "//pkg/log",
+        "//pkg/marshal",
+        "//pkg/marshal/primitive",
         "//pkg/metric",
         "//pkg/rand",
         "//pkg/safemem",
@@ -99,7 +102,5 @@ go_library(
         "//pkg/syserror",
         "//pkg/usermem",
         "//pkg/waiter",
-        "//tools/go_marshal/marshal",
-        "//tools/go_marshal/primitive",
     ],
 )

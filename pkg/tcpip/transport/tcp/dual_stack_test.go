@@ -78,8 +78,8 @@ func testV4Connect(t *testing.T, c *context.Context, checkers ...checker.Network
 	ackCheckers := append(checkers, checker.TCP(
 		checker.DstPort(context.TestPort),
 		checker.TCPFlags(header.TCPFlagAck),
-		checker.SeqNum(uint32(c.IRS)+1),
-		checker.AckNum(uint32(iss)+1),
+		checker.TCPSeqNum(uint32(c.IRS)+1),
+		checker.TCPAckNum(uint32(iss)+1),
 	))
 	checker.IPv4(t, c.GetPacket(), ackCheckers...)
 
@@ -185,8 +185,8 @@ func testV6Connect(t *testing.T, c *context.Context, checkers ...checker.Network
 	ackCheckers := append(checkers, checker.TCP(
 		checker.DstPort(context.TestPort),
 		checker.TCPFlags(header.TCPFlagAck),
-		checker.SeqNum(uint32(c.IRS)+1),
-		checker.AckNum(uint32(iss)+1),
+		checker.TCPSeqNum(uint32(c.IRS)+1),
+		checker.TCPAckNum(uint32(iss)+1),
 	))
 	checker.IPv6(t, c.GetV6Packet(), ackCheckers...)
 
@@ -283,7 +283,7 @@ func TestV4RefuseOnV6Only(t *testing.T) {
 			checker.SrcPort(context.StackPort),
 			checker.DstPort(context.TestPort),
 			checker.TCPFlags(header.TCPFlagRst|header.TCPFlagAck),
-			checker.AckNum(uint32(irs)+1),
+			checker.TCPAckNum(uint32(irs)+1),
 		),
 	)
 }
@@ -319,7 +319,7 @@ func TestV6RefuseOnBoundToV4Mapped(t *testing.T) {
 			checker.SrcPort(context.StackPort),
 			checker.DstPort(context.TestPort),
 			checker.TCPFlags(header.TCPFlagRst|header.TCPFlagAck),
-			checker.AckNum(uint32(irs)+1),
+			checker.TCPAckNum(uint32(irs)+1),
 		),
 	)
 }
@@ -352,7 +352,7 @@ func testV4Accept(t *testing.T, c *context.Context) {
 			checker.SrcPort(context.StackPort),
 			checker.DstPort(context.TestPort),
 			checker.TCPFlags(header.TCPFlagAck|header.TCPFlagSyn),
-			checker.AckNum(uint32(irs)+1),
+			checker.TCPAckNum(uint32(irs)+1),
 		),
 	)
 
@@ -371,12 +371,12 @@ func testV4Accept(t *testing.T, c *context.Context) {
 	c.WQ.EventRegister(&we, waiter.EventIn)
 	defer c.WQ.EventUnregister(&we)
 
-	nep, _, err := c.EP.Accept()
+	nep, _, err := c.EP.Accept(nil)
 	if err == tcpip.ErrWouldBlock {
 		// Wait for connection to be established.
 		select {
 		case <-ch:
-			nep, _, err = c.EP.Accept()
+			nep, _, err = c.EP.Accept(nil)
 			if err != nil {
 				t.Fatalf("Accept failed: %v", err)
 			}
@@ -492,7 +492,7 @@ func TestV6AcceptOnV6(t *testing.T) {
 			checker.SrcPort(context.StackPort),
 			checker.DstPort(context.TestPort),
 			checker.TCPFlags(header.TCPFlagAck|header.TCPFlagSyn),
-			checker.AckNum(uint32(irs)+1),
+			checker.TCPAckNum(uint32(irs)+1),
 		),
 	)
 
@@ -510,13 +510,13 @@ func TestV6AcceptOnV6(t *testing.T) {
 	we, ch := waiter.NewChannelEntry(nil)
 	c.WQ.EventRegister(&we, waiter.EventIn)
 	defer c.WQ.EventUnregister(&we)
-
-	nep, _, err := c.EP.Accept()
+	var addr tcpip.FullAddress
+	nep, _, err := c.EP.Accept(&addr)
 	if err == tcpip.ErrWouldBlock {
 		// Wait for connection to be established.
 		select {
 		case <-ch:
-			nep, _, err = c.EP.Accept()
+			nep, _, err = c.EP.Accept(&addr)
 			if err != nil {
 				t.Fatalf("Accept failed: %v", err)
 			}
@@ -526,20 +526,14 @@ func TestV6AcceptOnV6(t *testing.T) {
 		}
 	}
 
+	if addr.Addr != context.TestV6Addr {
+		t.Errorf("Unexpected remote address: got %s, want %s", addr.Addr, context.TestV6Addr)
+	}
+
 	// Make sure we can still query the v6 only status of the new endpoint,
 	// that is, that it is in fact a v6 socket.
 	if _, err := nep.GetSockOptBool(tcpip.V6OnlyOption); err != nil {
-		t.Fatalf("GetSockOpt failed failed: %v", err)
-	}
-
-	// Check the peer address.
-	addr, err := nep.GetRemoteAddress()
-	if err != nil {
-		t.Fatalf("GetRemoteAddress failed failed: %v", err)
-	}
-
-	if addr.Addr != context.TestV6Addr {
-		t.Fatalf("Unexpected remote address: got %v, want %v", addr.Addr, context.TestV6Addr)
+		t.Errorf("GetSockOptBool(tcpip.V6OnlyOption) failed: %s", err)
 	}
 }
 
@@ -566,8 +560,9 @@ func TestV4AcceptOnV4(t *testing.T) {
 func testV4ListenClose(t *testing.T, c *context.Context) {
 	// Set the SynRcvd threshold to zero to force a syn cookie based accept
 	// to happen.
-	if err := c.Stack().SetTransportProtocolOption(tcp.ProtocolNumber, tcpip.TCPSynRcvdCountThresholdOption(0)); err != nil {
-		t.Fatalf("setting TCPSynRcvdCountThresholdOption failed: %s", err)
+	var opt tcpip.TCPSynRcvdCountThresholdOption
+	if err := c.Stack().SetTransportProtocolOption(tcp.ProtocolNumber, &opt); err != nil {
+		t.Fatalf("setting TCPSynRcvdCountThresholdOption(%d, &%T(%d)): %s", tcp.ProtocolNumber, opt, opt, err)
 	}
 
 	const n = uint16(32)
@@ -610,12 +605,12 @@ func testV4ListenClose(t *testing.T, c *context.Context) {
 	we, ch := waiter.NewChannelEntry(nil)
 	c.WQ.EventRegister(&we, waiter.EventIn)
 	defer c.WQ.EventUnregister(&we)
-	nep, _, err := c.EP.Accept()
+	nep, _, err := c.EP.Accept(nil)
 	if err == tcpip.ErrWouldBlock {
 		// Wait for connection to be established.
 		select {
 		case <-ch:
-			nep, _, err = c.EP.Accept()
+			nep, _, err = c.EP.Accept(nil)
 			if err != nil {
 				t.Fatalf("Accept failed: %v", err)
 			}

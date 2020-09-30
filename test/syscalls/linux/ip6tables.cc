@@ -82,13 +82,43 @@ TEST(IP6TablesBasic, GetEntriesErrorPrecedence) {
       SyscallFailsWithErrno(EINVAL));
 }
 
+TEST(IP6TablesBasic, GetRevision) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_NET_RAW)));
+
+  int sock;
+  ASSERT_THAT(sock = socket(AF_INET6, SOCK_RAW, IPPROTO_RAW),
+              SyscallSucceeds());
+
+  struct xt_get_revision rev = {
+      .name = "REDIRECT",
+      .revision = 0,
+  };
+  socklen_t rev_len = sizeof(rev);
+
+  // TODO(gvisor.dev/issue/3549): IPv6 redirect support.
+  const int retval =
+      getsockopt(sock, SOL_IPV6, IP6T_SO_GET_REVISION_TARGET, &rev, &rev_len);
+  if (IsRunningOnGvisor()) {
+    EXPECT_THAT(retval, SyscallFailsWithErrno(ENOPROTOOPT));
+    return;
+  }
+
+  // Revision 0 exists.
+  EXPECT_THAT(retval, SyscallSucceeds());
+  EXPECT_EQ(rev.revision, 0);
+
+  // Revisions > 0 don't exist.
+  rev.revision = 1;
+  EXPECT_THAT(
+      getsockopt(sock, SOL_IPV6, IP6T_SO_GET_REVISION_TARGET, &rev, &rev_len),
+      SyscallFailsWithErrno(EPROTONOSUPPORT));
+}
+
 // This tests the initial state of a machine with empty ip6tables via
 // getsockopt(IP6T_SO_GET_INFO). We don't have a guarantee that the iptables are
 // empty when running in native, but we can test that gVisor has the same
 // initial state that a newly-booted Linux machine would have.
 TEST(IP6TablesTest, InitialInfo) {
-  // TODO(gvisor.dev/issue/3549): Enable for ip6tables.
-  SKIP_IF(true);
   SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_NET_RAW)));
 
   FileDescriptor sock =
@@ -132,8 +162,6 @@ TEST(IP6TablesTest, InitialInfo) {
 // are empty when running in native, but we can test that gVisor has the same
 // initial state that a newly-booted Linux machine would have.
 TEST(IP6TablesTest, InitialEntries) {
-  // TODO(gvisor.dev/issue/3549): Enable for ip6tables.
-  SKIP_IF(true);
   SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_NET_RAW)));
 
   FileDescriptor sock =

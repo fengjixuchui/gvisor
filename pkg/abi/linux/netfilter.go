@@ -17,9 +17,9 @@ package linux
 import (
 	"io"
 
+	"gvisor.dev/gvisor/pkg/marshal"
+	"gvisor.dev/gvisor/pkg/marshal/primitive"
 	"gvisor.dev/gvisor/pkg/usermem"
-	"gvisor.dev/gvisor/tools/go_marshal/marshal"
-	"gvisor.dev/gvisor/tools/go_marshal/primitive"
 )
 
 // This file contains structures required to support netfilter, specifically
@@ -265,6 +265,18 @@ type KernelXTEntryMatch struct {
 	Data []byte
 }
 
+// XTGetRevision corresponds to xt_get_revision in
+// include/uapi/linux/netfilter/x_tables.h
+//
+// +marshal
+type XTGetRevision struct {
+	Name     ExtensionName
+	Revision uint8
+}
+
+// SizeOfXTGetRevision is the size of an XTGetRevision.
+const SizeOfXTGetRevision = 30
+
 // XTEntryTarget holds a target for a rule. For example, it can specify that
 // packets matching the rule should DROP, ACCEPT, or use an extension target.
 // iptables-extension(8) has a list of possible targets.
@@ -284,6 +296,13 @@ type XTEntryTarget struct {
 
 // SizeOfXTEntryTarget is the size of an XTEntryTarget.
 const SizeOfXTEntryTarget = 32
+
+// KernelXTEntryTarget is identical to XTEntryTarget, but contains a
+// variable-length Data field.
+type KernelXTEntryTarget struct {
+	XTEntryTarget
+	Data []byte
+}
 
 // XTStandardTarget is a built-in target, one of ACCEPT, DROP, JUMP, QUEUE,
 // RETURN, or jump. It corresponds to struct xt_standard_target in
@@ -450,9 +469,9 @@ func (ke *KernelIPTGetEntries) UnmarshalUnsafe(src []byte) {
 }
 
 // CopyIn implements marshal.Marshallable.CopyIn.
-func (ke *KernelIPTGetEntries) CopyIn(task marshal.Task, addr usermem.Addr) (int, error) {
-	buf := task.CopyScratchBuffer(ke.SizeBytes()) // escapes: okay.
-	length, err := task.CopyInBytes(addr, buf)    // escapes: okay.
+func (ke *KernelIPTGetEntries) CopyIn(cc marshal.CopyContext, addr usermem.Addr) (int, error) {
+	buf := cc.CopyScratchBuffer(ke.SizeBytes()) // escapes: okay.
+	length, err := cc.CopyInBytes(addr, buf)    // escapes: okay.
 	// Unmarshal unconditionally. If we had a short copy-in, this results in a
 	// partially unmarshalled struct.
 	ke.UnmarshalBytes(buf) // escapes: fallback.
@@ -460,21 +479,21 @@ func (ke *KernelIPTGetEntries) CopyIn(task marshal.Task, addr usermem.Addr) (int
 }
 
 // CopyOut implements marshal.Marshallable.CopyOut.
-func (ke *KernelIPTGetEntries) CopyOut(task marshal.Task, addr usermem.Addr) (int, error) {
+func (ke *KernelIPTGetEntries) CopyOut(cc marshal.CopyContext, addr usermem.Addr) (int, error) {
 	// Type KernelIPTGetEntries doesn't have a packed layout in memory, fall
 	// back to MarshalBytes.
-	return task.CopyOutBytes(addr, ke.marshalAll(task))
+	return cc.CopyOutBytes(addr, ke.marshalAll(cc))
 }
 
 // CopyOutN implements marshal.Marshallable.CopyOutN.
-func (ke *KernelIPTGetEntries) CopyOutN(task marshal.Task, addr usermem.Addr, limit int) (int, error) {
+func (ke *KernelIPTGetEntries) CopyOutN(cc marshal.CopyContext, addr usermem.Addr, limit int) (int, error) {
 	// Type KernelIPTGetEntries doesn't have a packed layout in memory, fall
 	// back to MarshalBytes.
-	return task.CopyOutBytes(addr, ke.marshalAll(task)[:limit])
+	return cc.CopyOutBytes(addr, ke.marshalAll(cc)[:limit])
 }
 
-func (ke *KernelIPTGetEntries) marshalAll(task marshal.Task) []byte {
-	buf := task.CopyScratchBuffer(ke.SizeBytes())
+func (ke *KernelIPTGetEntries) marshalAll(cc marshal.CopyContext) []byte {
+	buf := cc.CopyScratchBuffer(ke.SizeBytes())
 	ke.MarshalBytes(buf)
 	return buf
 }
@@ -510,6 +529,8 @@ type IPTReplace struct {
 const SizeOfIPTReplace = 96
 
 // ExtensionName holds the name of a netfilter extension.
+//
+// +marshal
 type ExtensionName [XT_EXTENSION_MAXNAMELEN]byte
 
 // String implements fmt.Stringer.

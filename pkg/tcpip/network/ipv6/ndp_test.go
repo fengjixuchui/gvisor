@@ -17,6 +17,7 @@ package ipv6
 import (
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/go-cmp/cmp"
 	"gvisor.dev/gvisor/pkg/tcpip"
@@ -35,8 +36,8 @@ func setupStackAndEndpoint(t *testing.T, llladdr, rlladdr tcpip.Address, useNeig
 	t.Helper()
 
 	s := stack.New(stack.Options{
-		NetworkProtocols:   []stack.NetworkProtocol{NewProtocol()},
-		TransportProtocols: []stack.TransportProtocol{icmp.NewProtocol6()},
+		NetworkProtocols:   []stack.NetworkProtocolFactory{NewProtocol},
+		TransportProtocols: []stack.TransportProtocolFactory{icmp.NewProtocol6},
 		UseNeighborCache:   useNeighborCache,
 	})
 
@@ -65,8 +66,92 @@ func setupStackAndEndpoint(t *testing.T, llladdr, rlladdr tcpip.Address, useNeig
 		t.Fatalf("cannot find protocol instance for network protocol %d", ProtocolNumber)
 	}
 
-	ep := netProto.NewEndpoint(0, &stubLinkAddressCache{}, &stubNUDHandler{}, &stubDispatcher{}, nil, s)
+	ep := netProto.NewEndpoint(&testInterface{}, &stubLinkAddressCache{}, &stubNUDHandler{}, &stubDispatcher{})
+	if err := ep.Enable(); err != nil {
+		t.Fatalf("ep.Enable(): %s", err)
+	}
+	t.Cleanup(ep.Close)
+
 	return s, ep
+}
+
+var _ NDPDispatcher = (*testNDPDispatcher)(nil)
+
+// testNDPDispatcher is an NDPDispatcher only allows default router discovery.
+type testNDPDispatcher struct {
+	addr tcpip.Address
+}
+
+func (*testNDPDispatcher) OnDuplicateAddressDetectionStatus(tcpip.NICID, tcpip.Address, bool, *tcpip.Error) {
+}
+
+func (t *testNDPDispatcher) OnDefaultRouterDiscovered(_ tcpip.NICID, addr tcpip.Address) bool {
+	t.addr = addr
+	return true
+}
+
+func (t *testNDPDispatcher) OnDefaultRouterInvalidated(_ tcpip.NICID, addr tcpip.Address) {
+	t.addr = addr
+}
+
+func (*testNDPDispatcher) OnOnLinkPrefixDiscovered(tcpip.NICID, tcpip.Subnet) bool {
+	return false
+}
+
+func (*testNDPDispatcher) OnOnLinkPrefixInvalidated(tcpip.NICID, tcpip.Subnet) {
+}
+
+func (*testNDPDispatcher) OnAutoGenAddress(tcpip.NICID, tcpip.AddressWithPrefix) bool {
+	return false
+}
+
+func (*testNDPDispatcher) OnAutoGenAddressDeprecated(tcpip.NICID, tcpip.AddressWithPrefix) {
+}
+
+func (*testNDPDispatcher) OnAutoGenAddressInvalidated(tcpip.NICID, tcpip.AddressWithPrefix) {
+}
+
+func (*testNDPDispatcher) OnRecursiveDNSServerOption(tcpip.NICID, []tcpip.Address, time.Duration) {
+}
+
+func (*testNDPDispatcher) OnDNSSearchListOption(tcpip.NICID, []string, time.Duration) {
+}
+
+func (*testNDPDispatcher) OnDHCPv6Configuration(tcpip.NICID, DHCPv6ConfigurationFromNDPRA) {
+}
+
+func TestStackNDPEndpointInvalidateDefaultRouter(t *testing.T) {
+	var ndpDisp testNDPDispatcher
+	s := stack.New(stack.Options{
+		NetworkProtocols: []stack.NetworkProtocolFactory{NewProtocolWithOptions(Options{
+			NDPDisp: &ndpDisp,
+		})},
+	})
+
+	if err := s.CreateNIC(nicID, &stubLinkEndpoint{}); err != nil {
+		t.Fatalf("s.CreateNIC(%d, _): %s", nicID, err)
+	}
+
+	ep, err := s.GetNetworkEndpoint(nicID, ProtocolNumber)
+	if err != nil {
+		t.Fatalf("s.GetNetworkEndpoint(%d, %d): %s", nicID, ProtocolNumber, err)
+	}
+
+	ipv6EP := ep.(*endpoint)
+	ipv6EP.mu.Lock()
+	ipv6EP.mu.ndp.rememberDefaultRouter(lladdr1, time.Hour)
+	ipv6EP.mu.Unlock()
+
+	if ndpDisp.addr != lladdr1 {
+		t.Fatalf("got ndpDisp.addr = %s, want = %s", ndpDisp.addr, lladdr1)
+	}
+
+	ndpDisp.addr = ""
+	ndpEP := ep.(stack.NDPEndpoint)
+	ndpEP.InvalidateDefaultRouter(lladdr1)
+	if ndpDisp.addr != lladdr1 {
+		t.Fatalf("got ndpDisp.addr = %s, want = %s", ndpDisp.addr, lladdr1)
+	}
 }
 
 // TestNeighorSolicitationWithSourceLinkLayerOption tests that receiving a
@@ -98,7 +183,7 @@ func TestNeighorSolicitationWithSourceLinkLayerOption(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			s := stack.New(stack.Options{
-				NetworkProtocols: []stack.NetworkProtocol{NewProtocol()},
+				NetworkProtocols: []stack.NetworkProtocolFactory{NewProtocol},
 			})
 			e := channel.New(0, 1280, linkAddr0)
 			if err := s.CreateNIC(nicID, e); err != nil {
@@ -202,7 +287,7 @@ func TestNeighorSolicitationWithSourceLinkLayerOptionUsingNeighborCache(t *testi
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			s := stack.New(stack.Options{
-				NetworkProtocols: []stack.NetworkProtocol{NewProtocol()},
+				NetworkProtocols: []stack.NetworkProtocolFactory{NewProtocol},
 				UseNeighborCache: true,
 			})
 			e := channel.New(0, 1280, linkAddr0)
@@ -475,7 +560,7 @@ func TestNeighorSolicitationResponse(t *testing.T) {
 			for _, test := range tests {
 				t.Run(test.name, func(t *testing.T) {
 					s := stack.New(stack.Options{
-						NetworkProtocols: []stack.NetworkProtocol{NewProtocol()},
+						NetworkProtocols: []stack.NetworkProtocolFactory{NewProtocol},
 						UseNeighborCache: stackTyp.useNeighborCache,
 					})
 					e := channel.New(1, 1280, nicLinkAddr)
@@ -596,7 +681,7 @@ func TestNeighorAdvertisementWithTargetLinkLayerOption(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			s := stack.New(stack.Options{
-				NetworkProtocols: []stack.NetworkProtocol{NewProtocol()},
+				NetworkProtocols: []stack.NetworkProtocolFactory{NewProtocol},
 			})
 			e := channel.New(0, 1280, linkAddr0)
 			if err := s.CreateNIC(nicID, e); err != nil {
@@ -707,7 +792,7 @@ func TestNeighorAdvertisementWithTargetLinkLayerOptionUsingNeighborCache(t *test
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			s := stack.New(stack.Options{
-				NetworkProtocols: []stack.NetworkProtocol{NewProtocol()},
+				NetworkProtocols: []stack.NetworkProtocolFactory{NewProtocol},
 				UseNeighborCache: true,
 			})
 			e := channel.New(0, 1280, linkAddr0)
@@ -958,7 +1043,7 @@ func TestNDPValidation(t *testing.T) {
 
 								if isRouter {
 									// Enabling forwarding makes the stack act as a router.
-									s.SetForwarding(true)
+									s.SetForwarding(ProtocolNumber, true)
 								}
 
 								stats := s.Stats().ICMP.V6PacketsReceived
@@ -1172,7 +1257,7 @@ func TestRouterAdvertValidation(t *testing.T) {
 					e := channel.New(10, 1280, linkAddr1)
 					e.LinkEPCapabilities |= stack.CapabilityResolutionRequired
 					s := stack.New(stack.Options{
-						NetworkProtocols: []stack.NetworkProtocol{NewProtocol()},
+						NetworkProtocols: []stack.NetworkProtocolFactory{NewProtocol},
 						UseNeighborCache: stackTyp.useNeighborCache,
 					})
 

@@ -52,7 +52,7 @@ func newTestSystem(t *testing.T, rootFn RootDentryFn) *testutil.System {
 	v.MustRegisterFilesystemType("testfs", &fsType{rootFn: rootFn}, &vfs.RegisterFilesystemTypeOptions{
 		AllowUserMount: true,
 	})
-	mns, err := v.NewMountNamespace(ctx, creds, "", "testfs", &vfs.GetFilesystemOptions{})
+	mns, err := v.NewMountNamespace(ctx, creds, "", "testfs", &vfs.MountOptions{})
 	if err != nil {
 		t.Fatalf("Failed to create testfs root mount: %v", err)
 	}
@@ -98,9 +98,10 @@ func (*attrs) SetStat(context.Context, *vfs.Filesystem, *auth.Credentials, vfs.S
 type readonlyDir struct {
 	readonlyDirRefs
 	attrs
-	kernfs.InodeNotSymlink
-	kernfs.InodeNoDynamicLookup
 	kernfs.InodeDirectoryNoNewChildren
+	kernfs.InodeNoDynamicLookup
+	kernfs.InodeNoStatFS
+	kernfs.InodeNotSymlink
 	kernfs.OrderedChildren
 
 	locks vfs.FileLocks
@@ -120,8 +121,8 @@ func (fs *filesystem) newReadonlyDir(creds *auth.Credentials, mode linux.FileMod
 	return &dir.dentry
 }
 
-func (d *readonlyDir) Open(ctx context.Context, rp *vfs.ResolvingPath, vfsd *vfs.Dentry, opts vfs.OpenOptions) (*vfs.FileDescription, error) {
-	fd, err := kernfs.NewGenericDirectoryFD(rp.Mount(), vfsd, &d.OrderedChildren, &d.locks, &opts, kernfs.GenericDirectoryFDOptions{
+func (d *readonlyDir) Open(ctx context.Context, rp *vfs.ResolvingPath, kd *kernfs.Dentry, opts vfs.OpenOptions) (*vfs.FileDescription, error) {
+	fd, err := kernfs.NewGenericDirectoryFD(rp.Mount(), kd, &d.OrderedChildren, &d.locks, &opts, kernfs.GenericDirectoryFDOptions{
 		SeekEnd: kernfs.SeekEndStaticEntries,
 	})
 	if err != nil {
@@ -137,9 +138,10 @@ func (d *readonlyDir) DecRef(context.Context) {
 type dir struct {
 	dirRefs
 	attrs
-	kernfs.InodeNotSymlink
 	kernfs.InodeNoDynamicLookup
+	kernfs.InodeNotSymlink
 	kernfs.OrderedChildren
+	kernfs.InodeNoStatFS
 
 	locks vfs.FileLocks
 
@@ -160,8 +162,8 @@ func (fs *filesystem) newDir(creds *auth.Credentials, mode linux.FileMode, conte
 	return &dir.dentry
 }
 
-func (d *dir) Open(ctx context.Context, rp *vfs.ResolvingPath, vfsd *vfs.Dentry, opts vfs.OpenOptions) (*vfs.FileDescription, error) {
-	fd, err := kernfs.NewGenericDirectoryFD(rp.Mount(), vfsd, &d.OrderedChildren, &d.locks, &opts, kernfs.GenericDirectoryFDOptions{
+func (d *dir) Open(ctx context.Context, rp *vfs.ResolvingPath, kd *kernfs.Dentry, opts vfs.OpenOptions) (*vfs.FileDescription, error) {
+	fd, err := kernfs.NewGenericDirectoryFD(rp.Mount(), kd, &d.OrderedChildren, &d.locks, &opts, kernfs.GenericDirectoryFDOptions{
 		SeekEnd: kernfs.SeekEndStaticEntries,
 	})
 	if err != nil {
@@ -174,38 +176,36 @@ func (d *dir) DecRef(context.Context) {
 	d.dirRefs.DecRef(d.Destroy)
 }
 
-func (d *dir) NewDir(ctx context.Context, name string, opts vfs.MkdirOptions) (*vfs.Dentry, error) {
+func (d *dir) NewDir(ctx context.Context, name string, opts vfs.MkdirOptions) (*kernfs.Dentry, error) {
 	creds := auth.CredentialsFromContext(ctx)
 	dir := d.fs.newDir(creds, opts.Mode, nil)
-	dirVFSD := dir.VFSDentry()
-	if err := d.OrderedChildren.Insert(name, dirVFSD); err != nil {
+	if err := d.OrderedChildren.Insert(name, dir); err != nil {
 		dir.DecRef(ctx)
 		return nil, err
 	}
 	d.IncLinks(1)
-	return dirVFSD, nil
+	return dir, nil
 }
 
-func (d *dir) NewFile(ctx context.Context, name string, opts vfs.OpenOptions) (*vfs.Dentry, error) {
+func (d *dir) NewFile(ctx context.Context, name string, opts vfs.OpenOptions) (*kernfs.Dentry, error) {
 	creds := auth.CredentialsFromContext(ctx)
 	f := d.fs.newFile(creds, "")
-	fVFSD := f.VFSDentry()
-	if err := d.OrderedChildren.Insert(name, fVFSD); err != nil {
+	if err := d.OrderedChildren.Insert(name, f); err != nil {
 		f.DecRef(ctx)
 		return nil, err
 	}
-	return fVFSD, nil
+	return f, nil
 }
 
-func (*dir) NewLink(context.Context, string, kernfs.Inode) (*vfs.Dentry, error) {
+func (*dir) NewLink(context.Context, string, kernfs.Inode) (*kernfs.Dentry, error) {
 	return nil, syserror.EPERM
 }
 
-func (*dir) NewSymlink(context.Context, string, string) (*vfs.Dentry, error) {
+func (*dir) NewSymlink(context.Context, string, string) (*kernfs.Dentry, error) {
 	return nil, syserror.EPERM
 }
 
-func (*dir) NewNode(context.Context, string, vfs.MknodOptions) (*vfs.Dentry, error) {
+func (*dir) NewNode(context.Context, string, vfs.MknodOptions) (*kernfs.Dentry, error) {
 	return nil, syserror.EPERM
 }
 

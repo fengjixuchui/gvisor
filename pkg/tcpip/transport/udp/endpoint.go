@@ -139,7 +139,7 @@ type endpoint struct {
 
 	// multicastMemberships that need to be remvoed when the endpoint is
 	// closed. Protected by the mu mutex.
-	multicastMemberships []multicastMembership
+	multicastMemberships map[multicastMembership]struct{}
 
 	// effectiveNetProtos contains the network protocols actually in use. In
 	// most cases it will only contain "netProto", but in cases like IPv6
@@ -154,6 +154,9 @@ type endpoint struct {
 
 	// owner is used to get uid and gid of the packet.
 	owner tcpip.PacketOwner
+
+	// linger is used for SO_LINGER socket option.
+	linger tcpip.LingerOption
 }
 
 // +stateify savable
@@ -182,12 +185,13 @@ func newEndpoint(s *stack.Stack, netProto tcpip.NetworkProtocolNumber, waiterQue
 		// TTL=1.
 		//
 		// Linux defaults to TTL=1.
-		multicastTTL:  1,
-		multicastLoop: true,
-		rcvBufSizeMax: 32 * 1024,
-		sndBufSizeMax: 32 * 1024,
-		state:         StateInitial,
-		uniqueID:      s.UniqueID(),
+		multicastTTL:         1,
+		multicastLoop:        true,
+		rcvBufSizeMax:        32 * 1024,
+		sndBufSizeMax:        32 * 1024,
+		multicastMemberships: make(map[multicastMembership]struct{}),
+		state:                StateInitial,
+		uniqueID:             s.UniqueID(),
 	}
 
 	// Override with stack defaults.
@@ -237,10 +241,10 @@ func (e *endpoint) Close() {
 		e.boundPortFlags = ports.Flags{}
 	}
 
-	for _, mem := range e.multicastMemberships {
+	for mem := range e.multicastMemberships {
 		e.stack.LeaveGroup(e.NetProto, mem.nicID, mem.multicastAddr)
 	}
-	e.multicastMemberships = nil
+	e.multicastMemberships = make(map[multicastMembership]struct{})
 
 	// Close the receive list and drain it.
 	e.rcvMu.Lock()
@@ -752,17 +756,15 @@ func (e *endpoint) SetSockOpt(opt tcpip.SettableSocketOption) *tcpip.Error {
 		e.mu.Lock()
 		defer e.mu.Unlock()
 
-		for _, mem := range e.multicastMemberships {
-			if mem == memToInsert {
-				return tcpip.ErrPortInUse
-			}
+		if _, ok := e.multicastMemberships[memToInsert]; ok {
+			return tcpip.ErrPortInUse
 		}
 
 		if err := e.stack.JoinGroup(e.NetProto, nicID, v.MulticastAddr); err != nil {
 			return err
 		}
 
-		e.multicastMemberships = append(e.multicastMemberships, memToInsert)
+		e.multicastMemberships[memToInsert] = struct{}{}
 
 	case *tcpip.RemoveMembershipOption:
 		if !header.IsV4MulticastAddress(v.MulticastAddr) && !header.IsV6MulticastAddress(v.MulticastAddr) {
@@ -786,18 +788,11 @@ func (e *endpoint) SetSockOpt(opt tcpip.SettableSocketOption) *tcpip.Error {
 		}
 
 		memToRemove := multicastMembership{nicID: nicID, multicastAddr: v.MulticastAddr}
-		memToRemoveIndex := -1
 
 		e.mu.Lock()
 		defer e.mu.Unlock()
 
-		for i, mem := range e.multicastMemberships {
-			if mem == memToRemove {
-				memToRemoveIndex = i
-				break
-			}
-		}
-		if memToRemoveIndex == -1 {
+		if _, ok := e.multicastMemberships[memToRemove]; !ok {
 			return tcpip.ErrBadLocalAddress
 		}
 
@@ -805,8 +800,7 @@ func (e *endpoint) SetSockOpt(opt tcpip.SettableSocketOption) *tcpip.Error {
 			return err
 		}
 
-		e.multicastMemberships[memToRemoveIndex] = e.multicastMemberships[len(e.multicastMemberships)-1]
-		e.multicastMemberships = e.multicastMemberships[:len(e.multicastMemberships)-1]
+		delete(e.multicastMemberships, memToRemove)
 
 	case *tcpip.BindToDeviceOption:
 		id := tcpip.NICID(*v)
@@ -819,6 +813,11 @@ func (e *endpoint) SetSockOpt(opt tcpip.SettableSocketOption) *tcpip.Error {
 
 	case *tcpip.SocketDetachFilterOption:
 		return nil
+
+	case *tcpip.LingerOption:
+		e.mu.Lock()
+		e.linger = *v
+		e.mu.Unlock()
 	}
 	return nil
 }
@@ -975,6 +974,11 @@ func (e *endpoint) GetSockOpt(opt tcpip.GettableSocketOption) *tcpip.Error {
 		*o = tcpip.BindToDeviceOption(e.bindToDevice)
 		e.mu.RUnlock()
 
+	case *tcpip.LingerOption:
+		e.mu.RLock()
+		*o = e.linger
+		e.mu.RUnlock()
+
 	default:
 		return tcpip.ErrUnknownProtocolOption
 	}
@@ -992,6 +996,7 @@ func sendUDP(r *stack.Route, data buffer.VectorisedView, localPort, remotePort u
 
 	// Initialize the UDP header.
 	udp := header.UDP(pkt.TransportHeader().Push(header.UDPMinimumSize))
+	pkt.TransportProtocolNumber = ProtocolNumber
 
 	length := uint16(pkt.Size())
 	udp.Encode(&header.UDPFields{
@@ -1218,7 +1223,7 @@ func (*endpoint) Listen(int) *tcpip.Error {
 }
 
 // Accept is not supported by UDP, it just fails.
-func (*endpoint) Accept() (tcpip.Endpoint, *waiter.Queue, *tcpip.Error) {
+func (*endpoint) Accept(*tcpip.FullAddress) (tcpip.Endpoint, *waiter.Queue, *tcpip.Error) {
 	return nil, nil, tcpip.ErrNotSupported
 }
 
@@ -1388,15 +1393,6 @@ func (e *endpoint) HandlePacket(r *stack.Route, id stack.TransportEndpointID, pk
 	if int(hdr.Length()) > pkt.Data.Size()+header.UDPMinimumSize {
 		// Malformed packet.
 		e.stack.Stats().UDP.MalformedPacketsReceived.Increment()
-		e.stats.ReceiveErrors.MalformedPacketsReceived.Increment()
-		return
-	}
-
-	// Never receive from a multicast address.
-	if header.IsV4MulticastAddress(id.RemoteAddress) ||
-		header.IsV6MulticastAddress(id.RemoteAddress) {
-		e.stack.Stats().UDP.InvalidSourceAddress.Increment()
-		e.stack.Stats().IP.InvalidSourceAddressesReceived.Increment()
 		e.stats.ReceiveErrors.MalformedPacketsReceived.Increment()
 		return
 	}

@@ -166,8 +166,8 @@ packetimpact_go_test(
 )
 
 packetimpact_go_test(
-    name = "tcp_close_wait_ack",
-    srcs = ["tcp_close_wait_ack_test.go"],
+    name = "tcp_unacc_seq_ack",
+    srcs = ["tcp_unacc_seq_ack_test.go"],
     deps = [
         "//pkg/tcpip/header",
         "//pkg/tcpip/seqnum",
@@ -260,6 +260,28 @@ packetimpact_go_test(
 )
 
 packetimpact_go_test(
+    name = "tcp_timewait_reset",
+    srcs = ["tcp_timewait_reset_test.go"],
+    # TODO(b/168523247): Fix netstack then remove the line below.
+    expect_netstack_failure = True,
+    deps = [
+        "//pkg/tcpip/header",
+        "//test/packetimpact/testbench",
+        "@org_golang_x_sys//unix:go_default_library",
+    ],
+)
+
+packetimpact_go_test(
+    name = "tcp_queue_send_in_syn_sent",
+    srcs = ["tcp_queue_send_in_syn_sent_test.go"],
+    deps = [
+        "//pkg/tcpip/header",
+        "//test/packetimpact/testbench",
+        "@org_golang_x_sys//unix:go_default_library",
+    ],
+)
+
+packetimpact_go_test(
     name = "icmpv6_param_problem",
     srcs = ["icmpv6_param_problem_test.go"],
     # TODO(b/153485026): Fix netstack then remove the line below.
@@ -312,6 +334,16 @@ packetimpact_go_test(
 packetimpact_go_test(
     name = "tcp_linger",
     srcs = ["tcp_linger_test.go"],
+    deps = [
+        "//pkg/tcpip/header",
+        "//test/packetimpact/testbench",
+        "@org_golang_x_sys//unix:go_default_library",
+    ],
+)
+
+packetimpact_go_test(
+    name = "tcp_rcv_buf_space",
+    srcs = ["tcp_rcv_buf_space_test.go"],
     deps = [
         "//pkg/tcpip/header",
         "//test/packetimpact/testbench",

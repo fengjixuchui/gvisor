@@ -12,12 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Package tcp contains the implementation of the TCP transport protocol. To use
-// it in the networking stack, this package must be added to the project, and
-// activated on the stack by passing tcp.NewProtocol() as one of the
-// transport protocols when calling stack.New(). Then endpoints can be created
-// by passing tcp.ProtocolNumber as the transport protocol number when calling
-// Stack.NewEndpoint().
+// Package tcp contains the implementation of the TCP transport protocol.
 package tcp
 
 import (
@@ -29,6 +24,7 @@ import (
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/buffer"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
+	"gvisor.dev/gvisor/pkg/tcpip/header/parse"
 	"gvisor.dev/gvisor/pkg/tcpip/seqnum"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
 	"gvisor.dev/gvisor/pkg/tcpip/transport/raw"
@@ -78,50 +74,6 @@ const (
 	ccReno  = "reno"
 	ccCubic = "cubic"
 )
-
-// SACKEnabled is used by stack.(*Stack).TransportProtocolOption to
-// enable/disable SACK support in TCP. See: https://tools.ietf.org/html/rfc2018.
-type SACKEnabled bool
-
-// Recovery is used by stack.(*Stack).TransportProtocolOption to
-// set loss detection algorithm in TCP.
-type Recovery int32
-
-const (
-	// RACKLossDetection indicates RACK is used for loss detection and
-	// recovery.
-	RACKLossDetection Recovery = 1 << iota
-
-	// RACKStaticReoWnd indicates the reordering window should not be
-	// adjusted when DSACK is received.
-	RACKStaticReoWnd
-
-	// RACKNoDupTh indicates RACK should not consider the classic three
-	// duplicate acknowledgements rule to mark the segments as lost. This
-	// is used when reordering is not detected.
-	RACKNoDupTh
-)
-
-// DelayEnabled is used by stack.(Stack*).TransportProtocolOption to
-// enable/disable Nagle's algorithm in TCP.
-type DelayEnabled bool
-
-// SendBufferSizeOption is used by stack.(Stack*).TransportProtocolOption
-// to get/set the default, min and max TCP send buffer sizes.
-type SendBufferSizeOption struct {
-	Min     int
-	Default int
-	Max     int
-}
-
-// ReceiveBufferSizeOption is used by
-// stack.(Stack*).TransportProtocolOption to get/set the default, min and max
-// TCP receive buffer sizes.
-type ReceiveBufferSizeOption struct {
-	Min     int
-	Default int
-	Max     int
-}
 
 // syncRcvdCounter tracks the number of endpoints in the SYN-RCVD state. The
 // value is protected by a mutex so that we can increment only when it's
@@ -181,12 +133,14 @@ func (s *synRcvdCounter) Threshold() uint64 {
 }
 
 type protocol struct {
+	stack *stack.Stack
+
 	mu                         sync.RWMutex
 	sackEnabled                bool
-	recovery                   Recovery
+	recovery                   tcpip.TCPRecovery
 	delayEnabled               bool
-	sendBufferSize             SendBufferSizeOption
-	recvBufferSize             ReceiveBufferSizeOption
+	sendBufferSize             tcpip.TCPSendBufferSizeRangeOption
+	recvBufferSize             tcpip.TCPReceiveBufferSizeRangeOption
 	congestionControl          string
 	availableCongestionControl []string
 	moderateReceiveBuffer      bool
@@ -207,14 +161,14 @@ func (*protocol) Number() tcpip.TransportProtocolNumber {
 }
 
 // NewEndpoint creates a new tcp endpoint.
-func (p *protocol) NewEndpoint(stack *stack.Stack, netProto tcpip.NetworkProtocolNumber, waiterQueue *waiter.Queue) (tcpip.Endpoint, *tcpip.Error) {
-	return newEndpoint(stack, netProto, waiterQueue), nil
+func (p *protocol) NewEndpoint(netProto tcpip.NetworkProtocolNumber, waiterQueue *waiter.Queue) (tcpip.Endpoint, *tcpip.Error) {
+	return newEndpoint(p.stack, netProto, waiterQueue), nil
 }
 
 // NewRawEndpoint creates a new raw TCP endpoint. Raw TCP sockets are currently
 // unsupported. It implements stack.TransportProtocol.NewRawEndpoint.
-func (p *protocol) NewRawEndpoint(stack *stack.Stack, netProto tcpip.NetworkProtocolNumber, waiterQueue *waiter.Queue) (tcpip.Endpoint, *tcpip.Error) {
-	return raw.NewEndpoint(stack, netProto, header.TCPProtocolNumber, waiterQueue)
+func (p *protocol) NewRawEndpoint(netProto tcpip.NetworkProtocolNumber, waiterQueue *waiter.Queue) (tcpip.Endpoint, *tcpip.Error) {
+	return raw.NewEndpoint(p.stack, netProto, header.TCPProtocolNumber, waiterQueue)
 }
 
 // MinimumPacketSize returns the minimum valid tcp packet size.
@@ -244,21 +198,20 @@ func (p *protocol) QueuePacket(r *stack.Route, ep stack.TransportEndpoint, id st
 // a reset is sent in response to any incoming segment except another reset. In
 // particular, SYNs addressed to a non-existent connection are rejected by this
 // means."
-func (*protocol) HandleUnknownDestinationPacket(r *stack.Route, id stack.TransportEndpointID, pkt *stack.PacketBuffer) bool {
+
+func (*protocol) HandleUnknownDestinationPacket(r *stack.Route, id stack.TransportEndpointID, pkt *stack.PacketBuffer) stack.UnknownDestinationPacketDisposition {
 	s := newSegment(r, id, pkt)
 	defer s.decRef()
 
 	if !s.parse() || !s.csumValid {
-		return false
+		return stack.UnknownDestinationPacketMalformed
 	}
 
-	// There's nothing to do if this is already a reset packet.
-	if s.flagIsSet(header.TCPFlagRst) {
-		return true
+	if !s.flagIsSet(header.TCPFlagRst) {
+		replyWithReset(s, stack.DefaultTOS, s.route.DefaultTTL())
 	}
 
-	replyWithReset(s, stack.DefaultTOS, s.route.DefaultTTL())
-	return true
+	return stack.UnknownDestinationPacketHandled
 }
 
 // replyWithReset replies to the given segment with a reset segment.
@@ -296,49 +249,49 @@ func replyWithReset(s *segment, tos, ttl uint8) {
 }
 
 // SetOption implements stack.TransportProtocol.SetOption.
-func (p *protocol) SetOption(option interface{}) *tcpip.Error {
+func (p *protocol) SetOption(option tcpip.SettableTransportProtocolOption) *tcpip.Error {
 	switch v := option.(type) {
-	case SACKEnabled:
+	case *tcpip.TCPSACKEnabled:
 		p.mu.Lock()
-		p.sackEnabled = bool(v)
+		p.sackEnabled = bool(*v)
 		p.mu.Unlock()
 		return nil
 
-	case Recovery:
+	case *tcpip.TCPRecovery:
 		p.mu.Lock()
-		p.recovery = Recovery(v)
+		p.recovery = *v
 		p.mu.Unlock()
 		return nil
 
-	case DelayEnabled:
+	case *tcpip.TCPDelayEnabled:
 		p.mu.Lock()
-		p.delayEnabled = bool(v)
+		p.delayEnabled = bool(*v)
 		p.mu.Unlock()
 		return nil
 
-	case SendBufferSizeOption:
+	case *tcpip.TCPSendBufferSizeRangeOption:
 		if v.Min <= 0 || v.Default < v.Min || v.Default > v.Max {
 			return tcpip.ErrInvalidOptionValue
 		}
 		p.mu.Lock()
-		p.sendBufferSize = v
+		p.sendBufferSize = *v
 		p.mu.Unlock()
 		return nil
 
-	case ReceiveBufferSizeOption:
+	case *tcpip.TCPReceiveBufferSizeRangeOption:
 		if v.Min <= 0 || v.Default < v.Min || v.Default > v.Max {
 			return tcpip.ErrInvalidOptionValue
 		}
 		p.mu.Lock()
-		p.recvBufferSize = v
+		p.recvBufferSize = *v
 		p.mu.Unlock()
 		return nil
 
-	case tcpip.CongestionControlOption:
+	case *tcpip.CongestionControlOption:
 		for _, c := range p.availableCongestionControl {
-			if string(v) == c {
+			if string(*v) == c {
 				p.mu.Lock()
-				p.congestionControl = string(v)
+				p.congestionControl = string(*v)
 				p.mu.Unlock()
 				return nil
 			}
@@ -347,75 +300,79 @@ func (p *protocol) SetOption(option interface{}) *tcpip.Error {
 		// is specified.
 		return tcpip.ErrNoSuchFile
 
-	case tcpip.ModerateReceiveBufferOption:
+	case *tcpip.TCPModerateReceiveBufferOption:
 		p.mu.Lock()
-		p.moderateReceiveBuffer = bool(v)
+		p.moderateReceiveBuffer = bool(*v)
 		p.mu.Unlock()
 		return nil
 
-	case tcpip.TCPLingerTimeoutOption:
-		if v < 0 {
-			v = 0
+	case *tcpip.TCPLingerTimeoutOption:
+		p.mu.Lock()
+		if *v < 0 {
+			p.lingerTimeout = 0
+		} else {
+			p.lingerTimeout = time.Duration(*v)
 		}
-		p.mu.Lock()
-		p.lingerTimeout = time.Duration(v)
 		p.mu.Unlock()
 		return nil
 
-	case tcpip.TCPTimeWaitTimeoutOption:
-		if v < 0 {
-			v = 0
+	case *tcpip.TCPTimeWaitTimeoutOption:
+		p.mu.Lock()
+		if *v < 0 {
+			p.timeWaitTimeout = 0
+		} else {
+			p.timeWaitTimeout = time.Duration(*v)
 		}
-		p.mu.Lock()
-		p.timeWaitTimeout = time.Duration(v)
 		p.mu.Unlock()
 		return nil
 
-	case tcpip.TCPTimeWaitReuseOption:
-		if v < tcpip.TCPTimeWaitReuseDisabled || v > tcpip.TCPTimeWaitReuseLoopbackOnly {
+	case *tcpip.TCPTimeWaitReuseOption:
+		if *v < tcpip.TCPTimeWaitReuseDisabled || *v > tcpip.TCPTimeWaitReuseLoopbackOnly {
 			return tcpip.ErrInvalidOptionValue
 		}
 		p.mu.Lock()
-		p.timeWaitReuse = v
+		p.timeWaitReuse = *v
 		p.mu.Unlock()
 		return nil
 
-	case tcpip.TCPMinRTOOption:
-		if v < 0 {
-			v = tcpip.TCPMinRTOOption(MinRTO)
+	case *tcpip.TCPMinRTOOption:
+		p.mu.Lock()
+		if *v < 0 {
+			p.minRTO = MinRTO
+		} else {
+			p.minRTO = time.Duration(*v)
 		}
-		p.mu.Lock()
-		p.minRTO = time.Duration(v)
 		p.mu.Unlock()
 		return nil
 
-	case tcpip.TCPMaxRTOOption:
-		if v < 0 {
-			v = tcpip.TCPMaxRTOOption(MaxRTO)
+	case *tcpip.TCPMaxRTOOption:
+		p.mu.Lock()
+		if *v < 0 {
+			p.maxRTO = MaxRTO
+		} else {
+			p.maxRTO = time.Duration(*v)
 		}
-		p.mu.Lock()
-		p.maxRTO = time.Duration(v)
 		p.mu.Unlock()
 		return nil
 
-	case tcpip.TCPMaxRetriesOption:
+	case *tcpip.TCPMaxRetriesOption:
 		p.mu.Lock()
-		p.maxRetries = uint32(v)
+		p.maxRetries = uint32(*v)
 		p.mu.Unlock()
 		return nil
 
-	case tcpip.TCPSynRcvdCountThresholdOption:
+	case *tcpip.TCPSynRcvdCountThresholdOption:
 		p.mu.Lock()
-		p.synRcvdCount.SetThreshold(uint64(v))
+		p.synRcvdCount.SetThreshold(uint64(*v))
 		p.mu.Unlock()
 		return nil
 
-	case tcpip.TCPSynRetriesOption:
-		if v < 1 || v > 255 {
+	case *tcpip.TCPSynRetriesOption:
+		if *v < 1 || *v > 255 {
 			return tcpip.ErrInvalidOptionValue
 		}
 		p.mu.Lock()
-		p.synRetries = uint8(v)
+		p.synRetries = uint8(*v)
 		p.mu.Unlock()
 		return nil
 
@@ -425,33 +382,33 @@ func (p *protocol) SetOption(option interface{}) *tcpip.Error {
 }
 
 // Option implements stack.TransportProtocol.Option.
-func (p *protocol) Option(option interface{}) *tcpip.Error {
+func (p *protocol) Option(option tcpip.GettableTransportProtocolOption) *tcpip.Error {
 	switch v := option.(type) {
-	case *SACKEnabled:
+	case *tcpip.TCPSACKEnabled:
 		p.mu.RLock()
-		*v = SACKEnabled(p.sackEnabled)
+		*v = tcpip.TCPSACKEnabled(p.sackEnabled)
 		p.mu.RUnlock()
 		return nil
 
-	case *Recovery:
+	case *tcpip.TCPRecovery:
 		p.mu.RLock()
-		*v = Recovery(p.recovery)
+		*v = tcpip.TCPRecovery(p.recovery)
 		p.mu.RUnlock()
 		return nil
 
-	case *DelayEnabled:
+	case *tcpip.TCPDelayEnabled:
 		p.mu.RLock()
-		*v = DelayEnabled(p.delayEnabled)
+		*v = tcpip.TCPDelayEnabled(p.delayEnabled)
 		p.mu.RUnlock()
 		return nil
 
-	case *SendBufferSizeOption:
+	case *tcpip.TCPSendBufferSizeRangeOption:
 		p.mu.RLock()
 		*v = p.sendBufferSize
 		p.mu.RUnlock()
 		return nil
 
-	case *ReceiveBufferSizeOption:
+	case *tcpip.TCPReceiveBufferSizeRangeOption:
 		p.mu.RLock()
 		*v = p.recvBufferSize
 		p.mu.RUnlock()
@@ -463,15 +420,15 @@ func (p *protocol) Option(option interface{}) *tcpip.Error {
 		p.mu.RUnlock()
 		return nil
 
-	case *tcpip.AvailableCongestionControlOption:
+	case *tcpip.TCPAvailableCongestionControlOption:
 		p.mu.RLock()
-		*v = tcpip.AvailableCongestionControlOption(strings.Join(p.availableCongestionControl, " "))
+		*v = tcpip.TCPAvailableCongestionControlOption(strings.Join(p.availableCongestionControl, " "))
 		p.mu.RUnlock()
 		return nil
 
-	case *tcpip.ModerateReceiveBufferOption:
+	case *tcpip.TCPModerateReceiveBufferOption:
 		p.mu.RLock()
-		*v = tcpip.ModerateReceiveBufferOption(p.moderateReceiveBuffer)
+		*v = tcpip.TCPModerateReceiveBufferOption(p.moderateReceiveBuffer)
 		p.mu.RUnlock()
 		return nil
 
@@ -546,33 +503,19 @@ func (p *protocol) SynRcvdCounter() *synRcvdCounter {
 
 // Parse implements stack.TransportProtocol.Parse.
 func (*protocol) Parse(pkt *stack.PacketBuffer) bool {
-	// TCP header is variable length, peek at it first.
-	hdrLen := header.TCPMinimumSize
-	hdr, ok := pkt.Data.PullUp(hdrLen)
-	if !ok {
-		return false
-	}
-
-	// If the header has options, pull those up as well.
-	if offset := int(header.TCP(hdr).DataOffset()); offset > header.TCPMinimumSize && offset <= pkt.Data.Size() {
-		// TODO(gvisor.dev/issue/2404): Figure out whether to reject this kind of
-		// packets.
-		hdrLen = offset
-	}
-
-	_, ok = pkt.TransportHeader().Consume(hdrLen)
-	return ok
+	return parse.TCP(pkt)
 }
 
 // NewProtocol returns a TCP transport protocol.
-func NewProtocol() stack.TransportProtocol {
+func NewProtocol(s *stack.Stack) stack.TransportProtocol {
 	p := protocol{
-		sendBufferSize: SendBufferSizeOption{
+		stack: s,
+		sendBufferSize: tcpip.TCPSendBufferSizeRangeOption{
 			Min:     MinBufferSize,
 			Default: DefaultSendBufferSize,
 			Max:     MaxBufferSize,
 		},
-		recvBufferSize: ReceiveBufferSizeOption{
+		recvBufferSize: tcpip.TCPReceiveBufferSizeRangeOption{
 			Min:     MinBufferSize,
 			Default: DefaultReceiveBufferSize,
 			Max:     MaxBufferSize,
@@ -587,7 +530,7 @@ func NewProtocol() stack.TransportProtocol {
 		minRTO:                     MinRTO,
 		maxRTO:                     MaxRTO,
 		maxRetries:                 MaxRetries,
-		recovery:                   RACKLossDetection,
+		recovery:                   tcpip.TCPRACKLossDetection,
 	}
 	p.dispatcher.init(runtime.GOMAXPROCS(0))
 	return &p

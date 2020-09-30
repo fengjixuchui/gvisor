@@ -21,6 +21,7 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/types.h>
+#include <time.h>
 #include <unistd.h>
 
 #include <iostream>
@@ -116,7 +117,9 @@ class PosixImpl final : public posix_server::Posix::Service {
     socklen_t addrlen = sizeof(addr);
     response->set_fd(accept(request->sockfd(),
                             reinterpret_cast<sockaddr *>(&addr), &addrlen));
-    response->set_errno_(errno);
+    if (response->fd() < 0) {
+      response->set_errno_(errno);
+    }
     return sockaddr_to_proto(addr, addrlen, response->mutable_addr());
   }
 
@@ -137,7 +140,9 @@ class PosixImpl final : public posix_server::Posix::Service {
 
     response->set_ret(
         bind(request->sockfd(), reinterpret_cast<sockaddr *>(&addr), addr_len));
-    response->set_errno_(errno);
+    if (response->ret() < 0) {
+      response->set_errno_(errno);
+    }
     return ::grpc::Status::OK;
   }
 
@@ -145,7 +150,9 @@ class PosixImpl final : public posix_server::Posix::Service {
                        const ::posix_server::CloseRequest *request,
                        ::posix_server::CloseResponse *response) override {
     response->set_ret(close(request->fd()));
-    response->set_errno_(errno);
+    if (response->ret() < 0) {
+      response->set_errno_(errno);
+    }
     return ::grpc::Status::OK;
   }
 
@@ -165,7 +172,9 @@ class PosixImpl final : public posix_server::Posix::Service {
 
     response->set_ret(connect(request->sockfd(),
                               reinterpret_cast<sockaddr *>(&addr), addr_len));
-    response->set_errno_(errno);
+    if (response->ret() < 0) {
+      response->set_errno_(errno);
+    }
     return ::grpc::Status::OK;
   }
 
@@ -173,7 +182,9 @@ class PosixImpl final : public posix_server::Posix::Service {
                        const ::posix_server::FcntlRequest *request,
                        ::posix_server::FcntlResponse *response) override {
     response->set_ret(::fcntl(request->fd(), request->cmd(), request->arg()));
-    response->set_errno_(errno);
+    if (response->ret() < 0) {
+      response->set_errno_(errno);
+    }
     return ::grpc::Status::OK;
   }
 
@@ -185,7 +196,9 @@ class PosixImpl final : public posix_server::Posix::Service {
     socklen_t addrlen = sizeof(addr);
     response->set_ret(getsockname(
         request->sockfd(), reinterpret_cast<sockaddr *>(&addr), &addrlen));
-    response->set_errno_(errno);
+    if (response->ret() < 0) {
+      response->set_errno_(errno);
+    }
     return sockaddr_to_proto(addr, addrlen, response->mutable_addr());
   }
 
@@ -227,7 +240,9 @@ class PosixImpl final : public posix_server::Posix::Service {
         return ::grpc::Status(grpc::StatusCode::INVALID_ARGUMENT,
                               "Unknown SockOpt Type");
     }
-    response->set_errno_(errno);
+    if (response->ret() < 0) {
+      response->set_errno_(errno);
+    }
     return ::grpc::Status::OK;
   }
 
@@ -235,7 +250,9 @@ class PosixImpl final : public posix_server::Posix::Service {
                         const ::posix_server::ListenRequest *request,
                         ::posix_server::ListenResponse *response) override {
     response->set_ret(listen(request->sockfd(), request->backlog()));
-    response->set_errno_(errno);
+    if (response->ret() < 0) {
+      response->set_errno_(errno);
+    }
     return ::grpc::Status::OK;
   }
 
@@ -244,7 +261,9 @@ class PosixImpl final : public posix_server::Posix::Service {
                       ::posix_server::SendResponse *response) override {
     response->set_ret(::send(request->sockfd(), request->buf().data(),
                              request->buf().size(), request->flags()));
-    response->set_errno_(errno);
+    if (response->ret() < 0) {
+      response->set_errno_(errno);
+    }
     return ::grpc::Status::OK;
   }
 
@@ -265,7 +284,9 @@ class PosixImpl final : public posix_server::Posix::Service {
     response->set_ret(::sendto(request->sockfd(), request->buf().data(),
                                request->buf().size(), request->flags(),
                                reinterpret_cast<sockaddr *>(&addr), addr_len));
-    response->set_errno_(errno);
+    if (response->ret() < 0) {
+      response->set_errno_(errno);
+    }
     return ::grpc::Status::OK;
   }
 
@@ -287,9 +308,9 @@ class PosixImpl final : public posix_server::Posix::Service {
         break;
       }
       case ::posix_server::SockOptVal::kTimeval: {
-        timeval tv = {.tv_sec = static_cast<__time_t>(
+        timeval tv = {.tv_sec = static_cast<time_t>(
                           request->optval().timeval().seconds()),
-                      .tv_usec = static_cast<__suseconds_t>(
+                      .tv_usec = static_cast<suseconds_t>(
                           request->optval().timeval().microseconds())};
         response->set_ret(setsockopt(request->sockfd(), request->level(),
                                      request->optname(), &tv, sizeof(tv)));
@@ -299,7 +320,9 @@ class PosixImpl final : public posix_server::Posix::Service {
         return ::grpc::Status(grpc::StatusCode::INVALID_ARGUMENT,
                               "Unknown SockOpt Type");
     }
-    response->set_errno_(errno);
+    if (response->ret() < 0) {
+      response->set_errno_(errno);
+    }
     return ::grpc::Status::OK;
   }
 
@@ -308,14 +331,18 @@ class PosixImpl final : public posix_server::Posix::Service {
                         ::posix_server::SocketResponse *response) override {
     response->set_fd(
         socket(request->domain(), request->type(), request->protocol()));
-    response->set_errno_(errno);
+    if (response->fd() < 0) {
+      response->set_errno_(errno);
+    }
     return ::grpc::Status::OK;
   }
 
-  ::grpc::Status Shutdown(grpc_impl::ServerContext *context,
+  ::grpc::Status Shutdown(grpc::ServerContext *context,
                           const ::posix_server::ShutdownRequest *request,
                           ::posix_server::ShutdownResponse *response) override {
-    response->set_errno_(shutdown(request->fd(), request->how()));
+    if (shutdown(request->fd(), request->how()) < 0) {
+      response->set_errno_(errno);
+    }
     return ::grpc::Status::OK;
   }
 
@@ -328,7 +355,9 @@ class PosixImpl final : public posix_server::Posix::Service {
     if (response->ret() >= 0) {
       response->set_buf(buf.data(), response->ret());
     }
-    response->set_errno_(errno);
+    if (response->ret() < 0) {
+      response->set_errno_(errno);
+    }
     return ::grpc::Status::OK;
   }
 };

@@ -34,7 +34,7 @@ func Close(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.Syscall
 	// Note that Remove provides a reference on the file that we may use to
 	// flush. It is still active until we drop the final reference below
 	// (and other reference-holding operations complete).
-	_, file := t.FDTable().Remove(fd)
+	_, file := t.FDTable().Remove(t, fd)
 	if file == nil {
 		return 0, nil, syserror.EBADF
 	}
@@ -137,7 +137,7 @@ func Fcntl(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.Syscall
 		return uintptr(flags.ToLinuxFDFlags()), nil, nil
 	case linux.F_SETFD:
 		flags := args[2].Uint()
-		err := t.FDTable().SetFlagsVFS2(fd, kernel.FDFlags{
+		err := t.FDTable().SetFlagsVFS2(t, fd, kernel.FDFlags{
 			CloseOnExec: flags&linux.FD_CLOEXEC != 0,
 		})
 		return 0, nil, err
@@ -181,11 +181,11 @@ func Fcntl(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.Syscall
 		if !hasOwner {
 			return 0, nil, nil
 		}
-		_, err := t.CopyOut(args[2].Pointer(), &owner)
+		_, err := owner.CopyOut(t, args[2].Pointer())
 		return 0, nil, err
 	case linux.F_SETOWN_EX:
 		var owner linux.FOwnerEx
-		_, err := t.CopyIn(args[2].Pointer(), &owner)
+		_, err := owner.CopyIn(t, args[2].Pointer())
 		if err != nil {
 			return 0, nil, err
 		}
@@ -286,7 +286,7 @@ func posixLock(t *kernel.Task, args arch.SyscallArguments, file *vfs.FileDescrip
 	// Copy in the lock request.
 	flockAddr := args[2].Pointer()
 	var flock linux.Flock
-	if _, err := t.CopyIn(flockAddr, &flock); err != nil {
+	if _, err := flock.CopyIn(t, flockAddr); err != nil {
 		return err
 	}
 

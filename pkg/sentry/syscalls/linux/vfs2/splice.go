@@ -18,9 +18,12 @@ import (
 	"io"
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
+	"gvisor.dev/gvisor/pkg/log"
+	"gvisor.dev/gvisor/pkg/marshal/primitive"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/pipe"
+	slinux "gvisor.dev/gvisor/pkg/sentry/syscalls/linux"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
 	"gvisor.dev/gvisor/pkg/syserror"
 	"gvisor.dev/gvisor/pkg/usermem"
@@ -88,7 +91,7 @@ func Splice(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.Syscal
 		if inFile.Options().DenyPRead {
 			return 0, nil, syserror.EINVAL
 		}
-		if _, err := t.CopyIn(inOffsetPtr, &inOffset); err != nil {
+		if _, err := primitive.CopyInt64In(t, inOffsetPtr, &inOffset); err != nil {
 			return 0, nil, err
 		}
 		if inOffset < 0 {
@@ -103,7 +106,7 @@ func Splice(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.Syscal
 		if outFile.Options().DenyPWrite {
 			return 0, nil, syserror.EINVAL
 		}
-		if _, err := t.CopyIn(outOffsetPtr, &outOffset); err != nil {
+		if _, err := primitive.CopyInt64In(t, outOffsetPtr, &outOffset); err != nil {
 			return 0, nil, err
 		}
 		if outOffset < 0 {
@@ -141,7 +144,7 @@ func Splice(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.Syscal
 				inOffset += n
 			}
 		default:
-			panic("not possible")
+			panic("at least one end of splice must be a pipe")
 		}
 
 		if n != 0 || err != syserror.ErrWouldBlock || nonBlock {
@@ -154,25 +157,26 @@ func Splice(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.Syscal
 
 	// Copy updated offsets out.
 	if inOffsetPtr != 0 {
-		if _, err := t.CopyOut(inOffsetPtr, &inOffset); err != nil {
+		if _, err := primitive.CopyInt64Out(t, inOffsetPtr, inOffset); err != nil {
 			return 0, nil, err
 		}
 	}
 	if outOffsetPtr != 0 {
-		if _, err := t.CopyOut(outOffsetPtr, &outOffset); err != nil {
+		if _, err := primitive.CopyInt64Out(t, outOffsetPtr, outOffset); err != nil {
 			return 0, nil, err
 		}
 	}
 
-	if n == 0 {
-		return 0, nil, err
+	if n != 0 {
+		// On Linux, inotify behavior is not very consistent with splice(2). We try
+		// our best to emulate Linux for very basic calls to splice, where for some
+		// reason, events are generated for output files, but not input files.
+		outFile.Dentry().InotifyWithParent(t, linux.IN_MODIFY, 0, vfs.PathEvent)
 	}
 
-	// On Linux, inotify behavior is not very consistent with splice(2). We try
-	// our best to emulate Linux for very basic calls to splice, where for some
-	// reason, events are generated for output files, but not input files.
-	outFile.Dentry().InotifyWithParent(t, linux.IN_MODIFY, 0, vfs.PathEvent)
-	return uintptr(n), nil, nil
+	// We can only pass a single file to handleIOError, so pick inFile arbitrarily.
+	// This is used only for debugging purposes.
+	return uintptr(n), nil, slinux.HandleIOErrorVFS2(t, n != 0, err, syserror.ERESTARTSYS, "splice", outFile)
 }
 
 // Tee implements Linux syscall tee(2).
@@ -244,11 +248,20 @@ func Tee(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.SyscallCo
 			break
 		}
 	}
-	if n == 0 {
-		return 0, nil, err
+
+	if n != 0 {
+		outFile.Dentry().InotifyWithParent(t, linux.IN_MODIFY, 0, vfs.PathEvent)
+
+		// If a partial write is completed, the error is dropped. Log it here.
+		if err != nil && err != io.EOF && err != syserror.ErrWouldBlock {
+			log.Debugf("tee completed a partial write with error: %v", err)
+			err = nil
+		}
 	}
-	outFile.Dentry().InotifyWithParent(t, linux.IN_MODIFY, 0, vfs.PathEvent)
-	return uintptr(n), nil, nil
+
+	// We can only pass a single file to handleIOError, so pick inFile arbitrarily.
+	// This is used only for debugging purposes.
+	return uintptr(n), nil, slinux.HandleIOErrorVFS2(t, n != 0, err, syserror.ERESTARTSYS, "tee", inFile)
 }
 
 // Sendfile implements linux system call sendfile(2).
@@ -297,9 +310,12 @@ func Sendfile(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.Sysc
 		if inFile.Options().DenyPRead {
 			return 0, nil, syserror.ESPIPE
 		}
-		if _, err := t.CopyIn(offsetAddr, &offset); err != nil {
+		var offsetP primitive.Int64
+		if _, err := offsetP.CopyIn(t, offsetAddr); err != nil {
 			return 0, nil, err
 		}
+		offset = int64(offsetP)
+
 		if offset < 0 {
 			return 0, nil, syserror.EINVAL
 		}
@@ -338,11 +354,6 @@ func Sendfile(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.Sysc
 		for n < count {
 			var spliceN int64
 			spliceN, err = outPipeFD.SpliceFromNonPipe(t, inFile, offset, count)
-			if spliceN == 0 && err == io.EOF {
-				// We reached the end of the file. Eat the error and exit the loop.
-				err = nil
-				break
-			}
 			if offset != -1 {
 				offset += spliceN
 			}
@@ -365,13 +376,6 @@ func Sendfile(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.Sysc
 			} else {
 				readN, err = inFile.Read(t, usermem.BytesIOSequence(buf), vfs.ReadOptions{})
 			}
-			if readN == 0 && err != nil {
-				if err == io.EOF {
-					// We reached the end of the file. Eat the error before exiting the loop.
-					err = nil
-				}
-				break
-			}
 			n += readN
 
 			// Write all of the bytes that we read. This may need
@@ -385,16 +389,21 @@ func Sendfile(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.Sysc
 					err = dw.waitForOut(t)
 				}
 				if err != nil {
-					// We didn't complete the write. Only
-					// report the bytes that were actually
-					// written, and rewind the offset.
+					// We didn't complete the write. Only report the bytes that were actually
+					// written, and rewind offsets as needed.
 					notWritten := int64(len(wbuf))
 					n -= notWritten
-					if offset != -1 {
-						// TODO(gvisor.dev/issue/3779): The inFile offset will be incorrect if we
-						// roll back, because it has already been advanced by the full amount.
-						// Merely seeking on inFile does not work, because there may be concurrent
-						// file operations.
+					if offset == -1 {
+						// We modified the offset of the input file itself during the read
+						// operation. Rewind it.
+						if _, seekErr := inFile.Seek(t, -notWritten, linux.SEEK_CUR); seekErr != nil {
+							// Log the error but don't return it, since the write has already
+							// completed successfully.
+							log.Warningf("failed to roll back input file offset: %v", seekErr)
+						}
+					} else {
+						// The sendfile call was provided an offset parameter that should be
+						// adjusted to reflect the number of bytes sent. Rewind it.
 						offset -= notWritten
 					}
 					break
@@ -411,18 +420,26 @@ func Sendfile(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.Sysc
 
 	if offsetAddr != 0 {
 		// Copy out the new offset.
-		if _, err := t.CopyOut(offsetAddr, offset); err != nil {
+		offsetP := primitive.Uint64(offset)
+		if _, err := offsetP.CopyOut(t, offsetAddr); err != nil {
 			return 0, nil, err
 		}
 	}
 
-	if n == 0 {
-		return 0, nil, err
+	if n != 0 {
+		inFile.Dentry().InotifyWithParent(t, linux.IN_ACCESS, 0, vfs.PathEvent)
+		outFile.Dentry().InotifyWithParent(t, linux.IN_MODIFY, 0, vfs.PathEvent)
+
+		if err != nil && err != io.EOF && err != syserror.ErrWouldBlock {
+			// If a partial write is completed, the error is dropped. Log it here.
+			log.Debugf("sendfile completed a partial write with error: %v", err)
+			err = nil
+		}
 	}
 
-	inFile.Dentry().InotifyWithParent(t, linux.IN_ACCESS, 0, vfs.PathEvent)
-	outFile.Dentry().InotifyWithParent(t, linux.IN_MODIFY, 0, vfs.PathEvent)
-	return uintptr(n), nil, nil
+	// We can only pass a single file to handleIOError, so pick inFile arbitrarily.
+	// This is used only for debugging purposes.
+	return uintptr(n), nil, slinux.HandleIOErrorVFS2(t, n != 0, err, syserror.ERESTARTSYS, "sendfile", inFile)
 }
 
 // dualWaiter is used to wait on one or both vfs.FileDescriptions. It is not

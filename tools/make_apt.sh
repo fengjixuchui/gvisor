@@ -54,18 +54,22 @@ declare -r release="${root}/dists/${suite}"
 mkdir -p "${release}"
 
 # Create a temporary keyring, and ensure it is cleaned up.
+# Using separate homedir allows us to install apt repositories multiple times
+# using the same key. This is a limitation in GnuPG pre-2.1.
 declare -r keyring=$(mktemp /tmp/keyringXXXXXX.gpg)
+declare -r homedir=$(mktemp -d /tmp/homedirXXXXXX)
+declare -r gpg_opts=("--no-default-keyring" "--secret-keyring" "${keyring}" "--homedir" "${homedir}")
 cleanup() {
-  rm -f "${keyring}"
+  rm -rf "${keyring}" "${homedir}"
 }
 trap cleanup EXIT
 
 # We attempt the import twice because the first one will fail if the public key
 # is not found. This isn't actually a failure for us, because we don't require
-# the public (this may be stored separately). The second import will succeed
+# the public key (this may be stored separately). The second import will succeed
 # because, in reality, the first import succeeded and it's a no-op.
-gpg --no-default-keyring --keyring "${keyring}" --secret-keyring "${keyring}" --import "${private_key}" || \
-  gpg --no-default-keyring --keyring "${keyring}" --secret-keyring "${keyring}" --import "${private_key}"
+gpg "${gpg_opts[@]}" --import "${private_key}" || \
+  gpg "${gpg_opts[@]}" --import "${private_key}"
 
 # Copy the packages into the root.
 for pkg in "$@"; do
@@ -100,7 +104,8 @@ for pkg in "$@"; do
   cp -a "${pkg}" "${target}"
   chmod 0644 "${target}"
   if [[ "${ext}" == "deb" ]]; then
-    dpkg-sig -g "--no-default-keyring --keyring ${keyring}" --sign builder "${target}"
+    # We use [*] here to expand the gpg_opts array into a single shell-word.
+    dpkg-sig -g "${gpg_opts[*]}" --sign builder "${target}"
   fi
 done
 
@@ -135,5 +140,5 @@ rm "${release}"/apt.conf
 # Sign the release.
 declare -r digest_opts=("--digest-algo" "SHA512" "--cert-digest-algo" "SHA512")
 (cd "${release}" && rm -f Release.gpg InRelease)
-(cd "${release}" && gpg --no-default-keyring --keyring "${keyring}" --clearsign "${digest_opts[@]}" -o InRelease Release)
-(cd "${release}" && gpg --no-default-keyring --keyring "${keyring}" -abs "${digest_opts[@]}" -o Release.gpg Release)
+(cd "${release}" && gpg "${gpg_opts[@]}" --clearsign "${digest_opts[@]}" -o InRelease Release)
+(cd "${release}" && gpg "${gpg_opts[@]}" -abs "${digest_opts[@]}" -o Release.gpg Release)

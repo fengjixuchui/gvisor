@@ -22,6 +22,7 @@ exports_files(
         "socket_ipv4_tcp_unbound_external_networking_test.cc",
         "socket_ipv4_udp_unbound_external_networking_test.cc",
         "socket_ipv4_udp_unbound_loopback.cc",
+        "socket_ipv4_udp_unbound_loopback_nogotsan.cc",
         "tcp_socket.cc",
         "udp_bind.cc",
         "udp_socket.cc",
@@ -1666,12 +1667,14 @@ cc_binary(
         "//test/util:cleanup",
         "//test/util:file_descriptor",
         "//test/util:fs_util",
+        "@com_google_absl//absl/container:node_hash_set",
         "@com_google_absl//absl/strings",
         "@com_google_absl//absl/synchronization",
         "@com_google_absl//absl/time",
         gtest,
         "//test/util:memory_util",
         "//test/util:posix_error",
+        "//test/util:proc_util",
         "//test/util:temp_path",
         "//test/util:test_util",
         "//test/util:thread_util",
@@ -2411,22 +2414,8 @@ cc_library(
         ":socket_test_util",
         "@com_google_absl//absl/memory",
         gtest,
+        "//test/util:posix_error",
         "//test/util:test_util",
-    ],
-    alwayslink = 1,
-)
-
-cc_library(
-    name = "socket_ip_udp_unbound_netlink_test_utils",
-    testonly = 1,
-    srcs = [
-        "socket_ip_udp_unbound_netlink_util.cc",
-    ],
-    hdrs = [
-        "socket_ip_udp_unbound_netlink_util.h",
-    ],
-    deps = [
-        ":socket_test_util",
     ],
     alwayslink = 1,
 )
@@ -2441,9 +2430,10 @@ cc_library(
         "socket_ipv4_udp_unbound_netlink.h",
     ],
     deps = [
-        ":socket_ip_udp_unbound_netlink_test_utils",
         ":socket_netlink_route_util",
+        ":socket_test_util",
         "//test/util:capability_util",
+        "//test/util:cleanup",
         gtest,
     ],
     alwayslink = 1,
@@ -2459,8 +2449,8 @@ cc_library(
         "socket_ipv6_udp_unbound_netlink.h",
     ],
     deps = [
-        ":socket_ip_udp_unbound_netlink_test_utils",
         ":socket_netlink_route_util",
+        ":socket_test_util",
         "//test/util:capability_util",
         gtest,
     ],
@@ -3681,15 +3671,12 @@ cc_binary(
     ],
 )
 
-cc_library(
-    name = "udp_socket_test_cases",
+cc_binary(
+    name = "udp_socket_test",
     testonly = 1,
-    srcs = [
-        "udp_socket_errqueue_test_case.cc",
-        "udp_socket_test_cases.cc",
-    ],
-    hdrs = ["udp_socket_test_cases.h"],
+    srcs = ["udp_socket.cc"],
     defines = select_system(),
+    linkstatic = 1,
     deps = [
         ":ip_socket_test_util",
         ":socket_test_util",
@@ -3703,17 +3690,6 @@ cc_library(
         "//test/util:test_main",
         "//test/util:test_util",
         "//test/util:thread_util",
-    ],
-    alwayslink = 1,
-)
-
-cc_binary(
-    name = "udp_socket_test",
-    testonly = 1,
-    srcs = ["udp_socket.cc"],
-    linkstatic = 1,
-    deps = [
-        ":udp_socket_test_cases",
     ],
 )
 

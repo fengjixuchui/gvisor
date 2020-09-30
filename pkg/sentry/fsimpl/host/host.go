@@ -58,7 +58,7 @@ func newInode(fs *filesystem, hostFD int, fileType linux.FileMode, isTTY bool) (
 		canMap: fileType == linux.S_IFREG,
 	}
 	i.pf.inode = i
-	i.refs.EnableLeakCheck()
+	i.EnableLeakCheck()
 
 	// Non-seekable files can't be memory mapped, assert this.
 	if !i.seekable && i.canMap {
@@ -126,7 +126,7 @@ func NewFD(ctx context.Context, mnt *vfs.Mount, hostFD int, opts *NewFDOptions) 
 	// For simplicity, fileDescription.offset is set to 0. Technically, we
 	// should only set to 0 on files that are not seekable (sockets, pipes,
 	// etc.), and use the offset from the host fd otherwise when importing.
-	return i.open(ctx, d.VFSDentry(), mnt, flags)
+	return i.open(ctx, d, mnt, flags)
 }
 
 // ImportFD sets up and returns a vfs.FileDescription from a donated fd.
@@ -137,14 +137,16 @@ func ImportFD(ctx context.Context, mnt *vfs.Mount, hostFD int, isTTY bool) (*vfs
 }
 
 // filesystemType implements vfs.FilesystemType.
+//
+// +stateify savable
 type filesystemType struct{}
 
-// GetFilesystem implements FilesystemType.GetFilesystem.
+// GetFilesystem implements vfs.FilesystemType.GetFilesystem.
 func (filesystemType) GetFilesystem(context.Context, *vfs.VirtualFilesystem, *auth.Credentials, string, vfs.GetFilesystemOptions) (*vfs.Filesystem, *vfs.Dentry, error) {
 	panic("host.filesystemType.GetFilesystem should never be called")
 }
 
-// Name implements FilesystemType.Name.
+// Name implements vfs.FilesystemType.Name.
 func (filesystemType) Name() string {
 	return "none"
 }
@@ -166,6 +168,8 @@ func NewFilesystem(vfsObj *vfs.VirtualFilesystem) (*vfs.Filesystem, error) {
 }
 
 // filesystem implements vfs.FilesystemImpl.
+//
+// +stateify savable
 type filesystem struct {
 	kernfs.Filesystem
 
@@ -185,14 +189,17 @@ func (fs *filesystem) PrependPath(ctx context.Context, vfsroot, vd vfs.VirtualDe
 }
 
 // inode implements kernfs.Inode.
+//
+// +stateify savable
 type inode struct {
+	kernfs.InodeNoStatFS
 	kernfs.InodeNotDirectory
 	kernfs.InodeNotSymlink
 
 	locks vfs.FileLocks
 
 	// When the reference count reaches zero, the host fd is closed.
-	refs inodeRefs
+	inodeRefs
 
 	// hostFD contains the host fd that this file was originally created from,
 	// which must be available at time of restore.
@@ -232,7 +239,7 @@ type inode struct {
 	canMap bool
 
 	// mapsMu protects mappings.
-	mapsMu sync.Mutex
+	mapsMu sync.Mutex `state:"nosave"`
 
 	// If canMap is true, mappings tracks mappings of hostFD into
 	// memmap.MappingSpaces.
@@ -242,7 +249,7 @@ type inode struct {
 	pf inodePlatformFile
 }
 
-// CheckPermissions implements kernfs.Inode.
+// CheckPermissions implements kernfs.Inode.CheckPermissions.
 func (i *inode) CheckPermissions(ctx context.Context, creds *auth.Credentials, ats vfs.AccessTypes) error {
 	var s syscall.Stat_t
 	if err := syscall.Fstat(i.hostFD, &s); err != nil {
@@ -251,7 +258,7 @@ func (i *inode) CheckPermissions(ctx context.Context, creds *auth.Credentials, a
 	return vfs.GenericCheckPermissions(creds, ats, linux.FileMode(s.Mode), auth.KUID(s.Uid), auth.KGID(s.Gid))
 }
 
-// Mode implements kernfs.Inode.
+// Mode implements kernfs.Inode.Mode.
 func (i *inode) Mode() linux.FileMode {
 	var s syscall.Stat_t
 	if err := syscall.Fstat(i.hostFD, &s); err != nil {
@@ -262,7 +269,7 @@ func (i *inode) Mode() linux.FileMode {
 	return linux.FileMode(s.Mode)
 }
 
-// Stat implements kernfs.Inode.
+// Stat implements kernfs.Inode.Stat.
 func (i *inode) Stat(ctx context.Context, vfsfs *vfs.Filesystem, opts vfs.StatOptions) (linux.Statx, error) {
 	if opts.Mask&linux.STATX__RESERVED != 0 {
 		return linux.Statx{}, syserror.EINVAL
@@ -375,7 +382,7 @@ func (i *inode) fstat(fs *filesystem) (linux.Statx, error) {
 	}, nil
 }
 
-// SetStat implements kernfs.Inode.
+// SetStat implements kernfs.Inode.SetStat.
 func (i *inode) SetStat(ctx context.Context, fs *vfs.Filesystem, creds *auth.Credentials, opts vfs.SetStatOptions) error {
 	s := &opts.Stat
 
@@ -434,19 +441,9 @@ func (i *inode) SetStat(ctx context.Context, fs *vfs.Filesystem, creds *auth.Cre
 	return nil
 }
 
-// IncRef implements kernfs.Inode.
-func (i *inode) IncRef() {
-	i.refs.IncRef()
-}
-
-// TryIncRef implements kernfs.Inode.
-func (i *inode) TryIncRef() bool {
-	return i.refs.TryIncRef()
-}
-
-// DecRef implements kernfs.Inode.
+// DecRef implements kernfs.Inode.DecRef.
 func (i *inode) DecRef(ctx context.Context) {
-	i.refs.DecRef(func() {
+	i.inodeRefs.DecRef(func() {
 		if i.wouldBlock {
 			fdnotifier.RemoveFD(int32(i.hostFD))
 		}
@@ -456,16 +453,16 @@ func (i *inode) DecRef(ctx context.Context) {
 	})
 }
 
-// Open implements kernfs.Inode.
-func (i *inode) Open(ctx context.Context, rp *vfs.ResolvingPath, vfsd *vfs.Dentry, opts vfs.OpenOptions) (*vfs.FileDescription, error) {
+// Open implements kernfs.Inode.Open.
+func (i *inode) Open(ctx context.Context, rp *vfs.ResolvingPath, d *kernfs.Dentry, opts vfs.OpenOptions) (*vfs.FileDescription, error) {
 	// Once created, we cannot re-open a socket fd through /proc/[pid]/fd/.
 	if i.Mode().FileType() == linux.S_IFSOCK {
 		return nil, syserror.ENXIO
 	}
-	return i.open(ctx, vfsd, rp.Mount(), opts.Flags)
+	return i.open(ctx, d, rp.Mount(), opts.Flags)
 }
 
-func (i *inode) open(ctx context.Context, d *vfs.Dentry, mnt *vfs.Mount, flags uint32) (*vfs.FileDescription, error) {
+func (i *inode) open(ctx context.Context, d *kernfs.Dentry, mnt *vfs.Mount, flags uint32) (*vfs.FileDescription, error) {
 	var s syscall.Stat_t
 	if err := syscall.Fstat(i.hostFD, &s); err != nil {
 		return nil, err
@@ -489,17 +486,17 @@ func (i *inode) open(ctx context.Context, d *vfs.Dentry, mnt *vfs.Mount, flags u
 			return nil, err
 		}
 		// Currently, we only allow Unix sockets to be imported.
-		return unixsocket.NewFileDescription(ep, ep.Type(), flags, mnt, d, &i.locks)
+		return unixsocket.NewFileDescription(ep, ep.Type(), flags, mnt, d.VFSDentry(), &i.locks)
 
 	case syscall.S_IFREG, syscall.S_IFIFO, syscall.S_IFCHR:
 		if i.isTTY {
 			fd := &TTYFileDescription{
 				fileDescription: fileDescription{inode: i},
-				termios:         linux.DefaultSlaveTermios,
+				termios:         linux.DefaultReplicaTermios,
 			}
 			fd.LockFD.Init(&i.locks)
 			vfsfd := &fd.vfsfd
-			if err := vfsfd.Init(fd, flags, mnt, d, &vfs.FileDescriptionOptions{}); err != nil {
+			if err := vfsfd.Init(fd, flags, mnt, d.VFSDentry(), &vfs.FileDescriptionOptions{}); err != nil {
 				return nil, err
 			}
 			return vfsfd, nil
@@ -508,7 +505,7 @@ func (i *inode) open(ctx context.Context, d *vfs.Dentry, mnt *vfs.Mount, flags u
 		fd := &fileDescription{inode: i}
 		fd.LockFD.Init(&i.locks)
 		vfsfd := &fd.vfsfd
-		if err := vfsfd.Init(fd, flags, mnt, d, &vfs.FileDescriptionOptions{}); err != nil {
+		if err := vfsfd.Init(fd, flags, mnt, d.VFSDentry(), &vfs.FileDescriptionOptions{}); err != nil {
 			return nil, err
 		}
 		return vfsfd, nil
@@ -520,6 +517,8 @@ func (i *inode) open(ctx context.Context, d *vfs.Dentry, mnt *vfs.Mount, flags u
 }
 
 // fileDescription is embedded by host fd implementations of FileDescriptionImpl.
+//
+// +stateify savable
 type fileDescription struct {
 	vfsfd vfs.FileDescription
 	vfs.FileDescriptionDefaultImpl
@@ -534,40 +533,35 @@ type fileDescription struct {
 	inode *inode
 
 	// offsetMu protects offset.
-	offsetMu sync.Mutex
+	offsetMu sync.Mutex `state:"nosave"`
 
 	// offset specifies the current file offset. It is only meaningful when
 	// inode.seekable is true.
 	offset int64
 }
 
-// SetStat implements vfs.FileDescriptionImpl.
+// SetStat implements vfs.FileDescriptionImpl.SetStat.
 func (f *fileDescription) SetStat(ctx context.Context, opts vfs.SetStatOptions) error {
 	creds := auth.CredentialsFromContext(ctx)
 	return f.inode.SetStat(ctx, f.vfsfd.Mount().Filesystem(), creds, opts)
 }
 
-// Stat implements vfs.FileDescriptionImpl.
+// Stat implements vfs.FileDescriptionImpl.Stat.
 func (f *fileDescription) Stat(ctx context.Context, opts vfs.StatOptions) (linux.Statx, error) {
 	return f.inode.Stat(ctx, f.vfsfd.Mount().Filesystem(), opts)
 }
 
-// Release implements vfs.FileDescriptionImpl.
+// Release implements vfs.FileDescriptionImpl.Release.
 func (f *fileDescription) Release(context.Context) {
 	// noop
 }
 
-// Allocate implements vfs.FileDescriptionImpl.
+// Allocate implements vfs.FileDescriptionImpl.Allocate.
 func (f *fileDescription) Allocate(ctx context.Context, mode, offset, length uint64) error {
-	if !f.inode.seekable {
-		return syserror.ESPIPE
-	}
-
-	// TODO(gvisor.dev/issue/3589): Implement Allocate for non-pipe hostfds.
-	return syserror.EOPNOTSUPP
+	return unix.Fallocate(f.inode.hostFD, uint32(mode), int64(offset), int64(length))
 }
 
-// PRead implements FileDescriptionImpl.
+// PRead implements vfs.FileDescriptionImpl.PRead.
 func (f *fileDescription) PRead(ctx context.Context, dst usermem.IOSequence, offset int64, opts vfs.ReadOptions) (int64, error) {
 	i := f.inode
 	if !i.seekable {
@@ -577,7 +571,7 @@ func (f *fileDescription) PRead(ctx context.Context, dst usermem.IOSequence, off
 	return readFromHostFD(ctx, i.hostFD, dst, offset, opts.Flags)
 }
 
-// Read implements FileDescriptionImpl.
+// Read implements vfs.FileDescriptionImpl.Read.
 func (f *fileDescription) Read(ctx context.Context, dst usermem.IOSequence, opts vfs.ReadOptions) (int64, error) {
 	i := f.inode
 	if !i.seekable {
@@ -614,7 +608,7 @@ func readFromHostFD(ctx context.Context, hostFD int, dst usermem.IOSequence, off
 	return int64(n), err
 }
 
-// PWrite implements FileDescriptionImpl.
+// PWrite implements vfs.FileDescriptionImpl.PWrite.
 func (f *fileDescription) PWrite(ctx context.Context, src usermem.IOSequence, offset int64, opts vfs.WriteOptions) (int64, error) {
 	if !f.inode.seekable {
 		return 0, syserror.ESPIPE
@@ -623,7 +617,7 @@ func (f *fileDescription) PWrite(ctx context.Context, src usermem.IOSequence, of
 	return f.writeToHostFD(ctx, src, offset, opts.Flags)
 }
 
-// Write implements FileDescriptionImpl.
+// Write implements vfs.FileDescriptionImpl.Write.
 func (f *fileDescription) Write(ctx context.Context, src usermem.IOSequence, opts vfs.WriteOptions) (int64, error) {
 	i := f.inode
 	if !i.seekable {
@@ -671,7 +665,7 @@ func (f *fileDescription) writeToHostFD(ctx context.Context, src usermem.IOSeque
 	return int64(n), err
 }
 
-// Seek implements FileDescriptionImpl.
+// Seek implements vfs.FileDescriptionImpl.Seek.
 //
 // Note that we do not support seeking on directories, since we do not even
 // allow directory fds to be imported at all.
@@ -736,13 +730,13 @@ func (f *fileDescription) Seek(_ context.Context, offset int64, whence int32) (i
 	return f.offset, nil
 }
 
-// Sync implements FileDescriptionImpl.
+// Sync implements vfs.FileDescriptionImpl.Sync.
 func (f *fileDescription) Sync(context.Context) error {
 	// TODO(gvisor.dev/issue/1897): Currently, we always sync everything.
 	return unix.Fsync(f.inode.hostFD)
 }
 
-// ConfigureMMap implements FileDescriptionImpl.
+// ConfigureMMap implements vfs.FileDescriptionImpl.ConfigureMMap.
 func (f *fileDescription) ConfigureMMap(_ context.Context, opts *memmap.MMapOpts) error {
 	if !f.inode.canMap {
 		return syserror.ENODEV

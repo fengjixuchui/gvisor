@@ -13,9 +13,9 @@
 // limitations under the License.
 
 #include <fcntl.h>
-#ifndef __fuchsia__
+#ifdef __linux__
 #include <linux/filter.h>
-#endif  // __fuchsia__
+#endif  // __linux__
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <poll.h>
@@ -1586,7 +1586,7 @@ TEST_P(SimpleTcpSocketTest, SetTCPWindowClampAboveHalfMinRcvBuf) {
   }
 }
 
-#ifndef __fuchsia__
+#ifdef __linux__
 
 // TODO(gvisor.dev/2746): Support SO_ATTACH_FILTER/SO_DETACH_FILTER.
 // gVisor currently silently ignores attaching a filter.
@@ -1620,6 +1620,8 @@ TEST_P(SimpleTcpSocketTest, SetSocketAttachDetachFilter) {
       SyscallSucceeds());
 }
 
+#endif  // __linux__
+
 TEST_P(SimpleTcpSocketTest, SetSocketDetachFilterNoInstalledFilter) {
   // TODO(gvisor.dev/2746): Support SO_ATTACH_FILTER/SO_DETACH_FILTER.
   SKIP_IF(IsRunningOnGvisor());
@@ -1641,7 +1643,35 @@ TEST_P(SimpleTcpSocketTest, GetSocketDetachFilter) {
               SyscallFailsWithErrno(ENOPROTOOPT));
 }
 
-#endif  // __fuchsia__
+TEST_P(SimpleTcpSocketTest, CloseNonConnectedLingerOption) {
+  FileDescriptor s =
+      ASSERT_NO_ERRNO_AND_VALUE(Socket(GetParam(), SOCK_STREAM, IPPROTO_TCP));
+
+  constexpr int kLingerTimeout = 10;  // Seconds.
+
+  // Set the SO_LINGER option.
+  struct linger sl = {
+      .l_onoff = 1,
+      .l_linger = kLingerTimeout,
+  };
+  ASSERT_THAT(setsockopt(s.get(), SOL_SOCKET, SO_LINGER, &sl, sizeof(sl)),
+              SyscallSucceeds());
+
+  struct pollfd poll_fd = {
+      .fd = s.get(),
+      .events = POLLHUP,
+  };
+  constexpr int kPollTimeoutMs = 0;
+  ASSERT_THAT(RetryEINTR(poll)(&poll_fd, 1, kPollTimeoutMs),
+              SyscallSucceedsWithValue(1));
+
+  auto const start_time = absl::Now();
+  EXPECT_THAT(close(s.release()), SyscallSucceeds());
+  auto const end_time = absl::Now();
+
+  // Close() should not linger and return immediately.
+  ASSERT_LT((end_time - start_time), absl::Seconds(kLingerTimeout));
+}
 
 INSTANTIATE_TEST_SUITE_P(AllInetTests, SimpleTcpSocketTest,
                          ::testing::Values(AF_INET, AF_INET6));

@@ -67,6 +67,7 @@ var (
 	taskStaticFiles = map[string]testutil.DirentType{
 		"auxv":          linux.DT_REG,
 		"cgroup":        linux.DT_REG,
+		"cwd":           linux.DT_LNK,
 		"cmdline":       linux.DT_REG,
 		"comm":          linux.DT_REG,
 		"environ":       linux.DT_REG,
@@ -104,7 +105,7 @@ func setup(t *testing.T) *testutil.System {
 		AllowUserMount: true,
 	})
 
-	mntns, err := k.VFS().NewMountNamespace(ctx, creds, "", tmpfs.Name, &vfs.GetFilesystemOptions{})
+	mntns, err := k.VFS().NewMountNamespace(ctx, creds, "", tmpfs.Name, &vfs.MountOptions{})
 	if err != nil {
 		t.Fatalf("NewMountNamespace(): %v", err)
 	}

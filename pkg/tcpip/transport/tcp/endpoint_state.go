@@ -44,7 +44,7 @@ func (e *endpoint) drainSegmentLocked() {
 // beforeSave is invoked by stateify.
 func (e *endpoint) beforeSave() {
 	// Stop incoming packets.
-	e.segmentQueue.setLimit(0)
+	e.segmentQueue.freeze()
 
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -178,18 +178,18 @@ func (e *endpoint) afterLoad() {
 // Resume implements tcpip.ResumableEndpoint.Resume.
 func (e *endpoint) Resume(s *stack.Stack) {
 	e.stack = s
-	e.segmentQueue.setLimit(MaxUnprocessedSegments)
+	e.segmentQueue.thaw()
 	epState := e.origEndpointState
 	switch epState {
 	case StateInitial, StateBound, StateListen, StateConnecting, StateEstablished:
-		var ss SendBufferSizeOption
+		var ss tcpip.TCPSendBufferSizeRangeOption
 		if err := e.stack.TransportProtocolOption(ProtocolNumber, &ss); err == nil {
 			if e.sndBufSize < ss.Min || e.sndBufSize > ss.Max {
 				panic(fmt.Sprintf("endpoint.sndBufSize %d is outside the min and max allowed [%d, %d]", e.sndBufSize, ss.Min, ss.Max))
 			}
 		}
 
-		var rs ReceiveBufferSizeOption
+		var rs tcpip.TCPReceiveBufferSizeRangeOption
 		if err := e.stack.TransportProtocolOption(ProtocolNumber, &rs); err == nil {
 			if e.rcvBufSize < rs.Min || e.rcvBufSize > rs.Max {
 				panic(fmt.Sprintf("endpoint.rcvBufSize %d is outside the min and max allowed [%d, %d]", e.rcvBufSize, rs.Min, rs.Max))

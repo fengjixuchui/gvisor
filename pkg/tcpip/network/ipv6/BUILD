@@ -5,14 +5,18 @@ package(licenses = ["notice"])
 go_library(
     name = "ipv6",
     srcs = [
+        "dhcpv6configurationfromndpra_string.go",
         "icmp.go",
         "ipv6.go",
+        "ndp.go",
     ],
     visibility = ["//visibility:public"],
     deps = [
+        "//pkg/sync",
         "//pkg/tcpip",
         "//pkg/tcpip/buffer",
         "//pkg/tcpip/header",
+        "//pkg/tcpip/header/parse",
         "//pkg/tcpip/network/fragmentation",
         "//pkg/tcpip/stack",
     ],
@@ -34,6 +38,7 @@ go_test(
         "//pkg/tcpip/header",
         "//pkg/tcpip/link/channel",
         "//pkg/tcpip/link/sniffer",
+        "//pkg/tcpip/network/testutil",
         "//pkg/tcpip/stack",
         "//pkg/tcpip/transport/icmp",
         "//pkg/tcpip/transport/udp",

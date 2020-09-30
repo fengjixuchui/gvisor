@@ -15,6 +15,8 @@
 package ipv6
 
 import (
+	"fmt"
+
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/buffer"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
@@ -39,7 +41,7 @@ func (e *endpoint) handleControl(typ stack.ControlType, extra uint32, pkt *stack
 	// Drop packet if it doesn't have the basic IPv6 header or if the
 	// original source address doesn't match an address we own.
 	src := hdr.SourceAddress()
-	if e.stack.CheckLocalAddress(e.NICID(), ProtocolNumber, src) == 0 {
+	if e.protocol.stack.CheckLocalAddress(e.nic.ID(), ProtocolNumber, src) == 0 {
 		return
 	}
 
@@ -207,14 +209,7 @@ func (e *endpoint) handleICMP(r *stack.Route, pkt *stack.PacketBuffer, hasFragme
 			return
 		}
 
-		s := r.Stack()
-		if isTentative, err := s.IsAddrTentative(e.nicID, targetAddr); err != nil {
-			// We will only get an error if the NIC is unrecognized, which should not
-			// happen. For now, drop this packet.
-			//
-			// TODO(b/141002840): Handle this better?
-			return
-		} else if isTentative {
+		if e.hasTentativeAddr(targetAddr) {
 			// If the target address is tentative and the source of the packet is a
 			// unicast (specified) address, then the source of the packet is
 			// attempting to perform address resolution on the target. In this case,
@@ -227,7 +222,20 @@ func (e *endpoint) handleICMP(r *stack.Route, pkt *stack.PacketBuffer, hasFragme
 			// stack know so it can handle such a scenario and do nothing further with
 			// the NS.
 			if r.RemoteAddress == header.IPv6Any {
-				s.DupTentativeAddrDetected(e.nicID, targetAddr)
+				// We would get an error if the address no longer exists or the address
+				// is no longer tentative (DAD resolved between the call to
+				// hasTentativeAddr and this point). Both of these are valid scenarios:
+				//   1) An address may be removed at any time.
+				//   2) As per RFC 4862 section 5.4, DAD is not a perfect:
+				//       "Note that the method for detecting duplicates
+				//        is not completely reliable, and it is possible that duplicate
+				//        addresses will still exist"
+				//
+				// TODO(gvisor.dev/issue/4046): Handle the scenario when a duplicate
+				// address is detected for an assigned address.
+				if err := e.dupTentativeAddrDetected(targetAddr); err != nil && err != tcpip.ErrBadAddress && err != tcpip.ErrInvalidEndpointState {
+					panic(fmt.Sprintf("unexpected error handling duplicate tentative address: %s", err))
+				}
 			}
 
 			// Do not handle neighbor solicitations targeted to an address that is
@@ -240,7 +248,7 @@ func (e *endpoint) handleICMP(r *stack.Route, pkt *stack.PacketBuffer, hasFragme
 		// section 5.4.3.
 
 		// Is the NS targeting us?
-		if s.CheckLocalAddress(e.nicID, ProtocolNumber, targetAddr) == 0 {
+		if r.Stack().CheckLocalAddress(e.nic.ID(), ProtocolNumber, targetAddr) == 0 {
 			return
 		}
 
@@ -275,7 +283,7 @@ func (e *endpoint) handleICMP(r *stack.Route, pkt *stack.PacketBuffer, hasFragme
 		} else if e.nud != nil {
 			e.nud.HandleProbe(r.RemoteAddress, r.LocalAddress, header.IPv6ProtocolNumber, sourceLinkAddr, e.protocol)
 		} else {
-			e.linkAddrCache.AddLinkAddress(e.nicID, r.RemoteAddress, sourceLinkAddr)
+			e.linkAddrCache.AddLinkAddress(e.nic.ID(), r.RemoteAddress, sourceLinkAddr)
 		}
 
 		// ICMPv6 Neighbor Solicit messages are always sent to
@@ -318,6 +326,7 @@ func (e *endpoint) handleICMP(r *stack.Route, pkt *stack.PacketBuffer, hasFragme
 			ReserveHeaderBytes: int(r.MaxHeaderLength()) + header.ICMPv6NeighborAdvertMinimumSize + int(optsSerializer.Length()),
 		})
 		packet := header.ICMPv6(pkt.TransportHeader().Push(header.ICMPv6NeighborAdvertSize))
+		pkt.TransportProtocolNumber = header.ICMPv6ProtocolNumber
 		packet.SetType(header.ICMPv6NeighborAdvert)
 		na := header.NDPNeighborAdvert(packet.NDPPayload())
 		na.SetSolicitedFlag(solicited)
@@ -352,20 +361,26 @@ func (e *endpoint) handleICMP(r *stack.Route, pkt *stack.PacketBuffer, hasFragme
 		// NDP datagrams are very small and ToView() will not incur allocations.
 		na := header.NDPNeighborAdvert(payload.ToView())
 		targetAddr := na.TargetAddress()
-		s := r.Stack()
-
-		if isTentative, err := s.IsAddrTentative(e.nicID, targetAddr); err != nil {
-			// We will only get an error if the NIC is unrecognized, which should not
-			// happen. For now short-circuit this packet.
-			//
-			// TODO(b/141002840): Handle this better?
-			return
-		} else if isTentative {
+		if e.hasTentativeAddr(targetAddr) {
 			// We just got an NA from a node that owns an address we are performing
 			// DAD on, implying the address is not unique. In this case we let the
 			// stack know so it can handle such a scenario and do nothing furthur with
 			// the NDP NA.
-			s.DupTentativeAddrDetected(e.nicID, targetAddr)
+			//
+			// We would get an error if the address no longer exists or the address
+			// is no longer tentative (DAD resolved between the call to
+			// hasTentativeAddr and this point). Both of these are valid scenarios:
+			//   1) An address may be removed at any time.
+			//   2) As per RFC 4862 section 5.4, DAD is not a perfect:
+			//       "Note that the method for detecting duplicates
+			//        is not completely reliable, and it is possible that duplicate
+			//        addresses will still exist"
+			//
+			// TODO(gvisor.dev/issue/4046): Handle the scenario when a duplicate
+			// address is detected for an assigned address.
+			if err := e.dupTentativeAddrDetected(targetAddr); err != nil && err != tcpip.ErrBadAddress && err != tcpip.ErrInvalidEndpointState {
+				panic(fmt.Sprintf("unexpected error handling duplicate tentative address: %s", err))
+			}
 			return
 		}
 
@@ -395,7 +410,7 @@ func (e *endpoint) handleICMP(r *stack.Route, pkt *stack.PacketBuffer, hasFragme
 		// address cache with the link address for the target of the message.
 		if len(targetLinkAddr) != 0 {
 			if e.nud == nil {
-				e.linkAddrCache.AddLinkAddress(e.nicID, targetAddr, targetLinkAddr)
+				e.linkAddrCache.AddLinkAddress(e.nic.ID(), targetAddr, targetLinkAddr)
 				return
 			}
 
@@ -423,7 +438,7 @@ func (e *endpoint) handleICMP(r *stack.Route, pkt *stack.PacketBuffer, hasFragme
 			localAddr = ""
 		}
 
-		r, err := r.Stack().FindRoute(e.NICID(), localAddr, r.RemoteAddress, ProtocolNumber, false /* multicastLoop */)
+		r, err := r.Stack().FindRoute(e.nic.ID(), localAddr, r.RemoteAddress, ProtocolNumber, false /* multicastLoop */)
 		if err != nil {
 			// If we cannot find a route to the destination, silently drop the packet.
 			return
@@ -438,6 +453,7 @@ func (e *endpoint) handleICMP(r *stack.Route, pkt *stack.PacketBuffer, hasFragme
 			Data:               pkt.Data,
 		})
 		packet := header.ICMPv6(replyPkt.TransportHeader().Push(header.ICMPv6EchoMinimumSize))
+		pkt.TransportProtocolNumber = header.ICMPv6ProtocolNumber
 		copy(packet, icmpHdr)
 		packet.SetType(header.ICMPv6EchoReply)
 		packet.SetChecksum(header.ICMPv6Checksum(packet, r.LocalAddress, r.RemoteAddress, pkt.Data))
@@ -477,7 +493,7 @@ func (e *endpoint) handleICMP(r *stack.Route, pkt *stack.PacketBuffer, hasFragme
 		stack := r.Stack()
 
 		// Is the networking stack operating as a router?
-		if !stack.Forwarding() {
+		if !stack.Forwarding(ProtocolNumber) {
 			// ... No, silently drop the packet.
 			received.RouterOnlyPacketsDroppedByHost.Increment()
 			return
@@ -566,9 +582,9 @@ func (e *endpoint) handleICMP(r *stack.Route, pkt *stack.PacketBuffer, hasFragme
 			e.nud.HandleProbe(routerAddr, r.LocalAddress, header.IPv6ProtocolNumber, sourceLinkAddr, e.protocol)
 		}
 
-		// Tell the NIC to handle the RA.
-		stack := r.Stack()
-		stack.HandleNDPRA(e.nicID, routerAddr, ra)
+		e.mu.Lock()
+		e.mu.ndp.handleRA(routerAddr, ra)
+		e.mu.Unlock()
 
 	case header.ICMPv6RedirectMsg:
 		// TODO(gvisor.dev/issue/2285): Call `e.nud.HandleProbe` after validating
@@ -637,6 +653,7 @@ func (*protocol) LinkAddressRequest(addr, localAddr tcpip.Address, remoteLinkAdd
 		ReserveHeaderBytes: int(linkEP.MaxHeaderLength()) + header.IPv6MinimumSize + header.ICMPv6NeighborAdvertSize,
 	})
 	icmpHdr := header.ICMPv6(pkt.TransportHeader().Push(header.ICMPv6NeighborAdvertSize))
+	pkt.TransportProtocolNumber = header.ICMPv6ProtocolNumber
 	icmpHdr.SetType(header.ICMPv6NeighborSolicit)
 	copy(icmpHdr[icmpV6OptOffset-len(addr):], addr)
 	icmpHdr[icmpV6OptOffset] = ndpOptSrcLinkAddr
@@ -664,4 +681,114 @@ func (*protocol) ResolveStaticAddress(addr tcpip.Address) (tcpip.LinkAddress, bo
 		return header.EthernetAddressFromMulticastIPv6Address(addr), true
 	}
 	return tcpip.LinkAddress([]byte(nil)), false
+}
+
+// ======= ICMP Error packet generation =========
+
+// icmpReason is a marker interface for IPv6 specific ICMP errors.
+type icmpReason interface {
+	isICMPReason()
+}
+
+// icmpReasonPortUnreachable is an error where the transport protocol has no
+// listener and no alternative means to inform the sender.
+type icmpReasonPortUnreachable struct{}
+
+func (*icmpReasonPortUnreachable) isICMPReason() {}
+
+// returnError takes an error descriptor and generates the appropriate ICMP
+// error packet for IPv6 and sends it.
+func returnError(r *stack.Route, reason icmpReason, pkt *stack.PacketBuffer) *tcpip.Error {
+	stats := r.Stats().ICMP
+	sent := stats.V6PacketsSent
+	if !r.Stack().AllowICMPMessage() {
+		sent.RateLimited.Increment()
+		return nil
+	}
+
+	// Only send ICMP error if the address is not a multicast v6
+	// address and the source is not the unspecified address.
+	//
+	// TODO(b/164522993) There are exceptions to this rule.
+	// See: point e.3) RFC 4443 section-2.4
+	//
+	//	 (e) An ICMPv6 error message MUST NOT be originated as a result of
+	//       receiving the following:
+	//
+	//       (e.1) An ICMPv6 error message.
+	//
+	//       (e.2) An ICMPv6 redirect message [IPv6-DISC].
+	//
+	//       (e.3) A packet destined to an IPv6 multicast address.  (There are
+	//             two exceptions to this rule: (1) the Packet Too Big Message
+	//             (Section 3.2) to allow Path MTU discovery to work for IPv6
+	//             multicast, and (2) the Parameter Problem Message, Code 2
+	//             (Section 3.4) reporting an unrecognized IPv6 option (see
+	//             Section 4.2 of [IPv6]) that has the Option Type highest-
+	//             order two bits set to 10).
+	//
+	if header.IsV6MulticastAddress(r.LocalAddress) || r.RemoteAddress == header.IPv6Any {
+		return nil
+	}
+
+	network, transport := pkt.NetworkHeader().View(), pkt.TransportHeader().View()
+
+	if pkt.TransportProtocolNumber == header.ICMPv6ProtocolNumber {
+		// TODO(gvisor.dev/issues/3810): Sort this out when ICMP headers are stored.
+		// Unfortunately at this time ICMP Packets do not have a transport
+		// header separated out. It is in the Data part so we need to
+		// separate it out now. We will just pretend it is a minimal length
+		// ICMP packet as we don't really care if any later bits of a
+		// larger ICMP packet are in the header view or in the Data view.
+		transport, ok := pkt.TransportHeader().Consume(header.ICMPv6MinimumSize)
+		if !ok {
+			return nil
+		}
+		typ := header.ICMPv6(transport).Type()
+		if typ.IsErrorType() || typ == header.ICMPv6RedirectMsg {
+			return nil
+		}
+	}
+
+	// As per RFC 4443 section 2.4
+	//
+	//    (c) Every ICMPv6 error message (type < 128) MUST include
+	//    as much of the IPv6 offending (invoking) packet (the
+	//    packet that caused the error) as possible without making
+	//    the error message packet exceed the minimum IPv6 MTU
+	//    [IPv6].
+	mtu := int(r.MTU())
+	if mtu > header.IPv6MinimumMTU {
+		mtu = header.IPv6MinimumMTU
+	}
+	headerLen := int(r.MaxHeaderLength()) + header.ICMPv6ErrorHeaderSize
+	available := int(mtu) - headerLen
+	if available < header.IPv6MinimumSize {
+		return nil
+	}
+	payloadLen := network.Size() + transport.Size() + pkt.Data.Size()
+	if payloadLen > available {
+		payloadLen = available
+	}
+	payload := buffer.NewVectorisedView(pkt.Size(), pkt.Views())
+	payload.CapLength(payloadLen)
+
+	newPkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
+		ReserveHeaderBytes: headerLen,
+		Data:               payload,
+	})
+	newPkt.TransportProtocolNumber = header.ICMPv6ProtocolNumber
+
+	icmpHdr := header.ICMPv6(newPkt.TransportHeader().Push(header.ICMPv6DstUnreachableMinimumSize))
+	icmpHdr.SetCode(header.ICMPv6PortUnreachable)
+	icmpHdr.SetType(header.ICMPv6DstUnreachable)
+	icmpHdr.SetChecksum(header.ICMPv6Checksum(icmpHdr, r.LocalAddress, r.RemoteAddress, newPkt.Data))
+	counter := sent.DstUnreachable
+	err := r.WritePacket(nil /* gso */, stack.NetworkHeaderParams{Protocol: header.ICMPv6ProtocolNumber, TTL: r.DefaultTTL(), TOS: stack.DefaultTOS}, newPkt)
+	if err != nil {
+		sent.Dropped.Increment()
+		return err
+	}
+	counter.Increment()
+	return nil
 }

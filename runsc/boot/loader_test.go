@@ -26,6 +26,7 @@ import (
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/control/server"
+	"gvisor.dev/gvisor/pkg/fd"
 	"gvisor.dev/gvisor/pkg/fspath"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/p9"
@@ -444,7 +445,7 @@ func TestCreateMountNamespace(t *testing.T) {
 			}
 			defer cleanup()
 
-			mntr := newContainerMounter(&tc.spec, []int{sandEnd}, nil, &podMountHints{})
+			mntr := newContainerMounter(&tc.spec, []*fd.FD{fd.New(sandEnd)}, nil, &podMountHints{})
 			mns, err := mntr.createMountNamespace(ctx, conf)
 			if err != nil {
 				t.Fatalf("failed to create mount namespace: %v", err)
@@ -490,9 +491,9 @@ func TestCreateMountNamespaceVFS2(t *testing.T) {
 			}
 
 			ctx := l.k.SupervisorContext()
-			mns, err := mntr.setupVFS2(ctx, l.root.conf, &l.root.procArgs)
+			mns, err := mntr.mountAll(l.root.conf, &l.root.procArgs)
 			if err != nil {
-				t.Fatalf("failed to setupVFS2: %v", err)
+				t.Fatalf("mountAll: %v", err)
 			}
 
 			root := mns.Root()
@@ -702,7 +703,11 @@ func TestRestoreEnvironment(t *testing.T) {
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
 			conf := testConfig()
-			mntr := newContainerMounter(tc.spec, tc.ioFDs, nil, &podMountHints{})
+			var ioFDs []*fd.FD
+			for _, ioFD := range tc.ioFDs {
+				ioFDs = append(ioFDs, fd.New(ioFD))
+			}
+			mntr := newContainerMounter(tc.spec, ioFDs, nil, &podMountHints{})
 			actualRenv, err := mntr.createRestoreEnvironment(conf)
 			if !tc.errorExpected && err != nil {
 				t.Fatalf("could not create restore environment for test:%s", tc.name)

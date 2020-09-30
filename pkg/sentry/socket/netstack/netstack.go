@@ -40,6 +40,8 @@ import (
 	"gvisor.dev/gvisor/pkg/binary"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/log"
+	"gvisor.dev/gvisor/pkg/marshal"
+	"gvisor.dev/gvisor/pkg/marshal/primitive"
 	"gvisor.dev/gvisor/pkg/metric"
 	"gvisor.dev/gvisor/pkg/safemem"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
@@ -62,8 +64,6 @@ import (
 	"gvisor.dev/gvisor/pkg/tcpip/transport/udp"
 	"gvisor.dev/gvisor/pkg/usermem"
 	"gvisor.dev/gvisor/pkg/waiter"
-	"gvisor.dev/gvisor/tools/go_marshal/marshal"
-	"gvisor.dev/gvisor/tools/go_marshal/primitive"
 )
 
 func mustCreateMetric(name, description string) *tcpip.StatCounter {
@@ -158,6 +158,9 @@ var Metrics = tcpip.Stats{
 		OutgoingPacketErrors:                mustCreateMetric("/netstack/ip/outgoing_packet_errors", "Total number of IP packets which failed to write to a link-layer endpoint."),
 		MalformedPacketsReceived:            mustCreateMetric("/netstack/ip/malformed_packets_received", "Total number of IP packets which failed IP header validation checks."),
 		MalformedFragmentsReceived:          mustCreateMetric("/netstack/ip/malformed_fragments_received", "Total number of IP fragments which failed IP fragment validation checks."),
+		IPTablesPreroutingDropped:           mustCreateMetric("/netstack/ip/iptables/prerouting_dropped", "Total number of IP packets dropped in the Prerouting chain."),
+		IPTablesInputDropped:                mustCreateMetric("/netstack/ip/iptables/input_dropped", "Total number of IP packets dropped in the Input chain."),
+		IPTablesOutputDropped:               mustCreateMetric("/netstack/ip/iptables/output_dropped", "Total number of IP packets dropped in the Output chain."),
 	},
 	TCP: tcpip.TCPStats{
 		ActiveConnectionOpenings:           mustCreateMetric("/netstack/tcp/active_connection_openings", "Number of connections opened successfully via Connect."),
@@ -195,7 +198,6 @@ var Metrics = tcpip.Stats{
 		PacketsSent:              mustCreateMetric("/netstack/udp/packets_sent", "Number of UDP datagrams sent."),
 		PacketSendErrors:         mustCreateMetric("/netstack/udp/packet_send_errors", "Number of UDP datagrams failed to be sent."),
 		ChecksumErrors:           mustCreateMetric("/netstack/udp/checksum_errors", "Number of UDP datagrams dropped due to bad checksums."),
-		InvalidSourceAddress:     mustCreateMetric("/netstack/udp/invalid_source", "Number of UDP datagrams dropped due to invalid source address."),
 	},
 }
 
@@ -857,7 +859,7 @@ func (s *socketOpsCommon) Listen(t *kernel.Task, backlog int) *syserr.Error {
 
 // blockingAccept implements a blocking version of accept(2), that is, if no
 // connections are ready to be accept, it will block until one becomes ready.
-func (s *socketOpsCommon) blockingAccept(t *kernel.Task) (tcpip.Endpoint, *waiter.Queue, *syserr.Error) {
+func (s *socketOpsCommon) blockingAccept(t *kernel.Task, peerAddr *tcpip.FullAddress) (tcpip.Endpoint, *waiter.Queue, *syserr.Error) {
 	// Register for notifications.
 	e, ch := waiter.NewChannelEntry(nil)
 	s.EventRegister(&e, waiter.EventIn)
@@ -866,7 +868,7 @@ func (s *socketOpsCommon) blockingAccept(t *kernel.Task) (tcpip.Endpoint, *waite
 	// Try to accept the connection again; if it fails, then wait until we
 	// get a notification.
 	for {
-		if ep, wq, err := s.Endpoint.Accept(); err != tcpip.ErrWouldBlock {
+		if ep, wq, err := s.Endpoint.Accept(peerAddr); err != tcpip.ErrWouldBlock {
 			return ep, wq, syserr.TranslateNetstackError(err)
 		}
 
@@ -879,15 +881,18 @@ func (s *socketOpsCommon) blockingAccept(t *kernel.Task) (tcpip.Endpoint, *waite
 // Accept implements the linux syscall accept(2) for sockets backed by
 // tcpip.Endpoint.
 func (s *SocketOperations) Accept(t *kernel.Task, peerRequested bool, flags int, blocking bool) (int32, linux.SockAddr, uint32, *syserr.Error) {
-	// Issue the accept request to get the new endpoint.
-	ep, wq, terr := s.Endpoint.Accept()
+	var peerAddr *tcpip.FullAddress
+	if peerRequested {
+		peerAddr = &tcpip.FullAddress{}
+	}
+	ep, wq, terr := s.Endpoint.Accept(peerAddr)
 	if terr != nil {
 		if terr != tcpip.ErrWouldBlock || !blocking {
 			return 0, nil, 0, syserr.TranslateNetstackError(terr)
 		}
 
 		var err *syserr.Error
-		ep, wq, err = s.blockingAccept(t)
+		ep, wq, err = s.blockingAccept(t, peerAddr)
 		if err != nil {
 			return 0, nil, 0, err
 		}
@@ -907,13 +912,8 @@ func (s *SocketOperations) Accept(t *kernel.Task, peerRequested bool, flags int,
 
 	var addr linux.SockAddr
 	var addrLen uint32
-	if peerRequested {
-		// Get address of the peer and write it to peer slice.
-		var err *syserr.Error
-		addr, addrLen, err = ns.FileOperations.(*SocketOperations).GetPeerName(t)
-		if err != nil {
-			return 0, nil, 0, err
-		}
+	if peerAddr != nil {
+		addr, addrLen = ConvertAddress(s.family, *peerAddr)
 	}
 
 	fd, e := t.NewFDFrom(0, ns, kernel.FDFlags{
@@ -1187,7 +1187,7 @@ func getSockOptSocket(t *kernel.Task, s socket.SocketOps, ep commonEndpoint, fam
 		var v tcpip.LingerOption
 		var linger linux.Linger
 		if err := ep.GetSockOpt(&v); err != nil {
-			return &linger, nil
+			return nil, syserr.TranslateNetstackError(err)
 		}
 
 		if v.Enabled {
@@ -1718,6 +1718,26 @@ func getSockOptIP(t *kernel.Task, s socket.SocketOps, ep commonEndpoint, name in
 		}
 		return &entries, nil
 
+	case linux.IPT_SO_GET_REVISION_TARGET:
+		if outLen < linux.SizeOfXTGetRevision {
+			return nil, syserr.ErrInvalidArgument
+		}
+
+		// Only valid for raw IPv4 sockets.
+		if family, skType, _ := s.Type(); family != linux.AF_INET || skType != linux.SOCK_RAW {
+			return nil, syserr.ErrProtocolNotAvailable
+		}
+
+		stack := inet.StackFromContext(t)
+		if stack == nil {
+			return nil, syserr.ErrNoDevice
+		}
+		ret, err := netfilter.TargetRevision(t, outPtr, header.IPv4ProtocolNumber)
+		if err != nil {
+			return nil, err
+		}
+		return &ret, nil
+
 	default:
 		emitUnimplementedEventIP(t, name)
 	}
@@ -1770,10 +1790,16 @@ func SetSockOpt(t *kernel.Task, s socket.SocketOps, ep commonEndpoint, level int
 	case linux.SOL_IP:
 		return setSockOptIP(t, s, ep, name, optVal)
 
+	case linux.SOL_PACKET:
+		// gVisor doesn't support any SOL_PACKET options just return not
+		// supported. Returning nil here will result in tcpdump thinking AF_PACKET
+		// features are supported and proceed to use them and break.
+		t.Kernel().EmitUnimplementedEvent(t)
+		return syserr.ErrProtocolNotAvailable
+
 	case linux.SOL_UDP,
 		linux.SOL_ICMPV6,
-		linux.SOL_RAW,
-		linux.SOL_PACKET:
+		linux.SOL_RAW:
 
 		t.Kernel().EmitUnimplementedEvent(t)
 	}

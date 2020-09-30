@@ -1111,6 +1111,86 @@ TEST_P(SocketInetLoopbackTest, AcceptedInheritsTCPUserTimeout) {
   EXPECT_EQ(get, kUserTimeout);
 }
 
+TEST_P(SocketInetLoopbackTest, TCPAcceptAfterReset) {
+  auto const& param = GetParam();
+  TestAddress const& listener = param.listener;
+  TestAddress const& connector = param.connector;
+
+  // Create the listening socket.
+  const FileDescriptor listen_fd = ASSERT_NO_ERRNO_AND_VALUE(
+      Socket(listener.family(), SOCK_STREAM, IPPROTO_TCP));
+  sockaddr_storage listen_addr = listener.addr;
+  ASSERT_THAT(bind(listen_fd.get(), reinterpret_cast<sockaddr*>(&listen_addr),
+                   listener.addr_len),
+              SyscallSucceeds());
+  ASSERT_THAT(listen(listen_fd.get(), SOMAXCONN), SyscallSucceeds());
+
+  // Get the port bound by the listening socket.
+  {
+    socklen_t addrlen = listener.addr_len;
+    ASSERT_THAT(
+        getsockname(listen_fd.get(), reinterpret_cast<sockaddr*>(&listen_addr),
+                    &addrlen),
+        SyscallSucceeds());
+  }
+
+  const uint16_t port =
+      ASSERT_NO_ERRNO_AND_VALUE(AddrPort(listener.family(), listen_addr));
+
+  // Connect to the listening socket.
+  FileDescriptor conn_fd = ASSERT_NO_ERRNO_AND_VALUE(
+      Socket(connector.family(), SOCK_STREAM, IPPROTO_TCP));
+
+  sockaddr_storage conn_addr = connector.addr;
+  ASSERT_NO_ERRNO(SetAddrPort(connector.family(), &conn_addr, port));
+  ASSERT_THAT(RetryEINTR(connect)(conn_fd.get(),
+                                  reinterpret_cast<sockaddr*>(&conn_addr),
+                                  connector.addr_len),
+              SyscallSucceeds());
+
+  // Trigger a RST by turning linger off and closing the socket.
+  struct linger opt = {
+      .l_onoff = 1,
+      .l_linger = 0,
+  };
+  ASSERT_THAT(
+      setsockopt(conn_fd.get(), SOL_SOCKET, SO_LINGER, &opt, sizeof(opt)),
+      SyscallSucceeds());
+  ASSERT_THAT(close(conn_fd.release()), SyscallSucceeds());
+
+  if (IsRunningOnGvisor()) {
+    // Gvisor packet procssing is asynchronous and can take a bit of time in
+    // some cases so we give it a bit of time to process the RST packet before
+    // calling accept.
+    //
+    // There is nothing to poll() on so we have no choice but to use a sleep
+    // here.
+    absl::SleepFor(absl::Milliseconds(100));
+  }
+
+  sockaddr_storage accept_addr;
+  socklen_t addrlen = sizeof(accept_addr);
+
+  auto accept_fd = ASSERT_NO_ERRNO_AND_VALUE(Accept(
+      listen_fd.get(), reinterpret_cast<sockaddr*>(&accept_addr), &addrlen));
+  ASSERT_EQ(addrlen, listener.addr_len);
+
+  // TODO(gvisor.dev/issue/3812): Remove after SO_ERROR is fixed.
+  if (IsRunningOnGvisor()) {
+    char buf[10];
+    ASSERT_THAT(ReadFd(accept_fd.get(), buf, sizeof(buf)),
+                SyscallFailsWithErrno(ECONNRESET));
+  } else {
+    int err;
+    socklen_t optlen = sizeof(err);
+    ASSERT_THAT(
+        getsockopt(accept_fd.get(), SOL_SOCKET, SO_ERROR, &err, &optlen),
+        SyscallSucceeds());
+    ASSERT_EQ(err, ECONNRESET);
+    ASSERT_EQ(optlen, sizeof(err));
+  }
+}
+
 // TODO(gvisor.dev/issue/1688): Partially completed passive endpoints are not
 // saved. Enable S/R once issue is fixed.
 TEST_P(SocketInetLoopbackTest, TCPDeferAccept_NoRandomSave) {

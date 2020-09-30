@@ -29,6 +29,8 @@ import (
 )
 
 // SeekEndConfig describes the SEEK_END behaviour for FDs.
+//
+// +stateify savable
 type SeekEndConfig int
 
 // Constants related to SEEK_END behaviour for FDs.
@@ -41,6 +43,8 @@ const (
 )
 
 // GenericDirectoryFDOptions contains configuration for a GenericDirectoryFD.
+//
+// +stateify savable
 type GenericDirectoryFDOptions struct {
 	SeekEnd SeekEndConfig
 }
@@ -56,6 +60,8 @@ type GenericDirectoryFDOptions struct {
 // Must be initialize with Init before first use.
 //
 // Lock ordering: mu => children.mu.
+//
+// +stateify savable
 type GenericDirectoryFD struct {
 	vfs.FileDescriptionDefaultImpl
 	vfs.DirectoryFileDescriptionDefaultImpl
@@ -68,7 +74,7 @@ type GenericDirectoryFD struct {
 	children *OrderedChildren
 
 	// mu protects the fields below.
-	mu sync.Mutex
+	mu sync.Mutex `state:"nosave"`
 
 	// off is the current directory offset. Protected by "mu".
 	off int64
@@ -76,12 +82,12 @@ type GenericDirectoryFD struct {
 
 // NewGenericDirectoryFD creates a new GenericDirectoryFD and returns its
 // dentry.
-func NewGenericDirectoryFD(m *vfs.Mount, d *vfs.Dentry, children *OrderedChildren, locks *vfs.FileLocks, opts *vfs.OpenOptions, fdOpts GenericDirectoryFDOptions) (*GenericDirectoryFD, error) {
+func NewGenericDirectoryFD(m *vfs.Mount, d *Dentry, children *OrderedChildren, locks *vfs.FileLocks, opts *vfs.OpenOptions, fdOpts GenericDirectoryFDOptions) (*GenericDirectoryFD, error) {
 	fd := &GenericDirectoryFD{}
 	if err := fd.Init(children, locks, opts, fdOpts); err != nil {
 		return nil, err
 	}
-	if err := fd.vfsfd.Init(fd, opts.Flags, m, d, &vfs.FileDescriptionOptions{}); err != nil {
+	if err := fd.vfsfd.Init(fd, opts.Flags, m, d.VFSDentry(), &vfs.FileDescriptionOptions{}); err != nil {
 		return nil, err
 	}
 	return fd, nil
@@ -195,8 +201,7 @@ func (fd *GenericDirectoryFD) IterDirents(ctx context.Context, cb vfs.IterDirent
 	// these.
 	childIdx := fd.off - 2
 	for it := fd.children.nthLocked(childIdx); it != nil; it = it.Next() {
-		inode := it.Dentry.Impl().(*Dentry).inode
-		stat, err := inode.Stat(ctx, fd.filesystem(), opts)
+		stat, err := it.Dentry.inode.Stat(ctx, fd.filesystem(), opts)
 		if err != nil {
 			return err
 		}
