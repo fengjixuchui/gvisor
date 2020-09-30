@@ -36,14 +36,17 @@ func (fs *filesystem) newKcovFile(ctx context.Context, creds *auth.Credentials) 
 }
 
 // kcovInode implements kernfs.Inode.
+//
+// +stateify savable
 type kcovInode struct {
 	kernfs.InodeAttrs
 	kernfs.InodeNoopRefCount
-	kernfs.InodeNotSymlink
 	kernfs.InodeNotDirectory
+	kernfs.InodeNotSymlink
+	implStatFS
 }
 
-func (i *kcovInode) Open(ctx context.Context, rp *vfs.ResolvingPath, vfsd *vfs.Dentry, opts vfs.OpenOptions) (*vfs.FileDescription, error) {
+func (i *kcovInode) Open(ctx context.Context, rp *vfs.ResolvingPath, d *kernfs.Dentry, opts vfs.OpenOptions) (*vfs.FileDescription, error) {
 	k := kernel.KernelFromContext(ctx)
 	if k == nil {
 		panic("KernelFromContext returned nil")
@@ -53,7 +56,7 @@ func (i *kcovInode) Open(ctx context.Context, rp *vfs.ResolvingPath, vfsd *vfs.D
 		kcov:  k.NewKcov(),
 	}
 
-	if err := fd.vfsfd.Init(fd, opts.Flags, rp.Mount(), vfsd, &vfs.FileDescriptionOptions{
+	if err := fd.vfsfd.Init(fd, opts.Flags, rp.Mount(), d.VFSDentry(), &vfs.FileDescriptionOptions{
 		DenyPRead:  true,
 		DenyPWrite: true,
 	}); err != nil {
@@ -62,6 +65,7 @@ func (i *kcovInode) Open(ctx context.Context, rp *vfs.ResolvingPath, vfsd *vfs.D
 	return &fd.vfsfd, nil
 }
 
+// +stateify savable
 type kcovFD struct {
 	vfs.FileDescriptionDefaultImpl
 	vfs.NoLockFD

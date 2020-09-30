@@ -74,6 +74,8 @@ type endpoint struct {
 	route         stack.Route `state:"manual"`
 	ttl           uint8
 	stats         tcpip.TransportEndpointStats `state:"nosave"`
+	// linger is used for SO_LINGER socket option.
+	linger tcpip.LingerOption
 
 	// owner is used to get uid and gid of the packet.
 	owner tcpip.PacketOwner
@@ -344,9 +346,14 @@ func (e *endpoint) Peek([][]byte) (int64, tcpip.ControlMessages, *tcpip.Error) {
 
 // SetSockOpt sets a socket option.
 func (e *endpoint) SetSockOpt(opt tcpip.SettableSocketOption) *tcpip.Error {
-	switch opt.(type) {
+	switch v := opt.(type) {
 	case *tcpip.SocketDetachFilterOption:
 		return nil
+
+	case *tcpip.LingerOption:
+		e.mu.Lock()
+		e.linger = *v
+		e.mu.Unlock()
 	}
 	return nil
 }
@@ -415,8 +422,17 @@ func (e *endpoint) GetSockOptInt(opt tcpip.SockOptInt) (int, *tcpip.Error) {
 }
 
 // GetSockOpt implements tcpip.Endpoint.GetSockOpt.
-func (*endpoint) GetSockOpt(tcpip.GettableSocketOption) *tcpip.Error {
-	return tcpip.ErrUnknownProtocolOption
+func (e *endpoint) GetSockOpt(opt tcpip.GettableSocketOption) *tcpip.Error {
+	switch o := opt.(type) {
+	case *tcpip.LingerOption:
+		e.mu.Lock()
+		*o = e.linger
+		e.mu.Unlock()
+		return nil
+
+	default:
+		return tcpip.ErrUnknownProtocolOption
+	}
 }
 
 func send4(r *stack.Route, ident uint16, data buffer.View, ttl uint8, owner tcpip.PacketOwner) *tcpip.Error {
@@ -430,6 +446,7 @@ func send4(r *stack.Route, ident uint16, data buffer.View, ttl uint8, owner tcpi
 	pkt.Owner = owner
 
 	icmpv4 := header.ICMPv4(pkt.TransportHeader().Push(header.ICMPv4MinimumSize))
+	pkt.TransportProtocolNumber = header.ICMPv4ProtocolNumber
 	copy(icmpv4, data)
 	// Set the ident to the user-specified port. Sequence number should
 	// already be set by the user.
@@ -462,6 +479,7 @@ func send6(r *stack.Route, ident uint16, data buffer.View, ttl uint8) *tcpip.Err
 	})
 
 	icmpv6 := header.ICMPv6(pkt.TransportHeader().Push(header.ICMPv6MinimumSize))
+	pkt.TransportProtocolNumber = header.ICMPv6ProtocolNumber
 	copy(icmpv6, data)
 	// Set the ident. Sequence number is provided by the user.
 	icmpv6.SetIdent(ident)
@@ -597,7 +615,7 @@ func (*endpoint) Listen(int) *tcpip.Error {
 }
 
 // Accept is not supported by UDP, it just fails.
-func (*endpoint) Accept() (tcpip.Endpoint, *waiter.Queue, *tcpip.Error) {
+func (*endpoint) Accept(*tcpip.FullAddress) (tcpip.Endpoint, *waiter.Queue, *tcpip.Error) {
 	return nil, nil, tcpip.ErrNotSupported
 }
 

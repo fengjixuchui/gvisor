@@ -26,8 +26,10 @@ import (
 	"gvisor.dev/gvisor/pkg/waiter"
 )
 
-// TimerFileDescription implements FileDescriptionImpl for timer fds. It also
+// TimerFileDescription implements vfs.FileDescriptionImpl for timer fds. It also
 // implements ktime.TimerListener.
+//
+// +stateify savable
 type TimerFileDescription struct {
 	vfsfd vfs.FileDescription
 	vfs.FileDescriptionDefaultImpl
@@ -62,7 +64,7 @@ func New(ctx context.Context, vfsObj *vfs.VirtualFilesystem, clock ktime.Clock, 
 	return &tfd.vfsfd, nil
 }
 
-// Read implements FileDescriptionImpl.Read.
+// Read implements vfs.FileDescriptionImpl.Read.
 func (tfd *TimerFileDescription) Read(ctx context.Context, dst usermem.IOSequence, opts vfs.ReadOptions) (int64, error) {
 	const sizeofUint64 = 8
 	if dst.NumBytes() < sizeofUint64 {
@@ -128,7 +130,7 @@ func (tfd *TimerFileDescription) ResumeTimer() {
 	tfd.timer.Resume()
 }
 
-// Release implements FileDescriptionImpl.Release()
+// Release implements vfs.FileDescriptionImpl.Release.
 func (tfd *TimerFileDescription) Release(context.Context) {
 	tfd.timer.Destroy()
 }

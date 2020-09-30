@@ -84,6 +84,8 @@ type endpoint struct {
 	// Connect(), and is valid only when conneted is true.
 	route stack.Route                  `state:"manual"`
 	stats tcpip.TransportEndpointStats `state:"nosave"`
+	// linger is used for SO_LINGER socket option.
+	linger tcpip.LingerOption
 
 	// owner is used to get uid and gid of the packet.
 	owner tcpip.PacketOwner
@@ -446,12 +448,12 @@ func (e *endpoint) Shutdown(flags tcpip.ShutdownFlags) *tcpip.Error {
 }
 
 // Listen implements tcpip.Endpoint.Listen.
-func (e *endpoint) Listen(backlog int) *tcpip.Error {
+func (*endpoint) Listen(backlog int) *tcpip.Error {
 	return tcpip.ErrNotSupported
 }
 
 // Accept implements tcpip.Endpoint.Accept.
-func (e *endpoint) Accept() (tcpip.Endpoint, *waiter.Queue, *tcpip.Error) {
+func (*endpoint) Accept(*tcpip.FullAddress) (tcpip.Endpoint, *waiter.Queue, *tcpip.Error) {
 	return nil, nil, tcpip.ErrNotSupported
 }
 
@@ -482,12 +484,12 @@ func (e *endpoint) Bind(addr tcpip.FullAddress) *tcpip.Error {
 }
 
 // GetLocalAddress implements tcpip.Endpoint.GetLocalAddress.
-func (e *endpoint) GetLocalAddress() (tcpip.FullAddress, *tcpip.Error) {
+func (*endpoint) GetLocalAddress() (tcpip.FullAddress, *tcpip.Error) {
 	return tcpip.FullAddress{}, tcpip.ErrNotSupported
 }
 
 // GetRemoteAddress implements tcpip.Endpoint.GetRemoteAddress.
-func (e *endpoint) GetRemoteAddress() (tcpip.FullAddress, *tcpip.Error) {
+func (*endpoint) GetRemoteAddress() (tcpip.FullAddress, *tcpip.Error) {
 	// Even a connected socket doesn't return a remote address.
 	return tcpip.FullAddress{}, tcpip.ErrNotConnected
 }
@@ -511,8 +513,14 @@ func (e *endpoint) Readiness(mask waiter.EventMask) waiter.EventMask {
 
 // SetSockOpt implements tcpip.Endpoint.SetSockOpt.
 func (e *endpoint) SetSockOpt(opt tcpip.SettableSocketOption) *tcpip.Error {
-	switch opt.(type) {
+	switch v := opt.(type) {
 	case *tcpip.SocketDetachFilterOption:
+		return nil
+
+	case *tcpip.LingerOption:
+		e.mu.Lock()
+		e.linger = *v
+		e.mu.Unlock()
 		return nil
 
 	default:
@@ -577,8 +585,17 @@ func (e *endpoint) SetSockOptInt(opt tcpip.SockOptInt, v int) *tcpip.Error {
 }
 
 // GetSockOpt implements tcpip.Endpoint.GetSockOpt.
-func (*endpoint) GetSockOpt(tcpip.GettableSocketOption) *tcpip.Error {
-	return tcpip.ErrUnknownProtocolOption
+func (e *endpoint) GetSockOpt(opt tcpip.GettableSocketOption) *tcpip.Error {
+	switch o := opt.(type) {
+	case *tcpip.LingerOption:
+		e.mu.Lock()
+		*o = e.linger
+		e.mu.Unlock()
+		return nil
+
+	default:
+		return tcpip.ErrUnknownProtocolOption
+	}
 }
 
 // GetSockOptBool implements tcpip.Endpoint.GetSockOptBool.

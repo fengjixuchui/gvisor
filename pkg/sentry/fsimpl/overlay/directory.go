@@ -100,12 +100,13 @@ func (d *dentry) collectWhiteoutsForRmdirLocked(ctx context.Context) (map[string
 	return whiteouts, readdirErr
 }
 
+// +stateify savable
 type directoryFD struct {
 	fileDescription
 	vfs.DirectoryFileDescriptionDefaultImpl
 	vfs.DentryMetadataFileDescriptionImpl
 
-	mu      sync.Mutex
+	mu      sync.Mutex `state:"nosave"`
 	off     int64
 	dirents []vfs.Dirent
 }
@@ -116,10 +117,12 @@ func (fd *directoryFD) Release(ctx context.Context) {
 
 // IterDirents implements vfs.FileDescriptionImpl.IterDirents.
 func (fd *directoryFD) IterDirents(ctx context.Context, cb vfs.IterDirentsCallback) error {
+	d := fd.dentry()
+	defer d.InotifyWithParent(ctx, linux.IN_ACCESS, 0, vfs.PathEvent)
+
 	fd.mu.Lock()
 	defer fd.mu.Unlock()
 
-	d := fd.dentry()
 	if fd.dirents == nil {
 		ds, err := d.getDirents(ctx)
 		if err != nil {
@@ -143,7 +146,14 @@ func (d *dentry) getDirents(ctx context.Context) ([]vfs.Dirent, error) {
 	defer d.fs.renameMu.RUnlock()
 	d.dirMu.Lock()
 	defer d.dirMu.Unlock()
+	return d.getDirentsLocked(ctx)
+}
 
+// Preconditions:
+// * filesystem.renameMu must be locked.
+// * d.dirMu must be locked.
+// * d.isDir().
+func (d *dentry) getDirentsLocked(ctx context.Context) ([]vfs.Dirent, error) {
 	if d.dirents != nil {
 		return d.dirents, nil
 	}

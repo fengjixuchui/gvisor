@@ -22,6 +22,7 @@ import (
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/fdnotifier"
+	"gvisor.dev/gvisor/pkg/p9"
 	"gvisor.dev/gvisor/pkg/safemem"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
 	"gvisor.dev/gvisor/pkg/syserror"
@@ -33,11 +34,13 @@ import (
 // special files, and (when filesystemOptions.regularFilesUseSpecialFileFD is
 // in effect) regular files. specialFileFD differs from regularFileFD by using
 // per-FD handles instead of shared per-dentry handles, and never buffering I/O.
+//
+// +stateify savable
 type specialFileFD struct {
 	fileDescription
 
 	// handle is used for file I/O. handle is immutable.
-	handle handle
+	handle handle `state:"nosave"` // FIXME(gvisor.dev/issue/1663): not yet supported.
 
 	// isRegularFile is true if this FD represents a regular file which is only
 	// possible when filesystemOptions.regularFilesUseSpecialFileFD is in
@@ -55,7 +58,7 @@ type specialFileFD struct {
 	queue     waiter.Queue
 
 	// If seekable is true, off is the file offset. off is protected by mu.
-	mu  sync.Mutex
+	mu  sync.Mutex `state:"nosave"`
 	off int64
 }
 
@@ -133,6 +136,16 @@ func (fd *specialFileFD) EventUnregister(e *waiter.Entry) {
 		return
 	}
 	fd.fileDescription.EventUnregister(e)
+}
+
+func (fd *specialFileFD) Allocate(ctx context.Context, mode, offset, length uint64) error {
+	if fd.isRegularFile {
+		d := fd.dentry()
+		return d.doAllocate(ctx, offset, length, func() error {
+			return fd.handle.file.allocate(ctx, p9.ToAllocateMode(mode), offset, length)
+		})
+	}
+	return fd.FileDescriptionDefaultImpl.Allocate(ctx, mode, offset, length)
 }
 
 // PRead implements vfs.FileDescriptionImpl.PRead.
@@ -235,11 +248,12 @@ func (fd *specialFileFD) pwrite(ctx context.Context, src usermem.IOSequence, off
 		d.touchCMtime()
 	}
 	buf := make([]byte, src.NumBytes())
-	// Don't do partial writes if we get a partial read from src.
-	if _, err := src.CopyIn(ctx, buf); err != nil {
-		return 0, offset, err
+	copied, copyErr := src.CopyIn(ctx, buf)
+	if copied == 0 && copyErr != nil {
+		// Only return the error if we didn't get any data.
+		return 0, offset, copyErr
 	}
-	n, err := fd.handle.writeFromBlocksAt(ctx, safemem.BlockSeqOf(safemem.BlockFromSafeSlice(buf)), uint64(offset))
+	n, err := fd.handle.writeFromBlocksAt(ctx, safemem.BlockSeqOf(safemem.BlockFromSafeSlice(buf[:copied])), uint64(offset))
 	if err == syserror.EAGAIN {
 		err = syserror.ErrWouldBlock
 	}
@@ -256,7 +270,10 @@ func (fd *specialFileFD) pwrite(ctx context.Context, src usermem.IOSequence, off
 			atomic.StoreUint64(&d.size, uint64(offset))
 		}
 	}
-	return int64(n), offset, err
+	if err != nil {
+		return int64(n), offset, err
+	}
+	return int64(n), offset, copyErr
 }
 
 // Write implements vfs.FileDescriptionImpl.Write.

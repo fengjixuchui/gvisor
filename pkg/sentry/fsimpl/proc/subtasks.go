@@ -31,12 +31,13 @@ import (
 //
 // +stateify savable
 type subtasksInode struct {
-	subtasksInodeRefs
-	kernfs.InodeNotSymlink
-	kernfs.InodeDirectoryNoNewChildren
-	kernfs.InodeAttrs
-	kernfs.OrderedChildren
+	implStatFS
 	kernfs.AlwaysValid
+	kernfs.InodeAttrs
+	kernfs.InodeDirectoryNoNewChildren
+	kernfs.InodeNotSymlink
+	kernfs.OrderedChildren
+	subtasksInodeRefs
 
 	locks vfs.FileLocks
 
@@ -67,8 +68,8 @@ func (fs *filesystem) newSubtasks(task *kernel.Task, pidns *kernel.PIDNamespace,
 	return dentry
 }
 
-// Lookup implements kernfs.inodeDynamicLookup.
-func (i *subtasksInode) Lookup(ctx context.Context, name string) (*vfs.Dentry, error) {
+// Lookup implements kernfs.inodeDynamicLookup.Lookup.
+func (i *subtasksInode) Lookup(ctx context.Context, name string) (*kernfs.Dentry, error) {
 	tid, err := strconv.ParseUint(name, 10, 32)
 	if err != nil {
 		return nil, syserror.ENOENT
@@ -81,12 +82,10 @@ func (i *subtasksInode) Lookup(ctx context.Context, name string) (*vfs.Dentry, e
 	if subTask.ThreadGroup() != i.task.ThreadGroup() {
 		return nil, syserror.ENOENT
 	}
-
-	subTaskDentry := i.fs.newTaskInode(subTask, i.pidns, false, i.cgroupControllers)
-	return subTaskDentry.VFSDentry(), nil
+	return i.fs.newTaskInode(subTask, i.pidns, false, i.cgroupControllers), nil
 }
 
-// IterDirents implements kernfs.inodeDynamicLookup.
+// IterDirents implements kernfs.inodeDynamicLookup.IterDirents.
 func (i *subtasksInode) IterDirents(ctx context.Context, cb vfs.IterDirentsCallback, offset, relOffset int64) (int64, error) {
 	tasks := i.task.ThreadGroup().MemberIDs(i.pidns)
 	if len(tasks) == 0 {
@@ -117,6 +116,7 @@ func (i *subtasksInode) IterDirents(ctx context.Context, cb vfs.IterDirentsCallb
 	return offset, nil
 }
 
+// +stateify savable
 type subtasksFD struct {
 	kernfs.GenericDirectoryFD
 
@@ -154,21 +154,21 @@ func (fd *subtasksFD) SetStat(ctx context.Context, opts vfs.SetStatOptions) erro
 	return fd.GenericDirectoryFD.SetStat(ctx, opts)
 }
 
-// Open implements kernfs.Inode.
-func (i *subtasksInode) Open(ctx context.Context, rp *vfs.ResolvingPath, vfsd *vfs.Dentry, opts vfs.OpenOptions) (*vfs.FileDescription, error) {
+// Open implements kernfs.Inode.Open.
+func (i *subtasksInode) Open(ctx context.Context, rp *vfs.ResolvingPath, d *kernfs.Dentry, opts vfs.OpenOptions) (*vfs.FileDescription, error) {
 	fd := &subtasksFD{task: i.task}
 	if err := fd.Init(&i.OrderedChildren, &i.locks, &opts, kernfs.GenericDirectoryFDOptions{
 		SeekEnd: kernfs.SeekEndZero,
 	}); err != nil {
 		return nil, err
 	}
-	if err := fd.VFSFileDescription().Init(fd, opts.Flags, rp.Mount(), vfsd, &vfs.FileDescriptionOptions{}); err != nil {
+	if err := fd.VFSFileDescription().Init(fd, opts.Flags, rp.Mount(), d.VFSDentry(), &vfs.FileDescriptionOptions{}); err != nil {
 		return nil, err
 	}
 	return fd.VFSFileDescription(), nil
 }
 
-// Stat implements kernfs.Inode.
+// Stat implements kernfs.Inode.Stat.
 func (i *subtasksInode) Stat(ctx context.Context, vsfs *vfs.Filesystem, opts vfs.StatOptions) (linux.Statx, error) {
 	stat, err := i.InodeAttrs.Stat(ctx, vsfs, opts)
 	if err != nil {
@@ -180,12 +180,12 @@ func (i *subtasksInode) Stat(ctx context.Context, vsfs *vfs.Filesystem, opts vfs
 	return stat, nil
 }
 
-// SetStat implements Inode.SetStat not allowing inode attributes to be changed.
+// SetStat implements kernfs.Inode.SetStat not allowing inode attributes to be changed.
 func (*subtasksInode) SetStat(context.Context, *vfs.Filesystem, *auth.Credentials, vfs.SetStatOptions) error {
 	return syserror.EPERM
 }
 
-// DecRef implements kernfs.Inode.
+// DecRef implements kernfs.Inode.DecRef.
 func (i *subtasksInode) DecRef(context.Context) {
 	i.subtasksInodeRefs.DecRef(i.Destroy)
 }

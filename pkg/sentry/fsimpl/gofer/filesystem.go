@@ -1026,7 +1026,7 @@ func (d *dentry) open(ctx context.Context, rp *vfs.ResolvingPath, opts *vfs.Open
 		// step is required even if !d.cachedMetadataAuthoritative() because
 		// d.mappings has to be updated.
 		// d.metadataMu has already been acquired if trunc == true.
-		d.updateFileSizeLocked(0)
+		d.updateSizeLocked(0)
 
 		if d.cachedMetadataAuthoritative() {
 			d.touchCMtimeLocked()
@@ -1311,6 +1311,9 @@ func (fs *filesystem) RenameAt(ctx context.Context, rp *vfs.ResolvingPath, oldPa
 			if !renamed.isDir() {
 				return syserror.EISDIR
 			}
+			if genericIsAncestorDentry(replaced, renamed) {
+				return syserror.ENOTEMPTY
+			}
 		} else {
 			if rp.MustBeDir() || renamed.isDir() {
 				return syserror.ENOTDIR
@@ -1361,14 +1364,15 @@ func (fs *filesystem) RenameAt(ctx context.Context, rp *vfs.ResolvingPath, oldPa
 	// with reference counts and queue oldParent for checkCachingLocked if the
 	// parent isn't actually changing.
 	if oldParent != newParent {
+		oldParent.decRefLocked()
 		ds = appendDentry(ds, oldParent)
 		newParent.IncRef()
 		if renamed.isSynthetic() {
 			oldParent.syntheticChildren--
 			newParent.syntheticChildren++
 		}
+		renamed.parent = newParent
 	}
-	renamed.parent = newParent
 	renamed.name = newName
 	if newParent.children == nil {
 		newParent.children = make(map[string]*dentry)
@@ -1412,11 +1416,11 @@ func (fs *filesystem) SetStatAt(ctx context.Context, rp *vfs.ResolvingPath, opts
 		fs.renameMuRUnlockAndCheckCaching(ctx, &ds)
 		return err
 	}
-	if err := d.setStat(ctx, rp.Credentials(), &opts, rp.Mount()); err != nil {
-		fs.renameMuRUnlockAndCheckCaching(ctx, &ds)
+	err = d.setStat(ctx, rp.Credentials(), &opts, rp.Mount())
+	fs.renameMuRUnlockAndCheckCaching(ctx, &ds)
+	if err != nil {
 		return err
 	}
-	fs.renameMuRUnlockAndCheckCaching(ctx, &ds)
 
 	if ev := vfs.InotifyEventFromStatMask(opts.Stat.Mask); ev != 0 {
 		d.InotifyWithParent(ctx, ev, 0, vfs.InodeEvent)
@@ -1491,7 +1495,7 @@ func (fs *filesystem) UnlinkAt(ctx context.Context, rp *vfs.ResolvingPath) error
 	return fs.unlinkAt(ctx, rp, false /* dir */)
 }
 
-// BoundEndpointAt implements FilesystemImpl.BoundEndpointAt.
+// BoundEndpointAt implements vfs.FilesystemImpl.BoundEndpointAt.
 func (fs *filesystem) BoundEndpointAt(ctx context.Context, rp *vfs.ResolvingPath, opts vfs.BoundEndpointOptions) (transport.BoundEndpoint, error) {
 	var ds *[]*dentry
 	fs.renameMu.RLock()
@@ -1519,8 +1523,8 @@ func (fs *filesystem) BoundEndpointAt(ctx context.Context, rp *vfs.ResolvingPath
 	return nil, syserror.ECONNREFUSED
 }
 
-// ListxattrAt implements vfs.FilesystemImpl.ListxattrAt.
-func (fs *filesystem) ListxattrAt(ctx context.Context, rp *vfs.ResolvingPath, size uint64) ([]string, error) {
+// ListXattrAt implements vfs.FilesystemImpl.ListXattrAt.
+func (fs *filesystem) ListXattrAt(ctx context.Context, rp *vfs.ResolvingPath, size uint64) ([]string, error) {
 	var ds *[]*dentry
 	fs.renameMu.RLock()
 	defer fs.renameMuRUnlockAndCheckCaching(ctx, &ds)
@@ -1528,11 +1532,11 @@ func (fs *filesystem) ListxattrAt(ctx context.Context, rp *vfs.ResolvingPath, si
 	if err != nil {
 		return nil, err
 	}
-	return d.listxattr(ctx, rp.Credentials(), size)
+	return d.listXattr(ctx, rp.Credentials(), size)
 }
 
-// GetxattrAt implements vfs.FilesystemImpl.GetxattrAt.
-func (fs *filesystem) GetxattrAt(ctx context.Context, rp *vfs.ResolvingPath, opts vfs.GetxattrOptions) (string, error) {
+// GetXattrAt implements vfs.FilesystemImpl.GetXattrAt.
+func (fs *filesystem) GetXattrAt(ctx context.Context, rp *vfs.ResolvingPath, opts vfs.GetXattrOptions) (string, error) {
 	var ds *[]*dentry
 	fs.renameMu.RLock()
 	defer fs.renameMuRUnlockAndCheckCaching(ctx, &ds)
@@ -1540,11 +1544,11 @@ func (fs *filesystem) GetxattrAt(ctx context.Context, rp *vfs.ResolvingPath, opt
 	if err != nil {
 		return "", err
 	}
-	return d.getxattr(ctx, rp.Credentials(), &opts)
+	return d.getXattr(ctx, rp.Credentials(), &opts)
 }
 
-// SetxattrAt implements vfs.FilesystemImpl.SetxattrAt.
-func (fs *filesystem) SetxattrAt(ctx context.Context, rp *vfs.ResolvingPath, opts vfs.SetxattrOptions) error {
+// SetXattrAt implements vfs.FilesystemImpl.SetXattrAt.
+func (fs *filesystem) SetXattrAt(ctx context.Context, rp *vfs.ResolvingPath, opts vfs.SetXattrOptions) error {
 	var ds *[]*dentry
 	fs.renameMu.RLock()
 	d, err := fs.resolveLocked(ctx, rp, &ds)
@@ -1552,18 +1556,18 @@ func (fs *filesystem) SetxattrAt(ctx context.Context, rp *vfs.ResolvingPath, opt
 		fs.renameMuRUnlockAndCheckCaching(ctx, &ds)
 		return err
 	}
-	if err := d.setxattr(ctx, rp.Credentials(), &opts); err != nil {
-		fs.renameMuRUnlockAndCheckCaching(ctx, &ds)
+	err = d.setXattr(ctx, rp.Credentials(), &opts)
+	fs.renameMuRUnlockAndCheckCaching(ctx, &ds)
+	if err != nil {
 		return err
 	}
-	fs.renameMuRUnlockAndCheckCaching(ctx, &ds)
 
 	d.InotifyWithParent(ctx, linux.IN_ATTRIB, 0, vfs.InodeEvent)
 	return nil
 }
 
-// RemovexattrAt implements vfs.FilesystemImpl.RemovexattrAt.
-func (fs *filesystem) RemovexattrAt(ctx context.Context, rp *vfs.ResolvingPath, name string) error {
+// RemoveXattrAt implements vfs.FilesystemImpl.RemoveXattrAt.
+func (fs *filesystem) RemoveXattrAt(ctx context.Context, rp *vfs.ResolvingPath, name string) error {
 	var ds *[]*dentry
 	fs.renameMu.RLock()
 	d, err := fs.resolveLocked(ctx, rp, &ds)
@@ -1571,11 +1575,11 @@ func (fs *filesystem) RemovexattrAt(ctx context.Context, rp *vfs.ResolvingPath, 
 		fs.renameMuRUnlockAndCheckCaching(ctx, &ds)
 		return err
 	}
-	if err := d.removexattr(ctx, rp.Credentials(), name); err != nil {
-		fs.renameMuRUnlockAndCheckCaching(ctx, &ds)
+	err = d.removeXattr(ctx, rp.Credentials(), name)
+	fs.renameMuRUnlockAndCheckCaching(ctx, &ds)
+	if err != nil {
 		return err
 	}
-	fs.renameMuRUnlockAndCheckCaching(ctx, &ds)
 
 	d.InotifyWithParent(ctx, linux.IN_ATTRIB, 0, vfs.InodeEvent)
 	return nil

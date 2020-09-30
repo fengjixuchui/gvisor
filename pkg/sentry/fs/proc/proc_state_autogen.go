@@ -876,6 +876,60 @@ func (x *tcpRecoveryFile) StateLoad(m state.Source) {
 	m.LoadWait(1, &x.stack)
 }
 
+func (x *ipForwarding) StateTypeName() string {
+	return "pkg/sentry/fs/proc.ipForwarding"
+}
+
+func (x *ipForwarding) StateFields() []string {
+	return []string{
+		"SimpleFileInode",
+		"stack",
+		"enabled",
+	}
+}
+
+func (x *ipForwarding) beforeSave() {}
+
+func (x *ipForwarding) StateSave(m state.Sink) {
+	x.beforeSave()
+	m.Save(0, &x.SimpleFileInode)
+	m.Save(1, &x.stack)
+	m.Save(2, &x.enabled)
+}
+
+func (x *ipForwarding) StateLoad(m state.Source) {
+	m.Load(0, &x.SimpleFileInode)
+	m.LoadWait(1, &x.stack)
+	m.Load(2, &x.enabled)
+	m.AfterLoad(x.afterLoad)
+}
+
+func (x *ipForwardingFile) StateTypeName() string {
+	return "pkg/sentry/fs/proc.ipForwardingFile"
+}
+
+func (x *ipForwardingFile) StateFields() []string {
+	return []string{
+		"ipf",
+		"stack",
+	}
+}
+
+func (x *ipForwardingFile) beforeSave() {}
+
+func (x *ipForwardingFile) StateSave(m state.Sink) {
+	x.beforeSave()
+	m.Save(0, &x.ipf)
+	m.Save(1, &x.stack)
+}
+
+func (x *ipForwardingFile) afterLoad() {}
+
+func (x *ipForwardingFile) StateLoad(m state.Source) {
+	m.Load(0, &x.ipf)
+	m.LoadWait(1, &x.stack)
+}
+
 func (x *taskDir) StateTypeName() string {
 	return "pkg/sentry/fs/proc.taskDir"
 }
@@ -979,6 +1033,32 @@ func (x *exe) StateSave(m state.Sink) {
 func (x *exe) afterLoad() {}
 
 func (x *exe) StateLoad(m state.Source) {
+	m.Load(0, &x.Symlink)
+	m.Load(1, &x.t)
+}
+
+func (x *cwd) StateTypeName() string {
+	return "pkg/sentry/fs/proc.cwd"
+}
+
+func (x *cwd) StateFields() []string {
+	return []string{
+		"Symlink",
+		"t",
+	}
+}
+
+func (x *cwd) beforeSave() {}
+
+func (x *cwd) StateSave(m state.Sink) {
+	x.beforeSave()
+	m.Save(0, &x.Symlink)
+	m.Save(1, &x.t)
+}
+
+func (x *cwd) afterLoad() {}
+
+func (x *cwd) StateLoad(m state.Source) {
 	m.Load(0, &x.Symlink)
 	m.Load(1, &x.t)
 }
@@ -1467,10 +1547,13 @@ func init() {
 	state.Register((*tcpSackFile)(nil))
 	state.Register((*tcpRecovery)(nil))
 	state.Register((*tcpRecoveryFile)(nil))
+	state.Register((*ipForwarding)(nil))
+	state.Register((*ipForwardingFile)(nil))
 	state.Register((*taskDir)(nil))
 	state.Register((*subtasks)(nil))
 	state.Register((*subtasksFile)(nil))
 	state.Register((*exe)(nil))
+	state.Register((*cwd)(nil))
 	state.Register((*namespaceSymlink)(nil))
 	state.Register((*mapsData)(nil))
 	state.Register((*smapsData)(nil))

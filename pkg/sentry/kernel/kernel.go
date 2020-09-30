@@ -220,13 +220,18 @@ type Kernel struct {
 	// danglingEndpoints is used to save / restore tcpip.DanglingEndpoints.
 	danglingEndpoints struct{} `state:".([]tcpip.Endpoint)"`
 
-	// sockets is the list of all network sockets the system. Protected by
-	// extMu.
+	// sockets is the list of all network sockets in the system.
+	// Protected by extMu.
+	// TODO(gvisor.dev/issue/1624): Only used by VFS1.
 	sockets socketList
 
-	// nextSocketEntry is the next entry number to use in sockets. Protected
+	// socketsVFS2 records all network sockets in the system. Protected by
+	// extMu.
+	socketsVFS2 map[*vfs.FileDescription]*SocketRecord
+
+	// nextSocketRecord is the next entry number to use in sockets. Protected
 	// by extMu.
-	nextSocketEntry uint64
+	nextSocketRecord uint64
 
 	// deviceRegistry is used to save/restore device.SimpleDevices.
 	deviceRegistry struct{} `state:".(*device.Registry)"`
@@ -414,6 +419,8 @@ func (k *Kernel) Init(args InitKernelArgs) error {
 			return fmt.Errorf("failed to create sockfs mount: %v", err)
 		}
 		k.socketMount = socketMount
+
+		k.socketsVFS2 = make(map[*vfs.FileDescription]*SocketRecord)
 	}
 
 	return nil
@@ -507,6 +514,10 @@ func (k *Kernel) SaveTo(w wire.Writer) error {
 // flushMountSourceRefs flushes the MountSources for all mounted filesystems
 // and open FDs.
 func (k *Kernel) flushMountSourceRefs(ctx context.Context) error {
+	if VFS2Enabled {
+		return nil // Not relevant.
+	}
+
 	// Flush all mount sources for currently mounted filesystems in each task.
 	flushed := make(map[*fs.MountNamespace]struct{})
 	k.tasks.mu.RLock()
@@ -533,11 +544,6 @@ func (k *Kernel) flushMountSourceRefs(ctx context.Context) error {
 //
 // Precondition: Must be called with the kernel paused.
 func (ts *TaskSet) forEachFDPaused(ctx context.Context, f func(*fs.File, *vfs.FileDescription) error) (err error) {
-	// TODO(gvisor.dev/issue/1663): Add save support for VFS2.
-	if VFS2Enabled {
-		return nil
-	}
-
 	ts.mu.RLock()
 	defer ts.mu.RUnlock()
 	for t := range ts.Root.tids {
@@ -556,6 +562,10 @@ func (ts *TaskSet) forEachFDPaused(ctx context.Context, f func(*fs.File, *vfs.Fi
 
 func (ts *TaskSet) flushWritesToFiles(ctx context.Context) error {
 	// TODO(gvisor.dev/issue/1663): Add save support for VFS2.
+	if VFS2Enabled {
+		return nil
+	}
+
 	return ts.forEachFDPaused(ctx, func(file *fs.File, _ *vfs.FileDescription) error {
 		if flags := file.Flags(); !flags.Write {
 			return nil
@@ -888,17 +898,18 @@ func (k *Kernel) CreateProcess(args CreateProcessArgs) (*ThreadGroup, ThreadID, 
 		opener    fsbridge.Lookup
 		fsContext *FSContext
 		mntns     *fs.MountNamespace
+		mntnsVFS2 *vfs.MountNamespace
 	)
 
 	if VFS2Enabled {
-		mntnsVFS2 := args.MountNamespaceVFS2
+		mntnsVFS2 = args.MountNamespaceVFS2
 		if mntnsVFS2 == nil {
 			// MountNamespaceVFS2 adds a reference to the namespace, which is
 			// transferred to the new process.
 			mntnsVFS2 = k.globalInit.Leader().MountNamespaceVFS2()
 		}
 		// Get the root directory from the MountNamespace.
-		root := args.MountNamespaceVFS2.Root()
+		root := mntnsVFS2.Root()
 		// The call to newFSContext below will take a reference on root, so we
 		// don't need to hold this one.
 		defer root.DecRef(ctx)
@@ -1008,7 +1019,7 @@ func (k *Kernel) CreateProcess(args CreateProcessArgs) (*ThreadGroup, ThreadID, 
 		UTSNamespace:            args.UTSNamespace,
 		IPCNamespace:            args.IPCNamespace,
 		AbstractSocketNamespace: args.AbstractSocketNamespace,
-		MountNamespaceVFS2:      args.MountNamespaceVFS2,
+		MountNamespaceVFS2:      mntnsVFS2,
 		ContainerID:             args.ContainerID,
 	}
 	t, err := k.tasks.NewTask(config)
@@ -1508,20 +1519,27 @@ func (k *Kernel) SupervisorContext() context.Context {
 	}
 }
 
-// SocketEntry represents a socket recorded in Kernel.sockets. It implements
+// SocketRecord represents a socket recorded in Kernel.socketsVFS2.
+//
+// +stateify savable
+type SocketRecord struct {
+	k        *Kernel
+	Sock     *refs.WeakRef        // TODO(gvisor.dev/issue/1624): Only used by VFS1.
+	SockVFS2 *vfs.FileDescription // Only used by VFS2.
+	ID       uint64               // Socket table entry number.
+}
+
+// SocketRecordVFS1 represents a socket recorded in Kernel.sockets. It implements
 // refs.WeakRefUser for sockets stored in the socket table.
 //
 // +stateify savable
-type SocketEntry struct {
+type SocketRecordVFS1 struct {
 	socketEntry
-	k        *Kernel
-	Sock     *refs.WeakRef
-	SockVFS2 *vfs.FileDescription
-	ID       uint64 // Socket table entry number.
+	SocketRecord
 }
 
 // WeakRefGone implements refs.WeakRefUser.WeakRefGone.
-func (s *SocketEntry) WeakRefGone(context.Context) {
+func (s *SocketRecordVFS1) WeakRefGone(context.Context) {
 	s.k.extMu.Lock()
 	s.k.sockets.Remove(s)
 	s.k.extMu.Unlock()
@@ -1532,9 +1550,14 @@ func (s *SocketEntry) WeakRefGone(context.Context) {
 // Precondition: Caller must hold a reference to sock.
 func (k *Kernel) RecordSocket(sock *fs.File) {
 	k.extMu.Lock()
-	id := k.nextSocketEntry
-	k.nextSocketEntry++
-	s := &SocketEntry{k: k, ID: id}
+	id := k.nextSocketRecord
+	k.nextSocketRecord++
+	s := &SocketRecordVFS1{
+		SocketRecord: SocketRecord{
+			k:  k,
+			ID: id,
+		},
+	}
 	s.Sock = refs.NewWeakRef(sock, s)
 	k.sockets.PushBack(s)
 	k.extMu.Unlock()
@@ -1546,29 +1569,45 @@ func (k *Kernel) RecordSocket(sock *fs.File) {
 // Precondition: Caller must hold a reference to sock.
 //
 // Note that the socket table will not hold a reference on the
-// vfs.FileDescription, because we do not support weak refs on VFS2 files.
+// vfs.FileDescription.
 func (k *Kernel) RecordSocketVFS2(sock *vfs.FileDescription) {
 	k.extMu.Lock()
-	id := k.nextSocketEntry
-	k.nextSocketEntry++
-	s := &SocketEntry{
+	if _, ok := k.socketsVFS2[sock]; ok {
+		panic(fmt.Sprintf("Socket %p added twice", sock))
+	}
+	id := k.nextSocketRecord
+	k.nextSocketRecord++
+	s := &SocketRecord{
 		k:        k,
 		ID:       id,
 		SockVFS2: sock,
 	}
-	k.sockets.PushBack(s)
+	k.socketsVFS2[sock] = s
+	k.extMu.Unlock()
+}
+
+// DeleteSocketVFS2 removes a VFS2 socket from the system-wide socket table.
+func (k *Kernel) DeleteSocketVFS2(sock *vfs.FileDescription) {
+	k.extMu.Lock()
+	delete(k.socketsVFS2, sock)
 	k.extMu.Unlock()
 }
 
 // ListSockets returns a snapshot of all sockets.
 //
-// Callers of ListSockets() in VFS2 should use SocketEntry.SockVFS2.TryIncRef()
+// Callers of ListSockets() in VFS2 should use SocketRecord.SockVFS2.TryIncRef()
 // to get a reference on a socket in the table.
-func (k *Kernel) ListSockets() []*SocketEntry {
+func (k *Kernel) ListSockets() []*SocketRecord {
 	k.extMu.Lock()
-	var socks []*SocketEntry
-	for s := k.sockets.Front(); s != nil; s = s.Next() {
-		socks = append(socks, s)
+	var socks []*SocketRecord
+	if VFS2Enabled {
+		for _, s := range k.socketsVFS2 {
+			socks = append(socks, s)
+		}
+	} else {
+		for s := k.sockets.Front(); s != nil; s = s.Next() {
+			socks = append(socks, &s.SocketRecord)
+		}
 	}
 	k.extMu.Unlock()
 	return socks

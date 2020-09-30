@@ -543,7 +543,7 @@ func (s *statusData) Generate(ctx context.Context, buf *bytes.Buffer) error {
 	var vss, rss, data uint64
 	s.task.WithMuLocked(func(t *kernel.Task) {
 		if fdTable := t.FDTable(); fdTable != nil {
-			fds = fdTable.Size()
+			fds = fdTable.CurrentMaxFDs()
 		}
 		if mm := t.MemoryManager(); mm != nil {
 			vss = mm.VirtualMemorySize()
@@ -648,6 +648,7 @@ func (o *oomScoreAdj) Write(ctx context.Context, src usermem.IOSequence, offset 
 //
 // +stateify savable
 type exeSymlink struct {
+	implStatFS
 	kernfs.InodeAttrs
 	kernfs.InodeNoopRefCount
 	kernfs.InodeSymlink
@@ -666,20 +667,24 @@ func (fs *filesystem) newExeSymlink(task *kernel.Task, ino uint64) *kernfs.Dentr
 	return d
 }
 
-// Readlink implements kernfs.Inode.
-func (s *exeSymlink) Readlink(ctx context.Context) (string, error) {
-	if !kernel.ContextCanTrace(ctx, s.task, false) {
-		return "", syserror.EACCES
-	}
-
-	// Pull out the executable for /proc/[pid]/exe.
-	exec, err := s.executable()
+// Readlink implements kernfs.Inode.Readlink.
+func (s *exeSymlink) Readlink(ctx context.Context, _ *vfs.Mount) (string, error) {
+	exec, _, err := s.Getlink(ctx, nil)
 	if err != nil {
 		return "", err
 	}
 	defer exec.DecRef(ctx)
 
-	return exec.PathnameWithDeleted(ctx), nil
+	root := vfs.RootFromContext(ctx)
+	if !root.Ok() {
+		// It could have raced with process deletion.
+		return "", syserror.ESRCH
+	}
+	defer root.DecRef(ctx)
+
+	vfsObj := exec.Mount().Filesystem().VirtualFilesystem()
+	name, _ := vfsObj.PathnameWithDeleted(ctx, root, exec)
+	return name, nil
 }
 
 // Getlink implements kernfs.Inode.Getlink.
@@ -687,23 +692,12 @@ func (s *exeSymlink) Getlink(ctx context.Context, _ *vfs.Mount) (vfs.VirtualDent
 	if !kernel.ContextCanTrace(ctx, s.task, false) {
 		return vfs.VirtualDentry{}, "", syserror.EACCES
 	}
-
-	exec, err := s.executable()
-	if err != nil {
+	if err := checkTaskState(s.task); err != nil {
 		return vfs.VirtualDentry{}, "", err
 	}
-	defer exec.DecRef(ctx)
 
-	vd := exec.(*fsbridge.VFSFile).FileDescription().VirtualDentry()
-	vd.IncRef()
-	return vd, "", nil
-}
-
-func (s *exeSymlink) executable() (file fsbridge.File, err error) {
-	if err := checkTaskState(s.task); err != nil {
-		return nil, err
-	}
-
+	var err error
+	var exec fsbridge.File
 	s.task.WithMuLocked(func(t *kernel.Task) {
 		mm := t.MemoryManager()
 		if mm == nil {
@@ -714,12 +708,78 @@ func (s *exeSymlink) executable() (file fsbridge.File, err error) {
 		// The MemoryManager may be destroyed, in which case
 		// MemoryManager.destroy will simply set the executable to nil
 		// (with locks held).
-		file = mm.Executable()
-		if file == nil {
+		exec = mm.Executable()
+		if exec == nil {
 			err = syserror.ESRCH
 		}
 	})
-	return
+	if err != nil {
+		return vfs.VirtualDentry{}, "", err
+	}
+	defer exec.DecRef(ctx)
+
+	vd := exec.(*fsbridge.VFSFile).FileDescription().VirtualDentry()
+	vd.IncRef()
+	return vd, "", nil
+}
+
+// cwdSymlink is an symlink for the /proc/[pid]/cwd file.
+//
+// +stateify savable
+type cwdSymlink struct {
+	implStatFS
+	kernfs.InodeAttrs
+	kernfs.InodeNoopRefCount
+	kernfs.InodeSymlink
+
+	task *kernel.Task
+}
+
+var _ kernfs.Inode = (*cwdSymlink)(nil)
+
+func (fs *filesystem) newCwdSymlink(task *kernel.Task, ino uint64) *kernfs.Dentry {
+	inode := &cwdSymlink{task: task}
+	inode.Init(task.Credentials(), linux.UNNAMED_MAJOR, fs.devMinor, ino, linux.ModeSymlink|0777)
+
+	d := &kernfs.Dentry{}
+	d.Init(inode)
+	return d
+}
+
+// Readlink implements kernfs.Inode.Readlink.
+func (s *cwdSymlink) Readlink(ctx context.Context, _ *vfs.Mount) (string, error) {
+	cwd, _, err := s.Getlink(ctx, nil)
+	if err != nil {
+		return "", err
+	}
+	defer cwd.DecRef(ctx)
+
+	root := vfs.RootFromContext(ctx)
+	if !root.Ok() {
+		// It could have raced with process deletion.
+		return "", syserror.ESRCH
+	}
+	defer root.DecRef(ctx)
+
+	vfsObj := cwd.Mount().Filesystem().VirtualFilesystem()
+	name, _ := vfsObj.PathnameWithDeleted(ctx, root, cwd)
+	return name, nil
+}
+
+// Getlink implements kernfs.Inode.Getlink.
+func (s *cwdSymlink) Getlink(ctx context.Context, _ *vfs.Mount) (vfs.VirtualDentry, string, error) {
+	if !kernel.ContextCanTrace(ctx, s.task, false) {
+		return vfs.VirtualDentry{}, "", syserror.EACCES
+	}
+	if err := checkTaskState(s.task); err != nil {
+		return vfs.VirtualDentry{}, "", err
+	}
+	cwd := s.task.FSContext().WorkingDirectoryVFS2()
+	if !cwd.Ok() {
+		// It could have raced with process deletion.
+		return vfs.VirtualDentry{}, "", syserror.ESRCH
+	}
+	return cwd, "", nil
 }
 
 // mountInfoData is used to implement /proc/[pid]/mountinfo.
@@ -784,6 +844,7 @@ func (i *mountsData) Generate(ctx context.Context, buf *bytes.Buffer) error {
 	return nil
 }
 
+// +stateify savable
 type namespaceSymlink struct {
 	kernfs.StaticSymlink
 
@@ -806,15 +867,15 @@ func (fs *filesystem) newNamespaceSymlink(task *kernel.Task, ino uint64, ns stri
 	return d
 }
 
-// Readlink implements Inode.
-func (s *namespaceSymlink) Readlink(ctx context.Context) (string, error) {
+// Readlink implements kernfs.Inode.Readlink.
+func (s *namespaceSymlink) Readlink(ctx context.Context, mnt *vfs.Mount) (string, error) {
 	if err := checkTaskState(s.task); err != nil {
 		return "", err
 	}
-	return s.StaticSymlink.Readlink(ctx)
+	return s.StaticSymlink.Readlink(ctx, mnt)
 }
 
-// Getlink implements Inode.Getlink.
+// Getlink implements kernfs.Inode.Getlink.
 func (s *namespaceSymlink) Getlink(ctx context.Context, mnt *vfs.Mount) (vfs.VirtualDentry, string, error) {
 	if err := checkTaskState(s.task); err != nil {
 		return vfs.VirtualDentry{}, "", err
@@ -831,7 +892,10 @@ func (s *namespaceSymlink) Getlink(ctx context.Context, mnt *vfs.Mount) (vfs.Vir
 
 // namespaceInode is a synthetic inode created to represent a namespace in
 // /proc/[pid]/ns/*.
+//
+// +stateify savable
 type namespaceInode struct {
+	implStatFS
 	kernfs.InodeAttrs
 	kernfs.InodeNoopRefCount
 	kernfs.InodeNotDirectory
@@ -850,12 +914,12 @@ func (i *namespaceInode) Init(creds *auth.Credentials, devMajor, devMinor uint32
 	i.InodeAttrs.Init(creds, devMajor, devMinor, ino, linux.ModeRegular|perm)
 }
 
-// Open implements Inode.Open.
-func (i *namespaceInode) Open(ctx context.Context, rp *vfs.ResolvingPath, vfsd *vfs.Dentry, opts vfs.OpenOptions) (*vfs.FileDescription, error) {
+// Open implements kernfs.Inode.Open.
+func (i *namespaceInode) Open(ctx context.Context, rp *vfs.ResolvingPath, d *kernfs.Dentry, opts vfs.OpenOptions) (*vfs.FileDescription, error) {
 	fd := &namespaceFD{inode: i}
 	i.IncRef()
 	fd.LockFD.Init(&i.locks)
-	if err := fd.vfsfd.Init(fd, opts.Flags, rp.Mount(), vfsd, &vfs.FileDescriptionOptions{}); err != nil {
+	if err := fd.vfsfd.Init(fd, opts.Flags, rp.Mount(), d.VFSDentry(), &vfs.FileDescriptionOptions{}); err != nil {
 		return nil, err
 	}
 	return &fd.vfsfd, nil
@@ -863,6 +927,8 @@ func (i *namespaceInode) Open(ctx context.Context, rp *vfs.ResolvingPath, vfsd *
 
 // namespace FD is a synthetic file that represents a namespace in
 // /proc/[pid]/ns/*.
+//
+// +stateify savable
 type namespaceFD struct {
 	vfs.FileDescriptionDefaultImpl
 	vfs.LockFD
@@ -873,20 +939,20 @@ type namespaceFD struct {
 
 var _ vfs.FileDescriptionImpl = (*namespaceFD)(nil)
 
-// Stat implements FileDescriptionImpl.
+// Stat implements vfs.FileDescriptionImpl.Stat.
 func (fd *namespaceFD) Stat(ctx context.Context, opts vfs.StatOptions) (linux.Statx, error) {
 	vfs := fd.vfsfd.VirtualDentry().Mount().Filesystem()
 	return fd.inode.Stat(ctx, vfs, opts)
 }
 
-// SetStat implements FileDescriptionImpl.
+// SetStat implements vfs.FileDescriptionImpl.SetStat.
 func (fd *namespaceFD) SetStat(ctx context.Context, opts vfs.SetStatOptions) error {
 	vfs := fd.vfsfd.VirtualDentry().Mount().Filesystem()
 	creds := auth.CredentialsFromContext(ctx)
 	return fd.inode.SetStat(ctx, vfs, creds, opts)
 }
 
-// Release implements FileDescriptionImpl.
+// Release implements vfs.FileDescriptionImpl.Release.
 func (fd *namespaceFD) Release(ctx context.Context) {
 	fd.inode.DecRef(ctx)
 }

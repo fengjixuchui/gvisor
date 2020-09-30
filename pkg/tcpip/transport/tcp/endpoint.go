@@ -63,6 +63,17 @@ const (
 	StateClosing
 )
 
+const (
+	// rcvAdvWndScale is used to split the available socket buffer into
+	// application buffer and the window to be advertised to the peer. This is
+	// currently hard coded to split the available space equally.
+	rcvAdvWndScale = 1
+
+	// SegOverheadFactor is used to multiply the value provided by the
+	// user on a SetSockOpt for setting the socket send/receive buffer sizes.
+	SegOverheadFactor = 2
+)
+
 // connected returns true when s is one of the states representing an
 // endpoint connected to a peer.
 func (s EndpointState) connected() bool {
@@ -149,7 +160,6 @@ func (s EndpointState) String() string {
 // Reasons for notifying the protocol goroutine.
 const (
 	notifyNonZeroReceiveWindow = 1 << iota
-	notifyReceiveWindowChanged
 	notifyClose
 	notifyMTUChanged
 	notifyDrain
@@ -384,12 +394,25 @@ type endpoint struct {
 	// to indicate to users that no more data is coming.
 	//
 	// rcvListMu can be taken after the endpoint mu below.
-	rcvListMu     sync.Mutex  `state:"nosave"`
-	rcvList       segmentList `state:"wait"`
-	rcvClosed     bool
-	rcvBufSize    int
+	rcvListMu sync.Mutex  `state:"nosave"`
+	rcvList   segmentList `state:"wait"`
+	rcvClosed bool
+	// rcvBufSize is the total size of the receive buffer.
+	rcvBufSize int
+	// rcvBufUsed is the actual number of payload bytes held in the receive buffer
+	// not counting any overheads of the segments itself. NOTE: This will always
+	// be strictly <= rcvMemUsed below.
 	rcvBufUsed    int
 	rcvAutoParams rcvBufAutoTuneParams
+
+	// rcvMemUsed tracks the total amount of memory in use by received segments
+	// held in rcvList, pendingRcvdSegments and the segment queue. This is used to
+	// compute the window and the actual available buffer space. This is distinct
+	// from rcvBufUsed above which is the actual number of payload bytes held in
+	// the buffer not including any segment overheads.
+	//
+	// rcvMemUsed must be accessed atomically.
+	rcvMemUsed int32
 
 	// mu protects all endpoint fields unless documented otherwise. mu must
 	// be acquired before interacting with the endpoint fields.
@@ -852,12 +875,12 @@ func newEndpoint(s *stack.Stack, netProto tcpip.NetworkProtocolNumber, waiterQue
 		maxSynRetries: DefaultSynRetries,
 	}
 
-	var ss SendBufferSizeOption
+	var ss tcpip.TCPSendBufferSizeRangeOption
 	if err := s.TransportProtocolOption(ProtocolNumber, &ss); err == nil {
 		e.sndBufSize = ss.Default
 	}
 
-	var rs ReceiveBufferSizeOption
+	var rs tcpip.TCPReceiveBufferSizeRangeOption
 	if err := s.TransportProtocolOption(ProtocolNumber, &rs); err == nil {
 		e.rcvBufSize = rs.Default
 	}
@@ -867,12 +890,12 @@ func newEndpoint(s *stack.Stack, netProto tcpip.NetworkProtocolNumber, waiterQue
 		e.cc = cs
 	}
 
-	var mrb tcpip.ModerateReceiveBufferOption
+	var mrb tcpip.TCPModerateReceiveBufferOption
 	if err := s.TransportProtocolOption(ProtocolNumber, &mrb); err == nil {
 		e.rcvAutoParams.disabled = !bool(mrb)
 	}
 
-	var de DelayEnabled
+	var de tcpip.TCPDelayEnabled
 	if err := s.TransportProtocolOption(ProtocolNumber, &de); err == nil && de {
 		e.SetSockOptBool(tcpip.DelayOption, true)
 	}
@@ -891,7 +914,7 @@ func newEndpoint(s *stack.Stack, netProto tcpip.NetworkProtocolNumber, waiterQue
 		e.probe = p
 	}
 
-	e.segmentQueue.setLimit(MaxUnprocessedSegments)
+	e.segmentQueue.ep = e
 	e.tsOffset = timeStampOffset()
 	e.acceptCond = sync.NewCond(&e.acceptMu)
 
@@ -904,7 +927,12 @@ func (e *endpoint) Readiness(mask waiter.EventMask) waiter.EventMask {
 	result := waiter.EventMask(0)
 
 	switch e.EndpointState() {
-	case StateInitial, StateBound, StateConnecting, StateSynSent, StateSynRecv:
+	case StateInitial, StateBound:
+		// This prevents blocking of new sockets which are not
+		// connected when SO_LINGER is set.
+		result |= waiter.EventHUp
+
+	case StateConnecting, StateSynSent, StateSynRecv:
 		// Ready for nothing.
 
 	case StateClose, StateError, StateTimeWait:
@@ -1075,6 +1103,8 @@ func (e *endpoint) closeNoShutdownLocked() {
 		e.notifyProtocolGoroutine(notifyClose)
 	} else {
 		e.transitionToStateCloseLocked()
+		// Notify that the endpoint is closed.
+		e.waiterQueue.Notify(waiter.EventHUp)
 	}
 }
 
@@ -1129,10 +1159,16 @@ func (e *endpoint) cleanupLocked() {
 	tcpip.DeleteDanglingEndpoint(e)
 }
 
+// wndFromSpace returns the window that we can advertise based on the available
+// receive buffer space.
+func wndFromSpace(space int) int {
+	return space / (1 << rcvAdvWndScale)
+}
+
 // initialReceiveWindow returns the initial receive window to advertise in the
 // SYN/SYN-ACK.
 func (e *endpoint) initialReceiveWindow() int {
-	rcvWnd := e.receiveBufferAvailable()
+	rcvWnd := wndFromSpace(e.receiveBufferAvailable())
 	if rcvWnd > math.MaxUint16 {
 		rcvWnd = math.MaxUint16
 	}
@@ -1209,14 +1245,12 @@ func (e *endpoint) ModerateRecvBuf(copied int) {
 		// reject valid data that might already be in flight as the
 		// acceptable window will shrink.
 		if rcvWnd > e.rcvBufSize {
-			availBefore := e.receiveBufferAvailableLocked()
+			availBefore := wndFromSpace(e.receiveBufferAvailableLocked())
 			e.rcvBufSize = rcvWnd
-			availAfter := e.receiveBufferAvailableLocked()
-			mask := uint32(notifyReceiveWindowChanged)
+			availAfter := wndFromSpace(e.receiveBufferAvailableLocked())
 			if crossed, above := e.windowCrossedACKThresholdLocked(availAfter - availBefore); crossed && above {
-				mask |= notifyNonZeroReceiveWindow
+				e.notifyProtocolGoroutine(notifyNonZeroReceiveWindow)
 			}
-			e.notifyProtocolGoroutine(mask)
 		}
 
 		// We only update prevCopied when we grow the buffer because in cases
@@ -1293,18 +1327,22 @@ func (e *endpoint) readLocked() (buffer.View, *tcpip.Error) {
 	v := views[s.viewToDeliver]
 	s.viewToDeliver++
 
+	var delta int
 	if s.viewToDeliver >= len(views) {
 		e.rcvList.Remove(s)
+		// We only free up receive buffer space when the segment is released as the
+		// segment is still holding on to the views even though some views have been
+		// read out to the user.
+		delta = s.segMemSize()
 		s.decRef()
 	}
 
 	e.rcvBufUsed -= len(v)
-
 	// If the window was small before this read and if the read freed up
 	// enough buffer space, to either fit an aMSS or half a receive buffer
 	// (whichever smaller), then notify the protocol goroutine to send a
 	// window update.
-	if crossed, above := e.windowCrossedACKThresholdLocked(len(v)); crossed && above {
+	if crossed, above := e.windowCrossedACKThresholdLocked(delta); crossed && above {
 		e.notifyProtocolGoroutine(notifyNonZeroReceiveWindow)
 	}
 
@@ -1317,14 +1355,17 @@ func (e *endpoint) readLocked() (buffer.View, *tcpip.Error) {
 // indicating the reason why it's not writable.
 // Caller must hold e.mu and e.sndBufMu
 func (e *endpoint) isEndpointWritableLocked() (int, *tcpip.Error) {
-	// The endpoint cannot be written to if it's not connected.
-	if !e.EndpointState().connected() {
-		switch e.EndpointState() {
-		case StateError:
-			return 0, e.HardError
-		default:
-			return 0, tcpip.ErrClosedForSend
-		}
+	switch s := e.EndpointState(); {
+	case s == StateError:
+		return 0, e.HardError
+	case !s.connecting() && !s.connected():
+		return 0, tcpip.ErrClosedForSend
+	case s.connecting():
+		// As per RFC793, page 56, a send request arriving when in connecting
+		// state, can be queued to be completed after the state becomes
+		// connected. Return an error code for the caller of endpoint Write to
+		// try again, until the connection handshake is complete.
+		return 0, tcpip.ErrWouldBlock
 	}
 
 	// Check if the connection has already been closed for sends.
@@ -1478,11 +1519,11 @@ func (e *endpoint) Peek(vec [][]byte) (int64, tcpip.ControlMessages, *tcpip.Erro
 }
 
 // windowCrossedACKThresholdLocked checks if the receive window to be announced
-// now would be under aMSS or under half receive buffer, whichever smaller. This
-// is useful as a receive side silly window syndrome prevention mechanism. If
-// window grows to reasonable value, we should send ACK to the sender to inform
-// the rx space is now large. We also want ensure a series of small read()'s
-// won't trigger a flood of spurious tiny ACK's.
+// would be under aMSS or under the window derived from half receive buffer,
+// whichever smaller. This is useful as a receive side silly window syndrome
+// prevention mechanism. If window grows to reasonable value, we should send ACK
+// to the sender to inform the rx space is now large. We also want ensure a
+// series of small read()'s won't trigger a flood of spurious tiny ACK's.
 //
 // For large receive buffers, the threshold is aMSS - once reader reads more
 // than aMSS we'll send ACK. For tiny receive buffers, the threshold is half of
@@ -1493,17 +1534,18 @@ func (e *endpoint) Peek(vec [][]byte) (int64, tcpip.ControlMessages, *tcpip.Erro
 //
 // Precondition: e.mu and e.rcvListMu must be held.
 func (e *endpoint) windowCrossedACKThresholdLocked(deltaBefore int) (crossed bool, above bool) {
-	newAvail := e.receiveBufferAvailableLocked()
+	newAvail := wndFromSpace(e.receiveBufferAvailableLocked())
 	oldAvail := newAvail - deltaBefore
 	if oldAvail < 0 {
 		oldAvail = 0
 	}
-
 	threshold := int(e.amss)
-	if threshold > e.rcvBufSize/2 {
-		threshold = e.rcvBufSize / 2
+	// rcvBufFraction is the inverse of the fraction of receive buffer size that
+	// is used to decide if the available buffer space is now above it.
+	const rcvBufFraction = 2
+	if wndThreshold := wndFromSpace(e.rcvBufSize / rcvBufFraction); threshold > wndThreshold {
+		threshold = wndThreshold
 	}
-
 	switch {
 	case oldAvail < threshold && newAvail >= threshold:
 		return true, true
@@ -1632,17 +1674,23 @@ func (e *endpoint) SetSockOptInt(opt tcpip.SockOptInt, v int) *tcpip.Error {
 	case tcpip.ReceiveBufferSizeOption:
 		// Make sure the receive buffer size is within the min and max
 		// allowed.
-		var rs ReceiveBufferSizeOption
-		if err := e.stack.TransportProtocolOption(ProtocolNumber, &rs); err == nil {
+		var rs tcpip.TCPReceiveBufferSizeRangeOption
+		if err := e.stack.TransportProtocolOption(ProtocolNumber, &rs); err != nil {
+			panic(fmt.Sprintf("e.stack.TransportProtocolOption(%d, %#v) = %s", ProtocolNumber, &rs, err))
+		}
+
+		if v > rs.Max {
+			v = rs.Max
+		}
+
+		if v < math.MaxInt32/SegOverheadFactor {
+			v *= SegOverheadFactor
 			if v < rs.Min {
 				v = rs.Min
 			}
-			if v > rs.Max {
-				v = rs.Max
-			}
+		} else {
+			v = math.MaxInt32
 		}
-
-		mask := uint32(notifyReceiveWindowChanged)
 
 		e.LockUser()
 		e.rcvListMu.Lock()
@@ -1657,14 +1705,9 @@ func (e *endpoint) SetSockOptInt(opt tcpip.SockOptInt, v int) *tcpip.Error {
 			v = 1 << scale
 		}
 
-		// Make sure 2*size doesn't overflow.
-		if v > math.MaxInt32/2 {
-			v = math.MaxInt32 / 2
-		}
-
-		availBefore := e.receiveBufferAvailableLocked()
+		availBefore := wndFromSpace(e.receiveBufferAvailableLocked())
 		e.rcvBufSize = v
-		availAfter := e.receiveBufferAvailableLocked()
+		availAfter := wndFromSpace(e.receiveBufferAvailableLocked())
 
 		e.rcvAutoParams.disabled = true
 
@@ -1672,24 +1715,31 @@ func (e *endpoint) SetSockOptInt(opt tcpip.SockOptInt, v int) *tcpip.Error {
 		// syndrome prevetion, when our available space grows above aMSS
 		// or half receive buffer, whichever smaller.
 		if crossed, above := e.windowCrossedACKThresholdLocked(availAfter - availBefore); crossed && above {
-			mask |= notifyNonZeroReceiveWindow
+			e.notifyProtocolGoroutine(notifyNonZeroReceiveWindow)
 		}
 
 		e.rcvListMu.Unlock()
 		e.UnlockUser()
-		e.notifyProtocolGoroutine(mask)
 
 	case tcpip.SendBufferSizeOption:
 		// Make sure the send buffer size is within the min and max
 		// allowed.
-		var ss SendBufferSizeOption
-		if err := e.stack.TransportProtocolOption(ProtocolNumber, &ss); err == nil {
+		var ss tcpip.TCPSendBufferSizeRangeOption
+		if err := e.stack.TransportProtocolOption(ProtocolNumber, &ss); err != nil {
+			panic(fmt.Sprintf("e.stack.TransportProtocolOption(%d, %#v) = %s", ProtocolNumber, &ss, err))
+		}
+
+		if v > ss.Max {
+			v = ss.Max
+		}
+
+		if v < math.MaxInt32/SegOverheadFactor {
+			v *= SegOverheadFactor
 			if v < ss.Min {
 				v = ss.Min
 			}
-			if v > ss.Max {
-				v = ss.Max
-			}
+		} else {
+			v = math.MaxInt32
 		}
 
 		e.sndBufMu.Lock()
@@ -1722,7 +1772,7 @@ func (e *endpoint) SetSockOptInt(opt tcpip.SockOptInt, v int) *tcpip.Error {
 				return tcpip.ErrInvalidOptionValue
 			}
 		}
-		var rs ReceiveBufferSizeOption
+		var rs tcpip.TCPReceiveBufferSizeRangeOption
 		if err := e.stack.TransportProtocolOption(ProtocolNumber, &rs); err == nil {
 			if v < rs.Min/2 {
 				v = rs.Min / 2
@@ -1771,7 +1821,7 @@ func (e *endpoint) SetSockOpt(opt tcpip.SettableSocketOption) *tcpip.Error {
 		// Query the available cc algorithms in the stack and
 		// validate that the specified algorithm is actually
 		// supported in the stack.
-		var avail tcpip.AvailableCongestionControlOption
+		var avail tcpip.TCPAvailableCongestionControlOption
 		if err := e.stack.TransportProtocolOption(ProtocolNumber, &avail); err != nil {
 			return err
 		}
@@ -2047,8 +2097,10 @@ func (e *endpoint) GetSockOpt(opt tcpip.GettableSocketOption) *tcpip.Error {
 		e.UnlockUser()
 
 	case *tcpip.OriginalDestinationOption:
+		e.LockUser()
 		ipt := e.stack.IPTables()
 		addr, port, err := ipt.OriginalDst(e.ID)
+		e.UnlockUser()
 		if err != nil {
 			return err
 		}
@@ -2486,7 +2538,9 @@ func (e *endpoint) startAcceptedLoop() {
 
 // Accept returns a new endpoint if a peer has established a connection
 // to an endpoint previously set to listen mode.
-func (e *endpoint) Accept() (tcpip.Endpoint, *waiter.Queue, *tcpip.Error) {
+//
+// addr if not-nil will contain the peer address of the returned endpoint.
+func (e *endpoint) Accept(peerAddr *tcpip.FullAddress) (tcpip.Endpoint, *waiter.Queue, *tcpip.Error) {
 	e.LockUser()
 	defer e.UnlockUser()
 
@@ -2507,6 +2561,9 @@ func (e *endpoint) Accept() (tcpip.Endpoint, *waiter.Queue, *tcpip.Error) {
 		e.acceptCond.Signal()
 	default:
 		return nil, nil, tcpip.ErrWouldBlock
+	}
+	if peerAddr != nil {
+		*peerAddr = n.getRemoteAddress()
 	}
 	return n, n.waiterQueue, nil
 }
@@ -2610,11 +2667,15 @@ func (e *endpoint) GetRemoteAddress() (tcpip.FullAddress, *tcpip.Error) {
 		return tcpip.FullAddress{}, tcpip.ErrNotConnected
 	}
 
+	return e.getRemoteAddress(), nil
+}
+
+func (e *endpoint) getRemoteAddress() tcpip.FullAddress {
 	return tcpip.FullAddress{
 		Addr: e.ID.RemoteAddress,
 		Port: e.ID.RemotePort,
 		NIC:  e.boundNICID,
-	}, nil
+	}
 }
 
 func (e *endpoint) HandlePacket(r *stack.Route, id stack.TransportEndpointID, pkt *stack.PacketBuffer) {
@@ -2685,13 +2746,8 @@ func (e *endpoint) updateSndBufferUsage(v int) {
 func (e *endpoint) readyToRead(s *segment) {
 	e.rcvListMu.Lock()
 	if s != nil {
+		e.rcvBufUsed += s.payloadSize()
 		s.incRef()
-		e.rcvBufUsed += s.data.Size()
-		// Increase counter if the receive window falls down below MSS
-		// or half receive buffer size, whichever smaller.
-		if crossed, above := e.windowCrossedACKThresholdLocked(-s.data.Size()); crossed && !above {
-			e.stats.ReceiveErrors.ZeroRcvWindowState.Increment()
-		}
 		e.rcvList.PushBack(s)
 	} else {
 		e.rcvClosed = true
@@ -2706,15 +2762,17 @@ func (e *endpoint) readyToRead(s *segment) {
 func (e *endpoint) receiveBufferAvailableLocked() int {
 	// We may use more bytes than the buffer size when the receive buffer
 	// shrinks.
-	if e.rcvBufUsed >= e.rcvBufSize {
+	memUsed := e.receiveMemUsed()
+	if memUsed >= e.rcvBufSize {
 		return 0
 	}
 
-	return e.rcvBufSize - e.rcvBufUsed
+	return e.rcvBufSize - memUsed
 }
 
 // receiveBufferAvailable calculates how many bytes are still available in the
-// receive buffer.
+// receive buffer based on the actual memory used by all segments held in
+// receive buffer/pending and segment queue.
 func (e *endpoint) receiveBufferAvailable() int {
 	e.rcvListMu.Lock()
 	available := e.receiveBufferAvailableLocked()
@@ -2722,16 +2780,37 @@ func (e *endpoint) receiveBufferAvailable() int {
 	return available
 }
 
+// receiveBufferUsed returns the amount of in-use receive buffer.
+func (e *endpoint) receiveBufferUsed() int {
+	e.rcvListMu.Lock()
+	used := e.rcvBufUsed
+	e.rcvListMu.Unlock()
+	return used
+}
+
+// receiveBufferSize returns the current size of the receive buffer.
 func (e *endpoint) receiveBufferSize() int {
 	e.rcvListMu.Lock()
 	size := e.rcvBufSize
 	e.rcvListMu.Unlock()
-
 	return size
 }
 
+// receiveMemUsed returns the total memory in use by segments held by this
+// endpoint.
+func (e *endpoint) receiveMemUsed() int {
+	return int(atomic.LoadInt32(&e.rcvMemUsed))
+}
+
+// updateReceiveMemUsed adds the provided delta to e.rcvMemUsed.
+func (e *endpoint) updateReceiveMemUsed(delta int) {
+	atomic.AddInt32(&e.rcvMemUsed, int32(delta))
+}
+
+// maxReceiveBufferSize returns the stack wide maximum receive buffer size for
+// an endpoint.
 func (e *endpoint) maxReceiveBufferSize() int {
-	var rs ReceiveBufferSizeOption
+	var rs tcpip.TCPReceiveBufferSizeRangeOption
 	if err := e.stack.TransportProtocolOption(ProtocolNumber, &rs); err != nil {
 		// As a fallback return the hardcoded max buffer size.
 		return MaxBufferSize
@@ -2811,7 +2890,7 @@ func timeStampOffset() uint32 {
 // if the SYN options indicate that the SACK option was negotiated and the TCP
 // stack is configured to enable TCP SACK option.
 func (e *endpoint) maybeEnableSACKPermitted(synOpts *header.TCPSynOptions) {
-	var v SACKEnabled
+	var v tcpip.TCPSACKEnabled
 	if err := e.stack.TransportProtocolOption(ProtocolNumber, &v); err != nil {
 		// Stack doesn't support SACK. So just return.
 		return
@@ -2880,7 +2959,6 @@ func (e *endpoint) completeState() stack.TCPEndpointState {
 		RcvAcc:         e.rcv.rcvAcc,
 		RcvWndScale:    e.rcv.rcvWndScale,
 		PendingBufUsed: e.rcv.pendingBufUsed,
-		PendingBufSize: e.rcv.pendingBufSize,
 	}
 
 	// Copy sender state.

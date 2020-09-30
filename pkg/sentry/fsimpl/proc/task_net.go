@@ -616,6 +616,7 @@ type netSnmpData struct {
 
 var _ dynamicInode = (*netSnmpData)(nil)
 
+// +stateify savable
 type snmpLine struct {
 	prefix string
 	header string
@@ -660,7 +661,7 @@ func sprintSlice(s []uint64) string {
 	return r[1 : len(r)-1] // Remove "[]" introduced by fmt of slice.
 }
 
-// Generate implements vfs.DynamicBytesSource.
+// Generate implements vfs.DynamicBytesSource.Generate.
 func (d *netSnmpData) Generate(ctx context.Context, buf *bytes.Buffer) error {
 	types := []interface{}{
 		&inet.StatSNMPIP{},
@@ -709,7 +710,7 @@ type netRouteData struct {
 
 var _ dynamicInode = (*netRouteData)(nil)
 
-// Generate implements vfs.DynamicBytesSource.
+// Generate implements vfs.DynamicBytesSource.Generate.
 // See Linux's net/ipv4/fib_trie.c:fib_route_seq_show.
 func (d *netRouteData) Generate(ctx context.Context, buf *bytes.Buffer) error {
 	fmt.Fprintf(buf, "%-127s\n", "Iface\tDestination\tGateway\tFlags\tRefCnt\tUse\tMetric\tMask\tMTU\tWindow\tIRTT")
@@ -773,7 +774,7 @@ type netStatData struct {
 
 var _ dynamicInode = (*netStatData)(nil)
 
-// Generate implements vfs.DynamicBytesSource.
+// Generate implements vfs.DynamicBytesSource.Generate.
 // See Linux's net/ipv4/fib_trie.c:fib_route_seq_show.
 func (d *netStatData) Generate(ctx context.Context, buf *bytes.Buffer) error {
 	buf.WriteString("TcpExt: SyncookiesSent SyncookiesRecv SyncookiesFailed " +

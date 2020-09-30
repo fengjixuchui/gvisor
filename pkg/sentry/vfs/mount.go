@@ -18,14 +18,12 @@ import (
 	"bytes"
 	"fmt"
 	"math"
-	"path"
 	"sort"
 	"strings"
 	"sync/atomic"
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/context"
-	"gvisor.dev/gvisor/pkg/fspath"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/syserror"
 )
@@ -67,7 +65,7 @@ type Mount struct {
 	//
 	// Invariant: key.parent != nil iff key.point != nil. key.point belongs to
 	// key.parent.fs.
-	key mountKey
+	key mountKey `state:".(VirtualDentry)"`
 
 	// ns is the namespace in which this Mount was mounted. ns is protected by
 	// VirtualFilesystem.mountMu.
@@ -154,13 +152,13 @@ type MountNamespace struct {
 // NewMountNamespace returns a new mount namespace with a root filesystem
 // configured by the given arguments. A reference is taken on the returned
 // MountNamespace.
-func (vfs *VirtualFilesystem) NewMountNamespace(ctx context.Context, creds *auth.Credentials, source, fsTypeName string, opts *GetFilesystemOptions) (*MountNamespace, error) {
+func (vfs *VirtualFilesystem) NewMountNamespace(ctx context.Context, creds *auth.Credentials, source, fsTypeName string, opts *MountOptions) (*MountNamespace, error) {
 	rft := vfs.getFilesystemType(fsTypeName)
 	if rft == nil {
 		ctx.Warningf("Unknown filesystem type: %s", fsTypeName)
 		return nil, syserror.ENODEV
 	}
-	fs, root, err := rft.fsType.GetFilesystem(ctx, vfs, creds, source, *opts)
+	fs, root, err := rft.fsType.GetFilesystem(ctx, vfs, creds, source, opts.GetFilesystemOptions)
 	if err != nil {
 		return nil, err
 	}
@@ -169,7 +167,7 @@ func (vfs *VirtualFilesystem) NewMountNamespace(ctx context.Context, creds *auth
 		mountpoints: make(map[*Dentry]uint32),
 	}
 	mntns.EnableLeakCheck()
-	mntns.root = newMount(vfs, fs, root, mntns, &MountOptions{})
+	mntns.root = newMount(vfs, fs, root, mntns, opts)
 	return mntns, nil
 }
 
@@ -347,6 +345,7 @@ func (vfs *VirtualFilesystem) UmountAt(ctx context.Context, creds *auth.Credenti
 	return nil
 }
 
+// +stateify savable
 type umountRecursiveOptions struct {
 	// If eager is true, ensure that future calls to Mount.tryIncMountedRef()
 	// on umounted mounts fail.
@@ -416,7 +415,7 @@ func (vfs *VirtualFilesystem) connectLocked(mnt *Mount, vd VirtualDentry, mntns 
 		}
 	}
 	mnt.IncRef() // dropped by callers of umountRecursiveLocked
-	mnt.storeKey(vd)
+	mnt.setKey(vd)
 	if vd.mount.children == nil {
 		vd.mount.children = make(map[*Mount]struct{})
 	}
@@ -441,13 +440,13 @@ func (vfs *VirtualFilesystem) connectLocked(mnt *Mount, vd VirtualDentry, mntns 
 // * vfs.mounts.seq must be in a writer critical section.
 // * mnt.parent() != nil.
 func (vfs *VirtualFilesystem) disconnectLocked(mnt *Mount) VirtualDentry {
-	vd := mnt.loadKey()
+	vd := mnt.getKey()
 	if checkInvariants {
 		if vd.mount != nil {
 			panic("VFS.disconnectLocked called on disconnected mount")
 		}
 	}
-	mnt.storeKey(VirtualDentry{})
+	mnt.loadKey(VirtualDentry{})
 	delete(vd.mount.children, mnt)
 	atomic.AddUint32(&vd.dentry.mounts, math.MaxUint32) // -1
 	mnt.ns.mountpoints[vd.dentry]--
@@ -740,11 +739,23 @@ func (mntns *MountNamespace) Root() VirtualDentry {
 //
 // Preconditions: taskRootDir.Ok().
 func (vfs *VirtualFilesystem) GenerateProcMounts(ctx context.Context, taskRootDir VirtualDentry, buf *bytes.Buffer) {
-	vfs.mountMu.Lock()
-	defer vfs.mountMu.Unlock()
 	rootMnt := taskRootDir.mount
+
+	vfs.mountMu.Lock()
 	mounts := rootMnt.submountsLocked()
+	// Take a reference on mounts since we need to drop vfs.mountMu before
+	// calling vfs.PathnameReachable() (=> FilesystemImpl.PrependPath()).
+	for _, mnt := range mounts {
+		mnt.IncRef()
+	}
+	vfs.mountMu.Unlock()
+	defer func() {
+		for _, mnt := range mounts {
+			mnt.DecRef(ctx)
+		}
+	}()
 	sort.Slice(mounts, func(i, j int) bool { return mounts[i].ID < mounts[j].ID })
+
 	for _, mnt := range mounts {
 		// Get the path to this mount relative to task root.
 		mntRootVD := VirtualDentry{
@@ -755,7 +766,7 @@ func (vfs *VirtualFilesystem) GenerateProcMounts(ctx context.Context, taskRootDi
 		if err != nil {
 			// For some reason we didn't get a path. Log a warning
 			// and run with empty path.
-			ctx.Warningf("Error getting pathname for mount root %+v: %v", mnt.root, err)
+			ctx.Warningf("VFS.GenerateProcMounts: error getting pathname for mount root %+v: %v", mnt.root, err)
 			path = ""
 		}
 		if path == "" {
@@ -789,11 +800,25 @@ func (vfs *VirtualFilesystem) GenerateProcMounts(ctx context.Context, taskRootDi
 //
 // Preconditions: taskRootDir.Ok().
 func (vfs *VirtualFilesystem) GenerateProcMountInfo(ctx context.Context, taskRootDir VirtualDentry, buf *bytes.Buffer) {
-	vfs.mountMu.Lock()
-	defer vfs.mountMu.Unlock()
 	rootMnt := taskRootDir.mount
+
+	vfs.mountMu.Lock()
 	mounts := rootMnt.submountsLocked()
+	// Take a reference on mounts since we need to drop vfs.mountMu before
+	// calling vfs.PathnameReachable() (=> FilesystemImpl.PrependPath()) or
+	// vfs.StatAt() (=> FilesystemImpl.StatAt()).
+	for _, mnt := range mounts {
+		mnt.IncRef()
+	}
+	vfs.mountMu.Unlock()
+	defer func() {
+		for _, mnt := range mounts {
+			mnt.DecRef(ctx)
+		}
+	}()
 	sort.Slice(mounts, func(i, j int) bool { return mounts[i].ID < mounts[j].ID })
+
+	creds := auth.CredentialsFromContext(ctx)
 	for _, mnt := range mounts {
 		// Get the path to this mount relative to task root.
 		mntRootVD := VirtualDentry{
@@ -804,7 +829,7 @@ func (vfs *VirtualFilesystem) GenerateProcMountInfo(ctx context.Context, taskRoo
 		if err != nil {
 			// For some reason we didn't get a path. Log a warning
 			// and run with empty path.
-			ctx.Warningf("Error getting pathname for mount root %+v: %v", mnt.root, err)
+			ctx.Warningf("VFS.GenerateProcMountInfo: error getting pathname for mount root %+v: %v", mnt.root, err)
 			path = ""
 		}
 		if path == "" {
@@ -817,9 +842,10 @@ func (vfs *VirtualFilesystem) GenerateProcMountInfo(ctx context.Context, taskRoo
 			Root:  mntRootVD,
 			Start: mntRootVD,
 		}
-		statx, err := vfs.StatAt(ctx, auth.NewAnonymousCredentials(), pop, &StatOptions{})
+		statx, err := vfs.StatAt(ctx, creds, pop, &StatOptions{})
 		if err != nil {
 			// Well that's not good. Ignore this mount.
+			ctx.Warningf("VFS.GenerateProcMountInfo: failed to stat mount root %+v: %v", mnt.root, err)
 			break
 		}
 
@@ -831,6 +857,9 @@ func (vfs *VirtualFilesystem) GenerateProcMountInfo(ctx context.Context, taskRoo
 		fmt.Fprintf(buf, "%d ", mnt.ID)
 
 		// (2)  Parent ID (or this ID if there is no parent).
+		// Note that even if the call to mnt.parent() races with Mount
+		// destruction (which is possible since we're not holding vfs.mountMu),
+		// its Mount.ID will still be valid.
 		pID := mnt.ID
 		if p := mnt.parent(); p != nil {
 			pID = p.ID
@@ -877,30 +906,6 @@ func (vfs *VirtualFilesystem) GenerateProcMountInfo(ctx context.Context, taskRoo
 		// (11) Superblock options, and final newline.
 		fmt.Fprintf(buf, "%s\n", superBlockOpts(path, mnt))
 	}
-}
-
-// MakeSyntheticMountpoint creates parent directories of target if they do not
-// exist and attempts to create a directory for the mountpoint. If a
-// non-directory file already exists there then we allow it.
-func (vfs *VirtualFilesystem) MakeSyntheticMountpoint(ctx context.Context, target string, root VirtualDentry, creds *auth.Credentials) error {
-	mkdirOpts := &MkdirOptions{Mode: 0777, ForSyntheticMountpoint: true}
-
-	// Make sure the parent directory of target exists.
-	if err := vfs.MkdirAllAt(ctx, path.Dir(target), root, creds, mkdirOpts); err != nil {
-		return fmt.Errorf("failed to create parent directory of mountpoint %q: %w", target, err)
-	}
-
-	// Attempt to mkdir the final component. If a file (of any type) exists
-	// then we let allow mounting on top of that because we do not require the
-	// target to be an existing directory, unlike Linux mount(2).
-	if err := vfs.MkdirAt(ctx, creds, &PathOperation{
-		Root:  root,
-		Start: root,
-		Path:  fspath.Parse(target),
-	}, mkdirOpts); err != nil && err != syserror.EEXIST {
-		return fmt.Errorf("failed to create mountpoint %q: %w", target, err)
-	}
-	return nil
 }
 
 // manglePath replaces ' ', '\t', '\n', and '\\' with their octal equivalents.

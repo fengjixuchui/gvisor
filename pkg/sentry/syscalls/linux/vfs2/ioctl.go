@@ -16,6 +16,7 @@ package vfs2
 
 import (
 	"gvisor.dev/gvisor/pkg/abi/linux"
+	"gvisor.dev/gvisor/pkg/marshal/primitive"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/syserror"
@@ -34,20 +35,20 @@ func Ioctl(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.Syscall
 	// Handle ioctls that apply to all FDs.
 	switch args[1].Int() {
 	case linux.FIONCLEX:
-		t.FDTable().SetFlagsVFS2(fd, kernel.FDFlags{
+		t.FDTable().SetFlagsVFS2(t, fd, kernel.FDFlags{
 			CloseOnExec: false,
 		})
 		return 0, nil, nil
 
 	case linux.FIOCLEX:
-		t.FDTable().SetFlagsVFS2(fd, kernel.FDFlags{
+		t.FDTable().SetFlagsVFS2(t, fd, kernel.FDFlags{
 			CloseOnExec: true,
 		})
 		return 0, nil, nil
 
 	case linux.FIONBIO:
 		var set int32
-		if _, err := t.CopyIn(args[2].Pointer(), &set); err != nil {
+		if _, err := primitive.CopyInt32In(t, args[2].Pointer(), &set); err != nil {
 			return 0, nil, err
 		}
 		flags := file.StatusFlags()
@@ -60,7 +61,7 @@ func Ioctl(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.Syscall
 
 	case linux.FIOASYNC:
 		var set int32
-		if _, err := t.CopyIn(args[2].Pointer(), &set); err != nil {
+		if _, err := primitive.CopyInt32In(t, args[2].Pointer(), &set); err != nil {
 			return 0, nil, err
 		}
 		flags := file.StatusFlags()
@@ -82,12 +83,12 @@ func Ioctl(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.Syscall
 				who = owner.PID
 			}
 		}
-		_, err := t.CopyOut(args[2].Pointer(), &who)
+		_, err := primitive.CopyInt32Out(t, args[2].Pointer(), who)
 		return 0, nil, err
 
 	case linux.FIOSETOWN, linux.SIOCSPGRP:
 		var who int32
-		if _, err := t.CopyIn(args[2].Pointer(), &who); err != nil {
+		if _, err := primitive.CopyInt32In(t, args[2].Pointer(), &who); err != nil {
 			return 0, nil, err
 		}
 		ownerType := int32(linux.F_OWNER_PID)

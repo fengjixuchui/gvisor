@@ -62,9 +62,13 @@ import (
 const Name = "9p"
 
 // FilesystemType implements vfs.FilesystemType.
+//
+// +stateify savable
 type FilesystemType struct{}
 
 // filesystem implements vfs.FilesystemImpl.
+//
+// +stateify savable
 type filesystem struct {
 	vfsfs vfs.Filesystem
 
@@ -77,7 +81,7 @@ type filesystem struct {
 	iopts InternalFilesystemOptions
 
 	// client is the client used by this filesystem. client is immutable.
-	client *p9.Client
+	client *p9.Client `state:"nosave"` // FIXME(gvisor.dev/issue/1663): not yet supported.
 
 	// clock is a realtime clock used to set timestamps in file operations.
 	clock ktime.Clock
@@ -95,7 +99,7 @@ type filesystem struct {
 	// reference count (such that it is usable as vfs.ResolvingPath.Start() or
 	// is reachable from its children), or if it is a child dentry (such that
 	// it is reachable from its parent).
-	renameMu sync.RWMutex
+	renameMu sync.RWMutex `state:"nosave"`
 
 	// cachedDentries contains all dentries with 0 references. (Due to race
 	// conditions, it may also contain dentries with non-zero references.)
@@ -107,7 +111,7 @@ type filesystem struct {
 	// syncableDentries contains all dentries in this filesystem for which
 	// !dentry.file.isNil(). specialFileFDs contains all open specialFileFDs.
 	// These fields are protected by syncMu.
-	syncMu           sync.Mutex
+	syncMu           sync.Mutex `state:"nosave"`
 	syncableDentries map[*dentry]struct{}
 	specialFileFDs   map[*specialFileFD]struct{}
 
@@ -120,6 +124,8 @@ type filesystem struct {
 // dentries, it comes from QID.Path from the 9P server. Synthetic dentries
 // have have their inodeNumber generated sequentially, with the MSB reserved to
 // prevent conflicts with regular dentries.
+//
+// +stateify savable
 type inodeNumber uint64
 
 // Reserve MSB for synthetic mounts.
@@ -132,6 +138,7 @@ func inoFromPath(path uint64) inodeNumber {
 	return inodeNumber(path &^ syntheticInoMask)
 }
 
+// +stateify savable
 type filesystemOptions struct {
 	// "Standard" 9P options.
 	fd      int
@@ -177,6 +184,8 @@ type filesystemOptions struct {
 
 // InteropMode controls the client's interaction with other remote filesystem
 // users.
+//
+// +stateify savable
 type InteropMode uint32
 
 const (
@@ -195,11 +204,7 @@ const (
 	// and consistent with Linux's semantics (in particular, it is not always
 	// possible for clients to set arbitrary atimes and mtimes depending on the
 	// remote filesystem implementation, and never possible for clients to set
-	// arbitrary ctimes.) If a dentry containing a client-defined atime or
-	// mtime is evicted from cache, client timestamps will be sent to the
-	// remote filesystem on a best-effort basis to attempt to ensure that
-	// timestamps will be preserved when another dentry representing the same
-	// file is instantiated.
+	// arbitrary ctimes.)
 	InteropModeExclusive InteropMode = iota
 
 	// InteropModeWritethrough is appropriate when there are read-only users of
@@ -239,6 +244,8 @@ const (
 
 // InternalFilesystemOptions may be passed as
 // vfs.GetFilesystemOptions.InternalData to FilesystemType.GetFilesystem.
+//
+// +stateify savable
 type InternalFilesystemOptions struct {
 	// If LeakConnection is true, do not close the connection to the server
 	// when the Filesystem is released. This is necessary for deployments in
@@ -538,6 +545,8 @@ func (fs *filesystem) Release(ctx context.Context) {
 }
 
 // dentry implements vfs.DentryImpl.
+//
+// +stateify savable
 type dentry struct {
 	vfsd vfs.Dentry
 
@@ -567,7 +576,7 @@ type dentry struct {
 	// If file.isNil(), this dentry represents a synthetic file, i.e. a file
 	// that does not exist on the remote filesystem. As of this writing, the
 	// only files that can be synthetic are sockets, pipes, and directories.
-	file p9file
+	file p9file `state:"nosave"` // FIXME(gvisor.dev/issue/1663): not yet supported.
 
 	// If deleted is non-zero, the file represented by this dentry has been
 	// deleted. deleted is accessed using atomic memory operations.
@@ -579,7 +588,7 @@ type dentry struct {
 	cached bool
 	dentryEntry
 
-	dirMu sync.Mutex
+	dirMu sync.Mutex `state:"nosave"`
 
 	// If this dentry represents a directory, children contains:
 	//
@@ -611,7 +620,7 @@ type dentry struct {
 	// To mutate:
 	//   - Lock metadataMu and use atomic operations to update because we might
 	//     have atomic readers that don't hold the lock.
-	metadataMu sync.Mutex
+	metadataMu sync.Mutex  `state:"nosave"`
 	ino        inodeNumber // immutable
 	mode       uint32      // type is immutable, perms are mutable
 	uid        uint32      // auth.KUID, but stored as raw uint32 for sync/atomic
@@ -642,7 +651,7 @@ type dentry struct {
 	// other metadata fields.
 	nlink uint32
 
-	mapsMu sync.Mutex
+	mapsMu sync.Mutex `state:"nosave"`
 
 	// If this dentry represents a regular file, mappings tracks mappings of
 	// the file into memmap.MappingSpaces. mappings is protected by mapsMu.
@@ -666,12 +675,12 @@ type dentry struct {
 	// either p9.File transitions from closed (isNil() == true) to open
 	// (isNil() == false), it may be mutated with handleMu locked, but cannot
 	// be closed until the dentry is destroyed.
-	handleMu  sync.RWMutex
-	readFile  p9file
-	writeFile p9file
+	handleMu  sync.RWMutex `state:"nosave"`
+	readFile  p9file       `state:"nosave"` // FIXME(gvisor.dev/issue/1663): not yet supported.
+	writeFile p9file       `state:"nosave"` // FIXME(gvisor.dev/issue/1663): not yet supported.
 	hostFD    int32
 
-	dataMu sync.RWMutex
+	dataMu sync.RWMutex `state:"nosave"`
 
 	// If this dentry represents a regular file that is client-cached, cache
 	// maps offsets into the cached file to offsets into
@@ -837,7 +846,7 @@ func (d *dentry) updateFromP9AttrsLocked(mask p9.AttrMask, attr *p9.Attr) {
 		atomic.StoreUint32(&d.nlink, uint32(attr.NLink))
 	}
 	if mask.Size {
-		d.updateFileSizeLocked(attr.Size)
+		d.updateSizeLocked(attr.Size)
 	}
 }
 
@@ -991,7 +1000,7 @@ func (d *dentry) setStat(ctx context.Context, creds *auth.Credentials, opts *vfs
 				// d.size should be kept up to date, and privatized
 				// copy-on-write mappings of truncated pages need to be
 				// invalidated, even if InteropModeShared is in effect.
-				d.updateFileSizeLocked(stat.Size)
+				d.updateSizeLocked(stat.Size)
 			}
 		}
 		if d.fs.opts.interop == InteropModeShared {
@@ -1028,8 +1037,31 @@ func (d *dentry) setStat(ctx context.Context, creds *auth.Credentials, opts *vfs
 	return nil
 }
 
+// doAllocate performs an allocate operation on d. Note that d.metadataMu will
+// be held when allocate is called.
+func (d *dentry) doAllocate(ctx context.Context, offset, length uint64, allocate func() error) error {
+	d.metadataMu.Lock()
+	defer d.metadataMu.Unlock()
+
+	// Allocating a smaller size is a noop.
+	size := offset + length
+	if d.cachedMetadataAuthoritative() && size <= d.size {
+		return nil
+	}
+
+	err := allocate()
+	if err != nil {
+		return err
+	}
+	d.updateSizeLocked(size)
+	if d.cachedMetadataAuthoritative() {
+		d.touchCMtimeLocked()
+	}
+	return nil
+}
+
 // Preconditions: d.metadataMu must be locked.
-func (d *dentry) updateFileSizeLocked(newSize uint64) {
+func (d *dentry) updateSizeLocked(newSize uint64) {
 	d.dataMu.Lock()
 	oldSize := d.size
 	atomic.StoreUint64(&d.size, newSize)
@@ -1065,6 +1097,21 @@ func (d *dentry) updateFileSizeLocked(newSize uint64) {
 
 func (d *dentry) checkPermissions(creds *auth.Credentials, ats vfs.AccessTypes) error {
 	return vfs.GenericCheckPermissions(creds, ats, linux.FileMode(atomic.LoadUint32(&d.mode)), auth.KUID(atomic.LoadUint32(&d.uid)), auth.KGID(atomic.LoadUint32(&d.gid)))
+}
+
+func (d *dentry) checkXattrPermissions(creds *auth.Credentials, name string, ats vfs.AccessTypes) error {
+	// We only support xattrs prefixed with "user." (see b/148380782). Currently,
+	// there is no need to expose any other xattrs through a gofer.
+	if !strings.HasPrefix(name, linux.XATTR_USER_PREFIX) {
+		return syserror.EOPNOTSUPP
+	}
+	mode := linux.FileMode(atomic.LoadUint32(&d.mode))
+	kuid := auth.KUID(atomic.LoadUint32(&d.uid))
+	kgid := auth.KGID(atomic.LoadUint32(&d.gid))
+	if err := vfs.GenericCheckPermissions(creds, ats, mode, kuid, kgid); err != nil {
+		return err
+	}
+	return vfs.CheckXattrPermissions(creds, ats, mode, kuid, name)
 }
 
 func (d *dentry) mayDelete(creds *auth.Credentials, child *dentry) error {
@@ -1300,30 +1347,19 @@ func (d *dentry) destroyLocked(ctx context.Context) {
 	d.handleMu.Unlock()
 
 	if !d.file.isNil() {
-		if !d.isDeleted() {
-			// Write dirty timestamps back to the remote filesystem.
-			atimeDirty := atomic.LoadUint32(&d.atimeDirty) != 0
-			mtimeDirty := atomic.LoadUint32(&d.mtimeDirty) != 0
-			if atimeDirty || mtimeDirty {
-				atime := atomic.LoadInt64(&d.atime)
-				mtime := atomic.LoadInt64(&d.mtime)
-				if err := d.file.setAttr(ctx, p9.SetAttrMask{
-					ATime:              atimeDirty,
-					ATimeNotSystemTime: atimeDirty,
-					MTime:              mtimeDirty,
-					MTimeNotSystemTime: mtimeDirty,
-				}, p9.SetAttr{
-					ATimeSeconds:     uint64(atime / 1e9),
-					ATimeNanoSeconds: uint64(atime % 1e9),
-					MTimeSeconds:     uint64(mtime / 1e9),
-					MTimeNanoSeconds: uint64(mtime % 1e9),
-				}); err != nil {
-					log.Warningf("gofer.dentry.destroyLocked: failed to write dirty timestamps back: %v", err)
-				}
-			}
+		// Note that it's possible that d.atimeDirty or d.mtimeDirty are true,
+		// i.e. client and server timestamps may differ (because e.g. a client
+		// write was serviced by the page cache, and only written back to the
+		// remote file later). Ideally, we'd write client timestamps back to
+		// the remote filesystem so that timestamps for a new dentry
+		// instantiated for the same file would remain coherent. Unfortunately,
+		// this turns out to be too expensive in many cases, so for now we
+		// don't do this.
+		if err := d.file.close(ctx); err != nil {
+			log.Warningf("gofer.dentry.destroyLocked: failed to close file: %v", err)
 		}
-		d.file.close(ctx)
 		d.file = p9file{}
+
 		// Remove d from the set of syncable dentries.
 		d.fs.syncMu.Lock()
 		delete(d.fs.syncableDentries, d)
@@ -1351,9 +1387,7 @@ func (d *dentry) setDeleted() {
 	atomic.StoreUint32(&d.deleted, 1)
 }
 
-// We only support xattrs prefixed with "user." (see b/148380782). Currently,
-// there is no need to expose any other xattrs through a gofer.
-func (d *dentry) listxattr(ctx context.Context, creds *auth.Credentials, size uint64) ([]string, error) {
+func (d *dentry) listXattr(ctx context.Context, creds *auth.Credentials, size uint64) ([]string, error) {
 	if d.file.isNil() || !d.userXattrSupported() {
 		return nil, nil
 	}
@@ -1363,6 +1397,7 @@ func (d *dentry) listxattr(ctx context.Context, creds *auth.Credentials, size ui
 	}
 	xattrs := make([]string, 0, len(xattrMap))
 	for x := range xattrMap {
+		// We only support xattrs in the user.* namespace.
 		if strings.HasPrefix(x, linux.XATTR_USER_PREFIX) {
 			xattrs = append(xattrs, x)
 		}
@@ -1370,50 +1405,32 @@ func (d *dentry) listxattr(ctx context.Context, creds *auth.Credentials, size ui
 	return xattrs, nil
 }
 
-func (d *dentry) getxattr(ctx context.Context, creds *auth.Credentials, opts *vfs.GetxattrOptions) (string, error) {
+func (d *dentry) getXattr(ctx context.Context, creds *auth.Credentials, opts *vfs.GetXattrOptions) (string, error) {
 	if d.file.isNil() {
 		return "", syserror.ENODATA
 	}
-	if err := d.checkPermissions(creds, vfs.MayRead); err != nil {
+	if err := d.checkXattrPermissions(creds, opts.Name, vfs.MayRead); err != nil {
 		return "", err
-	}
-	if !strings.HasPrefix(opts.Name, linux.XATTR_USER_PREFIX) {
-		return "", syserror.EOPNOTSUPP
-	}
-	if !d.userXattrSupported() {
-		return "", syserror.ENODATA
 	}
 	return d.file.getXattr(ctx, opts.Name, opts.Size)
 }
 
-func (d *dentry) setxattr(ctx context.Context, creds *auth.Credentials, opts *vfs.SetxattrOptions) error {
+func (d *dentry) setXattr(ctx context.Context, creds *auth.Credentials, opts *vfs.SetXattrOptions) error {
 	if d.file.isNil() {
 		return syserror.EPERM
 	}
-	if err := d.checkPermissions(creds, vfs.MayWrite); err != nil {
+	if err := d.checkXattrPermissions(creds, opts.Name, vfs.MayWrite); err != nil {
 		return err
-	}
-	if !strings.HasPrefix(opts.Name, linux.XATTR_USER_PREFIX) {
-		return syserror.EOPNOTSUPP
-	}
-	if !d.userXattrSupported() {
-		return syserror.EPERM
 	}
 	return d.file.setXattr(ctx, opts.Name, opts.Value, opts.Flags)
 }
 
-func (d *dentry) removexattr(ctx context.Context, creds *auth.Credentials, name string) error {
+func (d *dentry) removeXattr(ctx context.Context, creds *auth.Credentials, name string) error {
 	if d.file.isNil() {
 		return syserror.EPERM
 	}
-	if err := d.checkPermissions(creds, vfs.MayWrite); err != nil {
+	if err := d.checkXattrPermissions(creds, name, vfs.MayWrite); err != nil {
 		return err
-	}
-	if !strings.HasPrefix(name, linux.XATTR_USER_PREFIX) {
-		return syserror.EOPNOTSUPP
-	}
-	if !d.userXattrSupported() {
-		return syserror.EPERM
 	}
 	return d.file.removeXattr(ctx, name)
 }
@@ -1472,8 +1489,9 @@ func (d *dentry) ensureSharedHandle(ctx context.Context, read, write, trunc bool
 			return err
 		}
 
-		if d.hostFD < 0 && openReadable && h.fd >= 0 {
-			// We have no existing FD; use the new FD for at least reading.
+		if d.hostFD < 0 && h.fd >= 0 && openReadable && (d.writeFile.isNil() || openWritable) {
+			// We have no existing FD, and the new FD meets the requirements
+			// for d.hostFD, so start using it.
 			d.hostFD = h.fd
 		} else if d.hostFD >= 0 && d.writeFile.isNil() && openWritable {
 			// We have an existing read-only FD, but the file has just been
@@ -1622,12 +1640,14 @@ func (d *dentry) decLinks() {
 
 // fileDescription is embedded by gofer implementations of
 // vfs.FileDescriptionImpl.
+//
+// +stateify savable
 type fileDescription struct {
 	vfsfd vfs.FileDescription
 	vfs.FileDescriptionDefaultImpl
 	vfs.LockFD
 
-	lockLogging sync.Once
+	lockLogging sync.Once `state:"nosave"` // FIXME(gvisor.dev/issue/1663): not yet supported.
 }
 
 func (fd *fileDescription) filesystem() *filesystem {
@@ -1665,30 +1685,30 @@ func (fd *fileDescription) SetStat(ctx context.Context, opts vfs.SetStatOptions)
 	return nil
 }
 
-// Listxattr implements vfs.FileDescriptionImpl.Listxattr.
-func (fd *fileDescription) Listxattr(ctx context.Context, size uint64) ([]string, error) {
-	return fd.dentry().listxattr(ctx, auth.CredentialsFromContext(ctx), size)
+// ListXattr implements vfs.FileDescriptionImpl.ListXattr.
+func (fd *fileDescription) ListXattr(ctx context.Context, size uint64) ([]string, error) {
+	return fd.dentry().listXattr(ctx, auth.CredentialsFromContext(ctx), size)
 }
 
-// Getxattr implements vfs.FileDescriptionImpl.Getxattr.
-func (fd *fileDescription) Getxattr(ctx context.Context, opts vfs.GetxattrOptions) (string, error) {
-	return fd.dentry().getxattr(ctx, auth.CredentialsFromContext(ctx), &opts)
+// GetXattr implements vfs.FileDescriptionImpl.GetXattr.
+func (fd *fileDescription) GetXattr(ctx context.Context, opts vfs.GetXattrOptions) (string, error) {
+	return fd.dentry().getXattr(ctx, auth.CredentialsFromContext(ctx), &opts)
 }
 
-// Setxattr implements vfs.FileDescriptionImpl.Setxattr.
-func (fd *fileDescription) Setxattr(ctx context.Context, opts vfs.SetxattrOptions) error {
+// SetXattr implements vfs.FileDescriptionImpl.SetXattr.
+func (fd *fileDescription) SetXattr(ctx context.Context, opts vfs.SetXattrOptions) error {
 	d := fd.dentry()
-	if err := d.setxattr(ctx, auth.CredentialsFromContext(ctx), &opts); err != nil {
+	if err := d.setXattr(ctx, auth.CredentialsFromContext(ctx), &opts); err != nil {
 		return err
 	}
 	d.InotifyWithParent(ctx, linux.IN_ATTRIB, 0, vfs.InodeEvent)
 	return nil
 }
 
-// Removexattr implements vfs.FileDescriptionImpl.Removexattr.
-func (fd *fileDescription) Removexattr(ctx context.Context, name string) error {
+// RemoveXattr implements vfs.FileDescriptionImpl.RemoveXattr.
+func (fd *fileDescription) RemoveXattr(ctx context.Context, name string) error {
 	d := fd.dentry()
-	if err := d.removexattr(ctx, auth.CredentialsFromContext(ctx), name); err != nil {
+	if err := d.removeXattr(ctx, auth.CredentialsFromContext(ctx), name); err != nil {
 		return err
 	}
 	d.InotifyWithParent(ctx, linux.IN_ATTRIB, 0, vfs.InodeEvent)

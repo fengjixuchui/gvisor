@@ -17,9 +17,11 @@ package tty
 import (
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/context"
+	"gvisor.dev/gvisor/pkg/marshal/primitive"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
 	"gvisor.dev/gvisor/pkg/sentry/fs"
 	"gvisor.dev/gvisor/pkg/sentry/fs/fsutil"
+	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/syserror"
 	"gvisor.dev/gvisor/pkg/usermem"
 	"gvisor.dev/gvisor/pkg/waiter"
@@ -27,11 +29,11 @@ import (
 
 // LINT.IfChange
 
-// slaveInodeOperations are the fs.InodeOperations for the slave end of the
+// replicaInodeOperations are the fs.InodeOperations for the replica end of the
 // Terminal (pts file).
 //
 // +stateify savable
-type slaveInodeOperations struct {
+type replicaInodeOperations struct {
 	fsutil.SimpleFileInode
 
 	// d is the containing dir.
@@ -41,13 +43,13 @@ type slaveInodeOperations struct {
 	t *Terminal
 }
 
-var _ fs.InodeOperations = (*slaveInodeOperations)(nil)
+var _ fs.InodeOperations = (*replicaInodeOperations)(nil)
 
-// newSlaveInode creates an fs.Inode for the slave end of a terminal.
+// newReplicaInode creates an fs.Inode for the replica end of a terminal.
 //
-// newSlaveInode takes ownership of t.
-func newSlaveInode(ctx context.Context, d *dirInodeOperations, t *Terminal, owner fs.FileOwner, p fs.FilePermissions) *fs.Inode {
-	iops := &slaveInodeOperations{
+// newReplicaInode takes ownership of t.
+func newReplicaInode(ctx context.Context, d *dirInodeOperations, t *Terminal, owner fs.FileOwner, p fs.FilePermissions) *fs.Inode {
+	iops := &replicaInodeOperations{
 		SimpleFileInode: *fsutil.NewSimpleFileInode(ctx, owner, p, linux.DEVPTS_SUPER_MAGIC),
 		d:               d,
 		t:               t,
@@ -64,18 +66,18 @@ func newSlaveInode(ctx context.Context, d *dirInodeOperations, t *Terminal, owne
 		Type:    fs.CharacterDevice,
 		// See fs/devpts/inode.c:devpts_fill_super.
 		BlockSize:       1024,
-		DeviceFileMajor: linux.UNIX98_PTY_SLAVE_MAJOR,
+		DeviceFileMajor: linux.UNIX98_PTY_REPLICA_MAJOR,
 		DeviceFileMinor: t.n,
 	})
 }
 
 // Release implements fs.InodeOperations.Release.
-func (si *slaveInodeOperations) Release(ctx context.Context) {
+func (si *replicaInodeOperations) Release(ctx context.Context) {
 	si.t.DecRef(ctx)
 }
 
 // Truncate implements fs.InodeOperations.Truncate.
-func (*slaveInodeOperations) Truncate(context.Context, *fs.Inode, int64) error {
+func (*replicaInodeOperations) Truncate(context.Context, *fs.Inode, int64) error {
 	return nil
 }
 
@@ -83,14 +85,15 @@ func (*slaveInodeOperations) Truncate(context.Context, *fs.Inode, int64) error {
 //
 // This may race with destruction of the terminal. If the terminal is gone, it
 // returns ENOENT.
-func (si *slaveInodeOperations) GetFile(ctx context.Context, d *fs.Dirent, flags fs.FileFlags) (*fs.File, error) {
-	return fs.NewFile(ctx, d, flags, &slaveFileOperations{si: si}), nil
+func (si *replicaInodeOperations) GetFile(ctx context.Context, d *fs.Dirent, flags fs.FileFlags) (*fs.File, error) {
+	return fs.NewFile(ctx, d, flags, &replicaFileOperations{si: si}), nil
 }
 
-// slaveFileOperations are the fs.FileOperations for the slave end of a terminal.
+// replicaFileOperations are the fs.FileOperations for the replica end of a
+// terminal.
 //
 // +stateify savable
-type slaveFileOperations struct {
+type replicaFileOperations struct {
 	fsutil.FilePipeSeek             `state:"nosave"`
 	fsutil.FileNotDirReaddir        `state:"nosave"`
 	fsutil.FileNoFsync              `state:"nosave"`
@@ -100,79 +103,84 @@ type slaveFileOperations struct {
 	fsutil.FileUseInodeUnstableAttr `state:"nosave"`
 
 	// si is the inode operations.
-	si *slaveInodeOperations
+	si *replicaInodeOperations
 }
 
-var _ fs.FileOperations = (*slaveFileOperations)(nil)
+var _ fs.FileOperations = (*replicaFileOperations)(nil)
 
 // Release implements fs.FileOperations.Release.
-func (sf *slaveFileOperations) Release(context.Context) {
+func (sf *replicaFileOperations) Release(context.Context) {
 }
 
 // EventRegister implements waiter.Waitable.EventRegister.
-func (sf *slaveFileOperations) EventRegister(e *waiter.Entry, mask waiter.EventMask) {
-	sf.si.t.ld.slaveWaiter.EventRegister(e, mask)
+func (sf *replicaFileOperations) EventRegister(e *waiter.Entry, mask waiter.EventMask) {
+	sf.si.t.ld.replicaWaiter.EventRegister(e, mask)
 }
 
 // EventUnregister implements waiter.Waitable.EventUnregister.
-func (sf *slaveFileOperations) EventUnregister(e *waiter.Entry) {
-	sf.si.t.ld.slaveWaiter.EventUnregister(e)
+func (sf *replicaFileOperations) EventUnregister(e *waiter.Entry) {
+	sf.si.t.ld.replicaWaiter.EventUnregister(e)
 }
 
 // Readiness implements waiter.Waitable.Readiness.
-func (sf *slaveFileOperations) Readiness(mask waiter.EventMask) waiter.EventMask {
-	return sf.si.t.ld.slaveReadiness()
+func (sf *replicaFileOperations) Readiness(mask waiter.EventMask) waiter.EventMask {
+	return sf.si.t.ld.replicaReadiness()
 }
 
 // Read implements fs.FileOperations.Read.
-func (sf *slaveFileOperations) Read(ctx context.Context, _ *fs.File, dst usermem.IOSequence, _ int64) (int64, error) {
+func (sf *replicaFileOperations) Read(ctx context.Context, _ *fs.File, dst usermem.IOSequence, _ int64) (int64, error) {
 	return sf.si.t.ld.inputQueueRead(ctx, dst)
 }
 
 // Write implements fs.FileOperations.Write.
-func (sf *slaveFileOperations) Write(ctx context.Context, _ *fs.File, src usermem.IOSequence, _ int64) (int64, error) {
+func (sf *replicaFileOperations) Write(ctx context.Context, _ *fs.File, src usermem.IOSequence, _ int64) (int64, error) {
 	return sf.si.t.ld.outputQueueWrite(ctx, src)
 }
 
 // Ioctl implements fs.FileOperations.Ioctl.
-func (sf *slaveFileOperations) Ioctl(ctx context.Context, _ *fs.File, io usermem.IO, args arch.SyscallArguments) (uintptr, error) {
+func (sf *replicaFileOperations) Ioctl(ctx context.Context, _ *fs.File, io usermem.IO, args arch.SyscallArguments) (uintptr, error) {
+	t := kernel.TaskFromContext(ctx)
+	if t == nil {
+		// ioctl(2) may only be called from a task goroutine.
+		return 0, syserror.ENOTTY
+	}
+
 	switch cmd := args[1].Uint(); cmd {
 	case linux.FIONREAD: // linux.FIONREAD == linux.TIOCINQ
 		// Get the number of bytes in the input queue read buffer.
-		return 0, sf.si.t.ld.inputQueueReadSize(ctx, io, args)
+		return 0, sf.si.t.ld.inputQueueReadSize(t, args)
 	case linux.TCGETS:
-		return sf.si.t.ld.getTermios(ctx, io, args)
+		return sf.si.t.ld.getTermios(t, args)
 	case linux.TCSETS:
-		return sf.si.t.ld.setTermios(ctx, io, args)
+		return sf.si.t.ld.setTermios(t, args)
 	case linux.TCSETSW:
 		// TODO(b/29356795): This should drain the output queue first.
-		return sf.si.t.ld.setTermios(ctx, io, args)
+		return sf.si.t.ld.setTermios(t, args)
 	case linux.TIOCGPTN:
-		_, err := usermem.CopyObjectOut(ctx, io, args[2].Pointer(), uint32(sf.si.t.n), usermem.IOOpts{
-			AddressSpaceActive: true,
-		})
+		nP := primitive.Uint32(sf.si.t.n)
+		_, err := nP.CopyOut(t, args[2].Pointer())
 		return 0, err
 	case linux.TIOCGWINSZ:
-		return 0, sf.si.t.ld.windowSize(ctx, io, args)
+		return 0, sf.si.t.ld.windowSize(t, args)
 	case linux.TIOCSWINSZ:
-		return 0, sf.si.t.ld.setWindowSize(ctx, io, args)
+		return 0, sf.si.t.ld.setWindowSize(t, args)
 	case linux.TIOCSCTTY:
 		// Make the given terminal the controlling terminal of the
 		// calling process.
-		return 0, sf.si.t.setControllingTTY(ctx, io, args, false /* isMaster */)
+		return 0, sf.si.t.setControllingTTY(ctx, args, false /* isMaster */)
 	case linux.TIOCNOTTY:
 		// Release this process's controlling terminal.
-		return 0, sf.si.t.releaseControllingTTY(ctx, io, args, false /* isMaster */)
+		return 0, sf.si.t.releaseControllingTTY(ctx, args, false /* isMaster */)
 	case linux.TIOCGPGRP:
 		// Get the foreground process group.
-		return sf.si.t.foregroundProcessGroup(ctx, io, args, false /* isMaster */)
+		return sf.si.t.foregroundProcessGroup(ctx, args, false /* isMaster */)
 	case linux.TIOCSPGRP:
 		// Set the foreground process group.
-		return sf.si.t.setForegroundProcessGroup(ctx, io, args, false /* isMaster */)
+		return sf.si.t.setForegroundProcessGroup(ctx, args, false /* isMaster */)
 	default:
 		maybeEmitUnimplementedEvent(ctx, cmd)
 		return 0, syserror.ENOTTY
 	}
 }
 
-// LINT.ThenChange(../../fsimpl/devpts/slave.go)
+// LINT.ThenChange(../../fsimpl/devpts/replica.go)

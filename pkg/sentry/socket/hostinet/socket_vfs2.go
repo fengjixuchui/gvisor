@@ -52,6 +52,7 @@ var _ = socket.SocketVFS2(&socketVFS2{})
 func newVFS2Socket(t *kernel.Task, family int, stype linux.SockType, protocol int, fd int, flags uint32) (*vfs.FileDescription, *syserr.Error) {
 	mnt := t.Kernel().SocketMount()
 	d := sockfs.NewDentry(t.Credentials(), mnt)
+	defer d.DecRef(t)
 
 	s := &socketVFS2{
 		socketOpsCommon: socketOpsCommon{
@@ -77,6 +78,13 @@ func newVFS2Socket(t *kernel.Task, family int, stype linux.SockType, protocol in
 	return vfsfd, nil
 }
 
+// Release implements vfs.FileDescriptionImpl.Release.
+func (s *socketVFS2) Release(ctx context.Context) {
+	t := kernel.TaskFromContext(ctx)
+	t.Kernel().DeleteSocketVFS2(&s.vfsfd)
+	s.socketOpsCommon.Release(ctx)
+}
+
 // Readiness implements waiter.Waitable.Readiness.
 func (s *socketVFS2) Readiness(mask waiter.EventMask) waiter.EventMask {
 	return s.socketOpsCommon.Readiness(mask)
@@ -95,11 +103,6 @@ func (s *socketVFS2) EventUnregister(e *waiter.Entry) {
 // Ioctl implements vfs.FileDescriptionImpl.
 func (s *socketVFS2) Ioctl(ctx context.Context, uio usermem.IO, args arch.SyscallArguments) (uintptr, error) {
 	return ioctl(ctx, s.fd, uio, args)
-}
-
-// Allocate implements vfs.FileDescriptionImpl.Allocate.
-func (s *socketVFS2) Allocate(ctx context.Context, mode, offset, length uint64) error {
-	return syserror.ENODEV
 }
 
 // PRead implements vfs.FileDescriptionImpl.PRead.

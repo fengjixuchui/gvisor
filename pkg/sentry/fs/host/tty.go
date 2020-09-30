@@ -17,6 +17,7 @@ package host
 import (
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/context"
+	"gvisor.dev/gvisor/pkg/marshal/primitive"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
 	"gvisor.dev/gvisor/pkg/sentry/fs"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
@@ -24,7 +25,6 @@ import (
 	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/syserror"
 	"gvisor.dev/gvisor/pkg/usermem"
-	"gvisor.dev/gvisor/tools/go_marshal/primitive"
 )
 
 // LINT.IfChange
@@ -54,7 +54,7 @@ type TTYFileOperations struct {
 func newTTYFile(ctx context.Context, dirent *fs.Dirent, flags fs.FileFlags, iops *inodeOperations) *fs.File {
 	return fs.NewFile(ctx, dirent, flags, &TTYFileOperations{
 		fileOperations: fileOperations{iops: iops},
-		termios:        linux.DefaultSlaveTermios,
+		termios:        linux.DefaultReplicaTermios,
 	})
 }
 
