@@ -55,7 +55,7 @@ var _ = socket.SocketVFS2(&SocketVFS2{})
 // returns a corresponding file description.
 func NewSockfsFile(t *kernel.Task, ep transport.Endpoint, stype linux.SockType) (*vfs.FileDescription, *syserr.Error) {
 	mnt := t.Kernel().SocketMount()
-	d := sockfs.NewDentry(t.Credentials(), mnt)
+	d := sockfs.NewDentry(t, mnt)
 	defer d.DecRef(t)
 
 	fd, err := NewFileDescription(ep, stype, linux.O_RDWR, mnt, d, &vfs.FileLocks{})
@@ -80,6 +80,7 @@ func NewFileDescription(ep transport.Endpoint, stype linux.SockType, flags uint3
 			stype: stype,
 		},
 	}
+	sock.EnableLeakCheck()
 	sock.LockFD.Init(locks)
 	vfsfd := &sock.vfsfd
 	if err := vfsfd.Init(sock, flags, mnt, d, &vfs.FileDescriptionOptions{
@@ -267,13 +268,17 @@ func (s *SocketVFS2) Read(ctx context.Context, dst usermem.IOSequence, opts vfs.
 	if dst.NumBytes() == 0 {
 		return 0, nil
 	}
-	return dst.CopyOutFrom(ctx, &EndpointReader{
+	r := &EndpointReader{
 		Ctx:       ctx,
 		Endpoint:  s.ep,
 		NumRights: 0,
 		Peek:      false,
 		From:      nil,
-	})
+	}
+	n, err := dst.CopyOutFrom(ctx, r)
+	// Drop control messages.
+	r.Control.Release(ctx)
+	return n, err
 }
 
 // PWrite implements vfs.FileDescriptionImpl.

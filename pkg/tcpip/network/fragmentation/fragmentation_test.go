@@ -20,9 +20,15 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/go-cmp/cmp"
 	"gvisor.dev/gvisor/pkg/tcpip/buffer"
 	"gvisor.dev/gvisor/pkg/tcpip/faketime"
+	"gvisor.dev/gvisor/pkg/tcpip/network/testutil"
 )
+
+// reassembleTimeout is dummy timeout used for testing, where the clock never
+// advances.
+const reassembleTimeout = 1
 
 // vv is a helper to build VectorisedView from different strings.
 func vv(size int, pieces ...string) buffer.VectorisedView {
@@ -96,7 +102,7 @@ var processTestCases = []struct {
 func TestFragmentationProcess(t *testing.T) {
 	for _, c := range processTestCases {
 		t.Run(c.comment, func(t *testing.T) {
-			f := NewFragmentation(minBlockSize, 1024, 512, DefaultReassembleTimeout, &faketime.NullClock{})
+			f := NewFragmentation(minBlockSize, 1024, 512, reassembleTimeout, &faketime.NullClock{})
 			firstFragmentProto := c.in[0].proto
 			for i, in := range c.in {
 				vv, proto, done, err := f.Process(in.id, in.first, in.last, in.more, in.proto, in.vv)
@@ -251,7 +257,7 @@ func TestReassemblingTimeout(t *testing.T) {
 }
 
 func TestMemoryLimits(t *testing.T) {
-	f := NewFragmentation(minBlockSize, 3, 1, DefaultReassembleTimeout, &faketime.NullClock{})
+	f := NewFragmentation(minBlockSize, 3, 1, reassembleTimeout, &faketime.NullClock{})
 	// Send first fragment with id = 0.
 	f.Process(FragmentID{ID: 0}, 0, 0, true, 0xFF, vv(1, "0"))
 	// Send first fragment with id = 1.
@@ -275,7 +281,7 @@ func TestMemoryLimits(t *testing.T) {
 }
 
 func TestMemoryLimitsIgnoresDuplicates(t *testing.T) {
-	f := NewFragmentation(minBlockSize, 1, 0, DefaultReassembleTimeout, &faketime.NullClock{})
+	f := NewFragmentation(minBlockSize, 1, 0, reassembleTimeout, &faketime.NullClock{})
 	// Send first fragment with id = 0.
 	f.Process(FragmentID{}, 0, 0, true, 0xFF, vv(1, "0"))
 	// Send the same packet again.
@@ -370,13 +376,123 @@ func TestErrors(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			f := NewFragmentation(test.blockSize, HighFragThreshold, LowFragThreshold, DefaultReassembleTimeout, &faketime.NullClock{})
+			f := NewFragmentation(test.blockSize, HighFragThreshold, LowFragThreshold, reassembleTimeout, &faketime.NullClock{})
 			_, _, done, err := f.Process(FragmentID{}, test.first, test.last, test.more, 0, vv(len(test.data), test.data))
 			if !errors.Is(err, test.err) {
 				t.Errorf("got Process(_, %d, %d, %t, _, %q) = (_, _, _, %v), want = (_, _, _, %v)", test.first, test.last, test.more, test.data, err, test.err)
 			}
 			if done {
 				t.Errorf("got Process(_, %d, %d, %t, _, %q) = (_, _, true, _), want = (_, _, false, _)", test.first, test.last, test.more, test.data)
+			}
+		})
+	}
+}
+
+type fragmentInfo struct {
+	remaining int
+	copied    int
+	offset    int
+	more      bool
+}
+
+func TestPacketFragmenter(t *testing.T) {
+	const (
+		reserve = 60
+		proto   = 0
+	)
+
+	tests := []struct {
+		name               string
+		fragmentPayloadLen uint32
+		transportHeaderLen int
+		payloadSize        int
+		wantFragments      []fragmentInfo
+	}{
+		{
+			name:               "Packet exactly fits in MTU",
+			fragmentPayloadLen: 1280,
+			transportHeaderLen: 0,
+			payloadSize:        1280,
+			wantFragments: []fragmentInfo{
+				{remaining: 0, copied: 1280, offset: 0, more: false},
+			},
+		},
+		{
+			name:               "Packet exactly does not fit in MTU",
+			fragmentPayloadLen: 1000,
+			transportHeaderLen: 0,
+			payloadSize:        1001,
+			wantFragments: []fragmentInfo{
+				{remaining: 1, copied: 1000, offset: 0, more: true},
+				{remaining: 0, copied: 1, offset: 1000, more: false},
+			},
+		},
+		{
+			name:               "Packet has a transport header",
+			fragmentPayloadLen: 560,
+			transportHeaderLen: 40,
+			payloadSize:        560,
+			wantFragments: []fragmentInfo{
+				{remaining: 1, copied: 560, offset: 0, more: true},
+				{remaining: 0, copied: 40, offset: 560, more: false},
+			},
+		},
+		{
+			name:               "Packet has a huge transport header",
+			fragmentPayloadLen: 500,
+			transportHeaderLen: 1300,
+			payloadSize:        500,
+			wantFragments: []fragmentInfo{
+				{remaining: 3, copied: 500, offset: 0, more: true},
+				{remaining: 2, copied: 500, offset: 500, more: true},
+				{remaining: 1, copied: 500, offset: 1000, more: true},
+				{remaining: 0, copied: 300, offset: 1500, more: false},
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			pkt := testutil.MakeRandPkt(test.transportHeaderLen, reserve, []int{test.payloadSize}, proto)
+			var originalPayload buffer.VectorisedView
+			originalPayload.AppendView(pkt.TransportHeader().View())
+			originalPayload.Append(pkt.Data)
+			var reassembledPayload buffer.VectorisedView
+			pf := MakePacketFragmenter(pkt, test.fragmentPayloadLen, reserve)
+			for i := 0; ; i++ {
+				fragPkt, offset, copied, more := pf.BuildNextFragment()
+				wantFragment := test.wantFragments[i]
+				if got := pf.RemainingFragmentCount(); got != wantFragment.remaining {
+					t.Errorf("(fragment #%d) got pf.RemainingFragmentCount() = %d, want = %d", i, got, wantFragment.remaining)
+				}
+				if copied != wantFragment.copied {
+					t.Errorf("(fragment #%d) got copied = %d, want = %d", i, copied, wantFragment.copied)
+				}
+				if offset != wantFragment.offset {
+					t.Errorf("(fragment #%d) got offset = %d, want = %d", i, offset, wantFragment.offset)
+				}
+				if more != wantFragment.more {
+					t.Errorf("(fragment #%d) got more = %t, want = %t", i, more, wantFragment.more)
+				}
+				if got := uint32(fragPkt.Size()); got > test.fragmentPayloadLen {
+					t.Errorf("(fragment #%d) got fragPkt.Size() = %d, want <= %d", i, got, test.fragmentPayloadLen)
+				}
+				if got := fragPkt.AvailableHeaderBytes(); got != reserve {
+					t.Errorf("(fragment #%d) got fragPkt.AvailableHeaderBytes() = %d, want = %d", i, got, reserve)
+				}
+				if got := fragPkt.TransportHeader().View().Size(); got != 0 {
+					t.Errorf("(fragment #%d) got fragPkt.TransportHeader().View().Size() = %d, want = 0", i, got)
+				}
+				reassembledPayload.Append(fragPkt.Data)
+				if !more {
+					if i != len(test.wantFragments)-1 {
+						t.Errorf("got fragment count = %d, want = %d", i, len(test.wantFragments)-1)
+					}
+					break
+				}
+			}
+			if diff := cmp.Diff(reassembledPayload.ToView(), originalPayload.ToView()); diff != "" {
+				t.Errorf("reassembledPayload mismatch (-want +got):\n%s", diff)
 			}
 		})
 	}

@@ -47,6 +47,9 @@ func init() {
 	registerTargetMaker(&redirectTargetMaker{
 		NetworkProtocol: header.IPv4ProtocolNumber,
 	})
+	registerTargetMaker(&nfNATTargetMaker{
+		NetworkProtocol: header.IPv6ProtocolNumber,
+	})
 }
 
 type standardTargetMaker struct {
@@ -194,11 +197,9 @@ func (*redirectTargetMaker) marshal(target stack.Target) []byte {
 
 	ret := make([]byte, 0, linux.SizeOfXTRedirectTarget)
 	xt.NfRange.RangeSize = 1
-	if rt.RangeProtoSpecified {
-		xt.NfRange.RangeIPV4.Flags |= linux.NF_NAT_RANGE_PROTO_SPECIFIED
-	}
-	xt.NfRange.RangeIPV4.MinPort = htons(rt.MinPort)
-	xt.NfRange.RangeIPV4.MaxPort = htons(rt.MaxPort)
+	xt.NfRange.RangeIPV4.Flags |= linux.NF_NAT_RANGE_PROTO_SPECIFIED
+	xt.NfRange.RangeIPV4.MinPort = htons(rt.Port)
+	xt.NfRange.RangeIPV4.MaxPort = xt.NfRange.RangeIPV4.MinPort
 	return binary.Marshal(ret, usermem.ByteOrder, xt)
 }
 
@@ -231,23 +232,103 @@ func (*redirectTargetMaker) unmarshal(buf []byte, filter stack.IPHeaderFilter) (
 	// Also check if we need to map ports or IP.
 	// For now, redirect target only supports destination port change.
 	// Port range and IP range are not supported yet.
-	if nfRange.RangeIPV4.Flags&linux.NF_NAT_RANGE_PROTO_SPECIFIED == 0 {
+	if nfRange.RangeIPV4.Flags != linux.NF_NAT_RANGE_PROTO_SPECIFIED {
 		nflog("redirectTargetMaker: invalid range flags %d", nfRange.RangeIPV4.Flags)
 		return nil, syserr.ErrInvalidArgument
 	}
-	target.RangeProtoSpecified = true
-
-	target.MinIP = tcpip.Address(nfRange.RangeIPV4.MinIP[:])
-	target.MaxIP = tcpip.Address(nfRange.RangeIPV4.MaxIP[:])
 
 	// TODO(gvisor.dev/issue/170): Port range is not supported yet.
 	if nfRange.RangeIPV4.MinPort != nfRange.RangeIPV4.MaxPort {
 		nflog("redirectTargetMaker: MinPort != MaxPort (%d, %d)", nfRange.RangeIPV4.MinPort, nfRange.RangeIPV4.MaxPort)
 		return nil, syserr.ErrInvalidArgument
 	}
+	if nfRange.RangeIPV4.MinIP != nfRange.RangeIPV4.MaxIP {
+		nflog("redirectTargetMaker: MinIP != MaxIP (%d, %d)", nfRange.RangeIPV4.MinPort, nfRange.RangeIPV4.MaxPort)
+		return nil, syserr.ErrInvalidArgument
+	}
 
-	target.MinPort = ntohs(nfRange.RangeIPV4.MinPort)
-	target.MaxPort = ntohs(nfRange.RangeIPV4.MaxPort)
+	target.Addr = tcpip.Address(nfRange.RangeIPV4.MinIP[:])
+	target.Port = ntohs(nfRange.RangeIPV4.MinPort)
+
+	return &target, nil
+}
+
+type nfNATTarget struct {
+	Target linux.XTEntryTarget
+	Range  linux.NFNATRange
+}
+
+const nfNATMarhsalledSize = linux.SizeOfXTEntryTarget + linux.SizeOfNFNATRange
+
+type nfNATTargetMaker struct {
+	NetworkProtocol tcpip.NetworkProtocolNumber
+}
+
+func (rm *nfNATTargetMaker) id() stack.TargetID {
+	return stack.TargetID{
+		Name:            stack.RedirectTargetName,
+		NetworkProtocol: rm.NetworkProtocol,
+	}
+}
+
+func (*nfNATTargetMaker) marshal(target stack.Target) []byte {
+	rt := target.(*stack.RedirectTarget)
+	nt := nfNATTarget{
+		Target: linux.XTEntryTarget{
+			TargetSize: nfNATMarhsalledSize,
+		},
+		Range: linux.NFNATRange{
+			Flags: linux.NF_NAT_RANGE_PROTO_SPECIFIED,
+		},
+	}
+	copy(nt.Target.Name[:], stack.RedirectTargetName)
+	copy(nt.Range.MinAddr[:], rt.Addr)
+	copy(nt.Range.MaxAddr[:], rt.Addr)
+
+	nt.Range.MinProto = htons(rt.Port)
+	nt.Range.MaxProto = nt.Range.MinProto
+
+	ret := make([]byte, 0, nfNATMarhsalledSize)
+	return binary.Marshal(ret, usermem.ByteOrder, nt)
+}
+
+func (*nfNATTargetMaker) unmarshal(buf []byte, filter stack.IPHeaderFilter) (stack.Target, *syserr.Error) {
+	if size := nfNATMarhsalledSize; len(buf) < size {
+		nflog("nfNATTargetMaker: buf has insufficient size (%d) for nfNAT target (%d)", len(buf), size)
+		return nil, syserr.ErrInvalidArgument
+	}
+
+	if p := filter.Protocol; p != header.TCPProtocolNumber && p != header.UDPProtocolNumber {
+		nflog("nfNATTargetMaker: bad proto %d", p)
+		return nil, syserr.ErrInvalidArgument
+	}
+
+	var natRange linux.NFNATRange
+	buf = buf[linux.SizeOfXTEntryTarget:nfNATMarhsalledSize]
+	binary.Unmarshal(buf, usermem.ByteOrder, &natRange)
+
+	// We don't support port or address ranges.
+	if natRange.MinAddr != natRange.MaxAddr {
+		nflog("nfNATTargetMaker: MinAddr and MaxAddr are different")
+		return nil, syserr.ErrInvalidArgument
+	}
+	if natRange.MinProto != natRange.MaxProto {
+		nflog("nfNATTargetMaker: MinProto and MaxProto are different")
+		return nil, syserr.ErrInvalidArgument
+	}
+
+	// TODO(gvisor.dev/issue/3549): Check for other flags.
+	// For now, redirect target only supports destination change.
+	if natRange.Flags != linux.NF_NAT_RANGE_PROTO_SPECIFIED {
+		nflog("nfNATTargetMaker: invalid range flags %d", natRange.Flags)
+		return nil, syserr.ErrInvalidArgument
+	}
+
+	target := stack.RedirectTarget{
+		NetworkProtocol: filter.NetworkProtocol(),
+		Addr:            tcpip.Address(natRange.MinAddr[:]),
+		Port:            ntohs(natRange.MinProto),
+	}
 
 	return &target, nil
 }
@@ -308,7 +389,7 @@ func (jt *JumpTarget) ID() stack.TargetID {
 }
 
 // Action implements stack.Target.Action.
-func (jt JumpTarget) Action(*stack.PacketBuffer, *stack.ConnTrack, stack.Hook, *stack.GSO, *stack.Route, tcpip.Address) (stack.RuleVerdict, int) {
+func (jt *JumpTarget) Action(*stack.PacketBuffer, *stack.ConnTrack, stack.Hook, *stack.GSO, *stack.Route, tcpip.Address) (stack.RuleVerdict, int) {
 	return stack.RuleJump, jt.RuleNum
 }
 

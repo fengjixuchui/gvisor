@@ -19,6 +19,7 @@ package kvm
 import (
 	"gvisor.dev/gvisor/pkg/sentry/arch"
 	"gvisor.dev/gvisor/pkg/sentry/platform"
+	"gvisor.dev/gvisor/pkg/sentry/platform/ring0"
 	"gvisor.dev/gvisor/pkg/sentry/platform/ring0/pagetables"
 	"gvisor.dev/gvisor/pkg/usermem"
 )
@@ -47,6 +48,18 @@ const (
 	// from more than a few PCIDs past.
 	poolPCIDs = 8
 )
+
+func (m *machine) mapUpperHalf(pageTable *pagetables.PageTables) {
+	applyPhysicalRegions(func(pr physicalRegion) bool {
+		pageTable.Map(
+			usermem.Addr(ring0.KernelStartAddress|pr.virtual),
+			pr.length,
+			pagetables.MapOpts{AccessType: usermem.AnyAccess},
+			pr.physical)
+
+		return true // Keep iterating.
+	})
+}
 
 // Get all read-only physicalRegions.
 func rdonlyRegionsForSetMem() (phyRegions []physicalRegion) {
@@ -98,19 +111,6 @@ func availableRegionsForSetMem() (phyRegions []physicalRegion) {
 	phyRegions = computePhysicalRegions(excludeRegions)
 
 	return phyRegions
-}
-
-// dropPageTables drops cached page table entries.
-func (m *machine) dropPageTables(pt *pagetables.PageTables) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	// Clear from all PCIDs.
-	for _, c := range m.vCPUsByID {
-		if c.PCIDs != nil {
-			c.PCIDs.Drop(pt)
-		}
-	}
 }
 
 // nonCanonical generates a canonical address return.

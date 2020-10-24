@@ -376,7 +376,7 @@ var AMD64 = &kernel.SyscallTable{
 		321: syscalls.CapError("bpf", linux.CAP_SYS_ADMIN, "", nil),
 		322: syscalls.Supported("execveat", Execveat),
 		323: syscalls.ErrorWithEvent("userfaultfd", syserror.ENOSYS, "", []string{"gvisor.dev/issue/266"}), // TODO(b/118906345)
-		324: syscalls.ErrorWithEvent("membarrier", syserror.ENOSYS, "", []string{"gvisor.dev/issue/267"}),  // TODO(gvisor.dev/issue/267)
+		324: syscalls.PartiallySupported("membarrier", Membarrier, "Not supported on all platforms.", nil),
 		325: syscalls.PartiallySupported("mlock2", Mlock2, "Stub implementation. The sandbox lacks appropriate permissions.", nil),
 
 		// Syscalls implemented after 325 are "backports" from versions
@@ -527,8 +527,8 @@ var ARM64 = &kernel.SyscallTable{
 		96:  syscalls.Supported("set_tid_address", SetTidAddress),
 		97:  syscalls.PartiallySupported("unshare", Unshare, "Mount, cgroup namespaces not supported. Network namespaces supported but must be empty.", nil),
 		98:  syscalls.PartiallySupported("futex", Futex, "Robust futexes not supported.", nil),
-		99:  syscalls.Error("set_robust_list", syserror.ENOSYS, "Obsolete.", nil),
-		100: syscalls.Error("get_robust_list", syserror.ENOSYS, "Obsolete.", nil),
+		99:  syscalls.Supported("set_robust_list", SetRobustList),
+		100: syscalls.Supported("get_robust_list", GetRobustList),
 		101: syscalls.Supported("nanosleep", Nanosleep),
 		102: syscalls.Supported("getitimer", Getitimer),
 		103: syscalls.Supported("setitimer", Setitimer),
@@ -695,7 +695,7 @@ var ARM64 = &kernel.SyscallTable{
 		280: syscalls.CapError("bpf", linux.CAP_SYS_ADMIN, "", nil),
 		281: syscalls.Supported("execveat", Execveat),
 		282: syscalls.ErrorWithEvent("userfaultfd", syserror.ENOSYS, "", []string{"gvisor.dev/issue/266"}), // TODO(b/118906345)
-		283: syscalls.ErrorWithEvent("membarrier", syserror.ENOSYS, "", []string{"gvisor.dev/issue/267"}),  // TODO(gvisor.dev/issue/267)
+		283: syscalls.PartiallySupported("membarrier", Membarrier, "Not supported on all platforms.", nil),
 		284: syscalls.PartiallySupported("mlock2", Mlock2, "Stub implementation. The sandbox lacks appropriate permissions.", nil),
 
 		// Syscalls after 284 are "backports" from versions of Linux after 4.4.

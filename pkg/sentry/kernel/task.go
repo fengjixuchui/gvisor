@@ -656,7 +656,9 @@ func (t *Task) Value(key interface{}) interface{} {
 	case CtxUTSNamespace:
 		return t.utsns
 	case CtxIPCNamespace:
-		return t.ipcns
+		ipcns := t.IPCNamespace()
+		ipcns.IncRef()
+		return ipcns
 	case CtxTask:
 		return t
 	case auth.CtxCredentials:
@@ -735,7 +737,6 @@ func (t *Task) SyscallRestartBlock() SyscallRestartBlock {
 func (t *Task) IsChrooted() bool {
 	if VFS2Enabled {
 		realRoot := t.mountNamespaceVFS2.Root()
-		defer realRoot.DecRef(t)
 		root := t.fsContext.RootDirectoryVFS2()
 		defer root.DecRef(t)
 		return root != realRoot
@@ -868,7 +869,6 @@ func (t *Task) MountNamespace() *fs.MountNamespace {
 func (t *Task) MountNamespaceVFS2() *vfs.MountNamespace {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	t.mountNamespaceVFS2.IncRef()
 	return t.mountNamespaceVFS2
 }
 
@@ -917,7 +917,7 @@ func (t *Task) SetKcov(k *Kcov) {
 // ResetKcov clears the kcov instance associated with t.
 func (t *Task) ResetKcov() {
 	if t.kcov != nil {
-		t.kcov.Reset()
+		t.kcov.OnTaskExit()
 		t.kcov = nil
 	}
 }

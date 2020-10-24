@@ -191,42 +191,6 @@ func (c *vCPU) getOneRegister(reg *kvmOneReg) error {
 	return nil
 }
 
-// setCPUID sets the CPUID to be used by the guest.
-func (c *vCPU) setCPUID() error {
-	return nil
-}
-
-// setSystemTime sets the TSC for the vCPU.
-func (c *vCPU) setSystemTime() error {
-	return nil
-}
-
-// setSignalMask sets the vCPU signal mask.
-//
-// This must be called prior to running the vCPU.
-func (c *vCPU) setSignalMask() error {
-	// The layout of this structure implies that it will not necessarily be
-	// the same layout chosen by the Go compiler. It gets fudged here.
-	var data struct {
-		length uint32
-		mask1  uint32
-		mask2  uint32
-		_      uint32
-	}
-	data.length = 8 // Fixed sigset size.
-	data.mask1 = ^uint32(bounceSignalMask & 0xffffffff)
-	data.mask2 = ^uint32(bounceSignalMask >> 32)
-	if _, _, errno := syscall.RawSyscall(
-		syscall.SYS_IOCTL,
-		uintptr(c.fd),
-		_KVM_SET_SIGNAL_MASK,
-		uintptr(unsafe.Pointer(&data))); errno != 0 {
-		return fmt.Errorf("error setting signal mask: %v", errno)
-	}
-
-	return nil
-}
-
 // SwitchToUser unpacks architectural-details.
 func (c *vCPU) SwitchToUser(switchOpts ring0.SwitchOpts, info *arch.SignalInfo) (usermem.AccessType, error) {
 	// Check for canonical addresses.
@@ -271,8 +235,9 @@ func (c *vCPU) SwitchToUser(switchOpts ring0.SwitchOpts, info *arch.SignalInfo) 
 		return c.fault(int32(syscall.SIGSEGV), info)
 	case ring0.Vector(bounce): // ring0.VirtualizationException
 		return usermem.NoAccess, platform.ErrContextInterrupt
-	case ring0.El0Sync_undef,
-		ring0.El1Sync_undef:
+	case ring0.El0Sync_undef:
+		return c.fault(int32(syscall.SIGILL), info)
+	case ring0.El1Sync_undef:
 		*info = arch.SignalInfo{
 			Signo: int32(syscall.SIGILL),
 			Code:  1, // ILL_ILLOPC (illegal opcode).

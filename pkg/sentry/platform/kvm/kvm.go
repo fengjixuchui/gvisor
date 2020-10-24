@@ -63,6 +63,9 @@ type runData struct {
 type KVM struct {
 	platform.NoCPUPreemptionDetection
 
+	// KVM never changes mm_structs.
+	platform.UseHostProcessMemoryBarrier
+
 	// machine is the backing VM.
 	machine *machine
 }
@@ -156,15 +159,7 @@ func (*KVM) MaxUserAddress() usermem.Addr {
 func (k *KVM) NewAddressSpace(_ interface{}) (platform.AddressSpace, <-chan struct{}, error) {
 	// Allocate page tables and install system mappings.
 	pageTables := pagetables.New(newAllocator())
-	applyPhysicalRegions(func(pr physicalRegion) bool {
-		// Map the kernel in the upper half.
-		pageTables.Map(
-			usermem.Addr(ring0.KernelStartAddress|pr.virtual),
-			pr.length,
-			pagetables.MapOpts{AccessType: usermem.AnyAccess},
-			pr.physical)
-		return true // Keep iterating.
-	})
+	k.machine.mapUpperHalf(pageTables)
 
 	// Return the new address space.
 	return &addressSpace{

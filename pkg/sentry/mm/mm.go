@@ -235,6 +235,20 @@ type MemoryManager struct {
 
 	// vdsoSigReturnAddr is the address of 'vdso_sigreturn'.
 	vdsoSigReturnAddr uint64
+
+	// membarrierPrivateEnabled is non-zero if EnableMembarrierPrivate has
+	// previously been called. Since, as of this writing,
+	// MEMBARRIER_CMD_PRIVATE_EXPEDITED is implemented as a global memory
+	// barrier, membarrierPrivateEnabled has no other effect.
+	//
+	// membarrierPrivateEnabled is accessed using atomic memory operations.
+	membarrierPrivateEnabled uint32
+
+	// membarrierRSeqEnabled is non-zero if EnableMembarrierRSeq has previously
+	// been called.
+	//
+	// membarrierRSeqEnabled is accessed using atomic memory operations.
+	membarrierRSeqEnabled uint32
 }
 
 // vma represents a virtual memory area.

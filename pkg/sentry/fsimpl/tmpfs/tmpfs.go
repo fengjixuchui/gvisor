@@ -61,8 +61,9 @@ type FilesystemType struct{}
 type filesystem struct {
 	vfsfs vfs.Filesystem
 
-	// memFile is used to allocate pages to for regular files.
-	memFile *pgalloc.MemoryFile
+	// mfp is used to allocate memory that stores regular file contents. mfp is
+	// immutable.
+	mfp pgalloc.MemoryFileProvider
 
 	// clock is a realtime clock used to set timestamps in file operations.
 	clock time.Clock
@@ -74,12 +75,17 @@ type filesystem struct {
 	mu sync.RWMutex `state:"nosave"`
 
 	nextInoMinusOne uint64 // accessed using atomic memory operations
+
+	root *dentry
 }
 
 // Name implements vfs.FilesystemType.Name.
 func (FilesystemType) Name() string {
 	return Name
 }
+
+// Release implements vfs.FilesystemType.Release.
+func (FilesystemType) Release(ctx context.Context) {}
 
 // FilesystemOpts is used to pass configuration data to tmpfs.
 //
@@ -101,8 +107,8 @@ type FilesystemOpts struct {
 
 // GetFilesystem implements vfs.FilesystemType.GetFilesystem.
 func (fstype FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.VirtualFilesystem, creds *auth.Credentials, _ string, opts vfs.GetFilesystemOptions) (*vfs.Filesystem, *vfs.Dentry, error) {
-	memFileProvider := pgalloc.MemoryFileProviderFromContext(ctx)
-	if memFileProvider == nil {
+	mfp := pgalloc.MemoryFileProviderFromContext(ctx)
+	if mfp == nil {
 		panic("MemoryFileProviderFromContext returned nil")
 	}
 
@@ -176,7 +182,7 @@ func (fstype FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 	}
 	clock := time.RealtimeClockFromContext(ctx)
 	fs := filesystem{
-		memFile:  memFileProvider.MemoryFile(),
+		mfp:      mfp,
 		clock:    clock,
 		devMinor: devMinor,
 	}
@@ -194,6 +200,7 @@ func (fstype FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 		fs.vfsfs.DecRef(ctx)
 		return nil, nil, fmt.Errorf("invalid tmpfs root file type: %#o", rootFileType)
 	}
+	fs.root = root
 	return &fs.vfsfs, &root.vfsd, nil
 }
 
@@ -205,6 +212,37 @@ func NewFilesystem(ctx context.Context, vfsObj *vfs.VirtualFilesystem, creds *au
 // Release implements vfs.FilesystemImpl.Release.
 func (fs *filesystem) Release(ctx context.Context) {
 	fs.vfsfs.VirtualFilesystem().PutAnonBlockDevMinor(fs.devMinor)
+	fs.mu.Lock()
+	if fs.root.inode.isDir() {
+		fs.root.releaseChildrenLocked(ctx)
+	}
+	fs.mu.Unlock()
+}
+
+// releaseChildrenLocked is called on the mount point by filesystem.Release() to
+// destroy all objects in the mount. It performs a depth-first walk of the
+// filesystem and "unlinks" everything by decrementing link counts
+// appropriately. There should be no open file descriptors when this is called,
+// so each inode should only have one outstanding reference that is removed once
+// its link count hits zero.
+//
+// Note that we do not update filesystem state precisely while tearing down (for
+// instance, the child maps are ignored)--we only care to remove all remaining
+// references so that every filesystem object gets destroyed. Also note that we
+// do not need to trigger DecRef on the mount point itself or any child mount;
+// these are taken care of by the destructor of the enclosing MountNamespace.
+//
+// Precondition: filesystem.mu is held.
+func (d *dentry) releaseChildrenLocked(ctx context.Context) {
+	dir := d.inode.impl.(*directory)
+	for _, child := range dir.childMap {
+		if child.inode.isDir() {
+			child.releaseChildrenLocked(ctx)
+			child.inode.decLinksLocked(ctx) // link for child/.
+			dir.inode.decLinksLocked(ctx)   // link for child/..
+		}
+		child.inode.decLinksLocked(ctx) // link for child
+	}
 }
 
 // immutable

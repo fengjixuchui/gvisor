@@ -34,18 +34,6 @@ const (
 
 const SEM_UNDO = 0x1000
 
-// SemidDS is equivalent to struct semid64_ds.
-//
-// +marshal
-type SemidDS struct {
-	SemPerm  IPCPerm
-	SemOTime TimeT
-	SemCTime TimeT
-	SemNSems uint64
-	unused3  uint64
-	unused4  uint64
-}
-
 // Sembuf is equivalent to struct sembuf.
 //
 // +marshal slice:SembufSlice

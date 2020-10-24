@@ -804,7 +804,7 @@ func sendTCPBatch(r *stack.Route, tf tcpFields, data buffer.VectorisedView, gso 
 		pkt.Owner = owner
 		pkt.EgressRoute = r
 		pkt.GSOOptions = gso
-		pkt.NetworkProtocolNumber = r.NetworkProtocolNumber()
+		pkt.NetworkProtocolNumber = r.NetProto
 		data.ReadToVV(&pkt.Data, packetSize)
 		buildTCPHdr(r, tf, pkt, gso)
 		tf.seq = tf.seq.Add(seqnum.Size(packetSize))
@@ -1217,12 +1217,6 @@ func (e *endpoint) handleSegment(s *segment) (cont bool, err *tcpip.Error) {
 		}
 		if drop {
 			return true, nil
-		}
-
-		// Increase counter if after processing the segment we would potentially
-		// advertise a zero window.
-		if crossed, above := e.windowCrossedACKThresholdLocked(-s.segMemSize()); crossed && !above {
-			e.stats.ReceiveErrors.ZeroRcvWindowState.Increment()
 		}
 
 		// Now check if the received segment has caused us to transition

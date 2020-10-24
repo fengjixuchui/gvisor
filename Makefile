@@ -94,9 +94,9 @@ endef
 rebuild-...: ## Rebuild the given image. Also may use 'rebuild-all-images'.
 $(eval $(call images,rebuild))
 push-...: ## Push the given image. Also may use 'push-all-images'.
-$(eval $(call images,pull))
-pull-...: ## Pull the given image. Also may use 'pull-all-images'.
 $(eval $(call images,push))
+pull-...: ## Pull the given image. Also may use 'pull-all-images'.
+$(eval $(call images,pull))
 load-...: ## Load (pull or rebuild) the given image. Also may use 'load-all-images'.
 $(eval $(call images,load))
 list-images: ## List all available images.
@@ -130,8 +130,7 @@ unit-tests: ## Local package unit tests in pkg/..., runsc/, tools/.., etc.
 .PHONY: unit-tests
 
 tests: ## Runs all unit tests and syscall tests.
-tests: unit-tests
-	@$(call submake,test TARGETS="test/syscalls/...")
+tests: unit-tests syscall-tests
 .PHONY: tests
 
 integration-tests: ## Run all standard integration tests.
@@ -147,15 +146,14 @@ network-tests: iptables-tests packetdrill-tests packetimpact-tests
 INTEGRATION_TARGETS := //test/image:image_test //test/e2e:integration_test
 
 syscall-%-tests:
-	@$(call submake,test OPTIONS="--test_tag_filters runsc_$* test/syscalls/...")
+	@$(call submake,test OPTIONS="--test_tag_filters runsc_$*" TARGETS="test/syscalls/...")
 
 syscall-native-tests:
-	@$(call submake,test OPTIONS="--test_tag_filters native test/syscalls/...")
+	@$(call submake,test OPTIONS="--test_tag_filters native" TARGETS="test/syscalls/...")
 .PHONY: syscall-native-tests
 
 syscall-tests: ## Run all system call tests.
-syscall-tests: syscall-ptrace-tests syscall-kvm-tests syscall-native-tests
-.PHONY: syscall-tests
+	@$(call submake,test TARGETS="test/syscalls/...")
 
 %-runtime-tests: load-runtimes_%
 	@$(call submake,install-test-runtime)
@@ -258,15 +256,15 @@ WEBSITE_PROJECT := gvisordev
 WEBSITE_REGION  := us-central1
 
 website-build: load-jekyll ## Build the site image locally.
-	@$(call submake,run TARGETS="//website:website")
+	@$(call submake,run TARGETS="//website:website" ARGS="$(WEBSITE_IMAGE)")
 .PHONY: website-build
 
 website-server: website-build ## Run a local server for development.
-	@docker run -i -p 8080:8080 gvisor.dev/images/website
+	@docker run -i -p 8080:8080 $(WEBSITE_IMAGE)
 .PHONY: website-server
 
 website-push: website-build ## Push a new image and update the service.
-	@docker tag gvisor.dev/images/website $(WEBSITE_IMAGE) && docker push $(WEBSITE_IMAGE)
+	@docker push $(WEBSITE_IMAGE)
 .PHONY: website-push
 
 website-deploy: website-push ## Deploy a new version of the website.
@@ -382,5 +380,9 @@ test-runtime: ## A convenient wrapper around test that provides the runtime argu
 
 nogo: ## Surfaces all nogo findings.
 	@$(call submake,build OPTIONS="--build_tag_filters nogo" TARGETS="//...")
-	@$(call submake,run TARGETS="//tools/github" ARGS="-path=$(BUILD_ROOT) -dry-run nogo")
+	@$(call submake,run TARGETS="//tools/github" ARGS="$(foreach dir,$(BUILD_ROOTS),-path=$(CURDIR)/$(dir)) -dry-run nogo")
 .PHONY: nogo
+
+gazelle: ## Runs gazelle to update WORKSPACE.
+	@$(call submake,run TARGETS="//:gazelle" ARGS="update-repos -from_file=go.mod -prune")
+.PHONY: gazelle

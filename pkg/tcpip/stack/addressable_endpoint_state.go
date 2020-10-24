@@ -361,6 +361,8 @@ func (a *AddressableEndpointState) RemovePermanentEndpoint(ep AddressEndpoint) *
 		return tcpip.ErrInvalidEndpointState
 	}
 
+	a.mu.Lock()
+	defer a.mu.Unlock()
 	return a.removePermanentEndpointLocked(addrState)
 }
 
@@ -677,11 +679,6 @@ type addressState struct {
 		configType AddressConfigType
 		deprecated bool
 	}
-}
-
-// NetworkEndpoint implements AddressEndpoint.
-func (a *addressState) NetworkEndpoint() NetworkEndpoint {
-	return a.addressableEndpointState.networkEndpoint
 }
 
 // AddressWithPrefix implements AddressEndpoint.

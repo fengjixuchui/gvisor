@@ -20,6 +20,7 @@ import (
 	"io"
 	"strconv"
 	"strings"
+	"sync/atomic"
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/context"
@@ -155,11 +156,10 @@ afterSymlink:
 	return child, nil
 }
 
-// verifyChild verifies the root hash of child against the already verified
-// root hash of the parent to ensure the child is expected.  verifyChild
-// triggers a sentry panic if unexpected modifications to the file system are
-// detected. In noCrashOnVerificationFailure mode it returns a syserror
-// instead.
+// verifyChild verifies the hash of child against the already verified hash of
+// the parent to ensure the child is expected.  verifyChild triggers a sentry
+// panic if unexpected modifications to the file system are detected. In
+// noCrashOnVerificationFailure mode it returns a syserror instead.
 // Preconditions: fs.renameMu must be locked. d.dirMu must be locked.
 // TODO(b/166474175): Investigate all possible errors returned in this
 // function, and make sure we differentiate all errors that indicate unexpected
@@ -174,12 +174,12 @@ func (fs *filesystem) verifyChild(ctx context.Context, parent *dentry, child *de
 		return nil, err
 	}
 
-	verityMu.RLock()
-	defer verityMu.RUnlock()
+	fs.verityMu.RLock()
+	defer fs.verityMu.RUnlock()
 	// Read the offset of the child from the extended attributes of the
 	// corresponding Merkle tree file.
-	// This is the offset of the root hash for child in its parent's Merkle
-	// tree file.
+	// This is the offset of the hash for child in its parent's Merkle tree
+	// file.
 	off, err := vfsObj.GetXattrAt(ctx, fs.creds, &vfs.PathOperation{
 		Root:  child.lowerMerkleVD,
 		Start: child.lowerMerkleVD,
@@ -192,7 +192,7 @@ func (fs *filesystem) verifyChild(ctx context.Context, parent *dentry, child *de
 	// contains the expected xattrs. If the file or the xattr does not
 	// exist, it indicates unexpected modifications to the file system.
 	if err == syserror.ENOENT || err == syserror.ENODATA {
-		return nil, alertIntegrityViolation(err, fmt.Sprintf("Failed to get xattr %s for %s: %v", merkleOffsetInParentXattr, childPath, err))
+		return nil, alertIntegrityViolation(fmt.Sprintf("Failed to get xattr %s for %s: %v", merkleOffsetInParentXattr, childPath, err))
 	}
 	if err != nil {
 		return nil, err
@@ -201,10 +201,10 @@ func (fs *filesystem) verifyChild(ctx context.Context, parent *dentry, child *de
 	// unexpected modifications to the file system.
 	offset, err := strconv.Atoi(off)
 	if err != nil {
-		return nil, alertIntegrityViolation(err, fmt.Sprintf("Failed to convert xattr %s for %s to int: %v", merkleOffsetInParentXattr, childPath, err))
+		return nil, alertIntegrityViolation(fmt.Sprintf("Failed to convert xattr %s for %s to int: %v", merkleOffsetInParentXattr, childPath, err))
 	}
 
-	// Open parent Merkle tree file to read and verify child's root hash.
+	// Open parent Merkle tree file to read and verify child's hash.
 	parentMerkleFD, err := vfsObj.OpenAt(ctx, fs.creds, &vfs.PathOperation{
 		Root:  parent.lowerMerkleVD,
 		Start: parent.lowerMerkleVD,
@@ -215,7 +215,7 @@ func (fs *filesystem) verifyChild(ctx context.Context, parent *dentry, child *de
 	// The parent Merkle tree file should have been created. If it's
 	// missing, it indicates an unexpected modification to the file system.
 	if err == syserror.ENOENT {
-		return nil, alertIntegrityViolation(err, fmt.Sprintf("Failed to open parent Merkle file for %s: %v", childPath, err))
+		return nil, alertIntegrityViolation(fmt.Sprintf("Failed to open parent Merkle file for %s: %v", childPath, err))
 	}
 	if err != nil {
 		return nil, err
@@ -223,7 +223,7 @@ func (fs *filesystem) verifyChild(ctx context.Context, parent *dentry, child *de
 
 	// dataSize is the size of raw data for the Merkle tree. For a file,
 	// dataSize is the size of the whole file. For a directory, dataSize is
-	// the size of all its children's root hashes.
+	// the size of all its children's hashes.
 	dataSize, err := parentMerkleFD.GetXattr(ctx, &vfs.GetXattrOptions{
 		Name: merkleSizeXattr,
 		Size: sizeOfStringInt32,
@@ -233,7 +233,7 @@ func (fs *filesystem) verifyChild(ctx context.Context, parent *dentry, child *de
 	// contains the expected xattrs. If the file or the xattr does not
 	// exist, it indicates unexpected modifications to the file system.
 	if err == syserror.ENOENT || err == syserror.ENODATA {
-		return nil, alertIntegrityViolation(err, fmt.Sprintf("Failed to get xattr %s for %s: %v", merkleSizeXattr, childPath, err))
+		return nil, alertIntegrityViolation(fmt.Sprintf("Failed to get xattr %s for %s: %v", merkleSizeXattr, childPath, err))
 	}
 	if err != nil {
 		return nil, err
@@ -243,7 +243,7 @@ func (fs *filesystem) verifyChild(ctx context.Context, parent *dentry, child *de
 	// unexpected modifications to the file system.
 	parentSize, err := strconv.Atoi(dataSize)
 	if err != nil {
-		return nil, alertIntegrityViolation(syserror.EINVAL, fmt.Sprintf("Failed to convert xattr %s for %s to int: %v", merkleSizeXattr, childPath, err))
+		return nil, alertIntegrityViolation(fmt.Sprintf("Failed to convert xattr %s for %s to int: %v", merkleSizeXattr, childPath, err))
 	}
 
 	fdReader := vfs.FileReadWriteSeeker{
@@ -251,32 +251,191 @@ func (fs *filesystem) verifyChild(ctx context.Context, parent *dentry, child *de
 		Ctx: ctx,
 	}
 
-	// Since we are verifying against a directory Merkle tree, buf should
-	// contain the root hash of the children in the parent Merkle tree when
-	// Verify returns with success.
-	var buf bytes.Buffer
-	if _, err := merkletree.Verify(&buf, &fdReader, &fdReader, int64(parentSize), int64(offset), int64(merkletree.DigestSize()), parent.rootHash, true /* dataAndTreeInSameFile */); err != nil && err != io.EOF {
-		return nil, alertIntegrityViolation(syserror.EIO, fmt.Sprintf("Verification for %s failed: %v", childPath, err))
+	parentStat, err := vfsObj.StatAt(ctx, fs.creds, &vfs.PathOperation{
+		Root:  parent.lowerVD,
+		Start: parent.lowerVD,
+	}, &vfs.StatOptions{})
+	if err == syserror.ENOENT {
+		return nil, alertIntegrityViolation(fmt.Sprintf("Failed to get parent stat for %s: %v", childPath, err))
+	}
+	if err != nil {
+		return nil, err
 	}
 
-	// Cache child root hash when it's verified the first time.
-	if len(child.rootHash) == 0 {
-		child.rootHash = buf.Bytes()
+	// Since we are verifying against a directory Merkle tree, buf should
+	// contain the hash of the children in the parent Merkle tree when
+	// Verify returns with success.
+	var buf bytes.Buffer
+	if _, err := merkletree.Verify(&merkletree.VerifyParams{
+		Out:                   &buf,
+		File:                  &fdReader,
+		Tree:                  &fdReader,
+		Size:                  int64(parentSize),
+		Name:                  parent.name,
+		Mode:                  uint32(parentStat.Mode),
+		UID:                   parentStat.UID,
+		GID:                   parentStat.GID,
+		ReadOffset:            int64(offset),
+		ReadSize:              int64(merkletree.DigestSize()),
+		Expected:              parent.hash,
+		DataAndTreeInSameFile: true,
+	}); err != nil && err != io.EOF {
+		return nil, alertIntegrityViolation(fmt.Sprintf("Verification for %s failed: %v", childPath, err))
+	}
+
+	// Cache child hash when it's verified the first time.
+	if len(child.hash) == 0 {
+		child.hash = buf.Bytes()
 	}
 	return child, nil
+}
+
+// verifyStat verifies the stat against the verified hash. The mode/uid/gid of
+// the file is cached after verified.
+func (fs *filesystem) verifyStat(ctx context.Context, d *dentry, stat linux.Statx) error {
+	vfsObj := fs.vfsfs.VirtualFilesystem()
+
+	// Get the path to the child dentry. This is only used to provide path
+	// information in failure case.
+	childPath, err := vfsObj.PathnameWithDeleted(ctx, d.fs.rootDentry.lowerVD, d.lowerVD)
+	if err != nil {
+		return err
+	}
+
+	fs.verityMu.RLock()
+	defer fs.verityMu.RUnlock()
+
+	fd, err := vfsObj.OpenAt(ctx, fs.creds, &vfs.PathOperation{
+		Root:  d.lowerMerkleVD,
+		Start: d.lowerMerkleVD,
+	}, &vfs.OpenOptions{
+		Flags: linux.O_RDONLY,
+	})
+	if err == syserror.ENOENT {
+		return alertIntegrityViolation(fmt.Sprintf("Failed to open merkle file for %s: %v", childPath, err))
+	}
+	if err != nil {
+		return err
+	}
+
+	merkleSize, err := fd.GetXattr(ctx, &vfs.GetXattrOptions{
+		Name: merkleSizeXattr,
+		Size: sizeOfStringInt32,
+	})
+
+	if err == syserror.ENODATA {
+		return alertIntegrityViolation(fmt.Sprintf("Failed to get xattr %s for merkle file of %s: %v", merkleSizeXattr, childPath, err))
+	}
+	if err != nil {
+		return err
+	}
+
+	size, err := strconv.Atoi(merkleSize)
+	if err != nil {
+		return alertIntegrityViolation(fmt.Sprintf("Failed to convert xattr %s for %s to int: %v", merkleSizeXattr, childPath, err))
+	}
+
+	fdReader := vfs.FileReadWriteSeeker{
+		FD:  fd,
+		Ctx: ctx,
+	}
+
+	var buf bytes.Buffer
+	params := &merkletree.VerifyParams{
+		Out:        &buf,
+		Tree:       &fdReader,
+		Size:       int64(size),
+		Name:       d.name,
+		Mode:       uint32(stat.Mode),
+		UID:        stat.UID,
+		GID:        stat.GID,
+		ReadOffset: 0,
+		// Set read size to 0 so only the metadata is verified.
+		ReadSize:              0,
+		Expected:              d.hash,
+		DataAndTreeInSameFile: false,
+	}
+	if atomic.LoadUint32(&d.mode)&linux.S_IFMT == linux.S_IFDIR {
+		params.DataAndTreeInSameFile = true
+	}
+
+	if _, err := merkletree.Verify(params); err != nil && err != io.EOF {
+		return alertIntegrityViolation(fmt.Sprintf("Verification stat for %s failed: %v", childPath, err))
+	}
+	d.mode = uint32(stat.Mode)
+	d.uid = stat.UID
+	d.gid = stat.GID
+	return nil
 }
 
 // Preconditions: fs.renameMu must be locked. d.dirMu must be locked.
 func (fs *filesystem) getChildLocked(ctx context.Context, parent *dentry, name string, ds **[]*dentry) (*dentry, error) {
 	if child, ok := parent.children[name]; ok {
+		// If verity is enabled on child, we should check again whether
+		// the file and the corresponding Merkle tree are as expected,
+		// in order to catch deletion/renaming after the last time it's
+		// accessed.
+		if child.verityEnabled() {
+			vfsObj := fs.vfsfs.VirtualFilesystem()
+			// Get the path to the child dentry. This is only used
+			// to provide path information in failure case.
+			path, err := vfsObj.PathnameWithDeleted(ctx, child.fs.rootDentry.lowerVD, child.lowerVD)
+			if err != nil {
+				return nil, err
+			}
+
+			childVD, err := parent.getLowerAt(ctx, vfsObj, name)
+			if err == syserror.ENOENT {
+				// The file was previously accessed. If the
+				// file does not exist now, it indicates an
+				// unexpected modification to the file system.
+				return nil, alertIntegrityViolation(fmt.Sprintf("Target file %s is expected but missing", path))
+			}
+			if err != nil {
+				return nil, err
+			}
+			defer childVD.DecRef(ctx)
+
+			childMerkleVD, err := parent.getLowerAt(ctx, vfsObj, merklePrefix+name)
+			// The Merkle tree file was previous accessed. If it
+			// does not exist now, it indicates an unexpected
+			// modification to the file system.
+			if err == syserror.ENOENT {
+				return nil, alertIntegrityViolation(fmt.Sprintf("Expected Merkle file for target %s but none found", path))
+			}
+			if err != nil {
+				return nil, err
+			}
+
+			defer childMerkleVD.DecRef(ctx)
+		}
+
 		// If enabling verification on files/directories is not allowed
 		// during runtime, all cached children are already verified. If
 		// runtime enable is allowed and the parent directory is
-		// enabled, we should verify the child root hash here because
-		// it may be cached before enabled.
-		if fs.allowRuntimeEnable && len(parent.rootHash) != 0 {
-			if _, err := fs.verifyChild(ctx, parent, child); err != nil {
-				return nil, err
+		// enabled, we should verify the child hash here because it may
+		// be cached before enabled.
+		if fs.allowRuntimeEnable {
+			if parent.verityEnabled() {
+				if _, err := fs.verifyChild(ctx, parent, child); err != nil {
+					return nil, err
+				}
+			}
+			if child.verityEnabled() {
+				vfsObj := fs.vfsfs.VirtualFilesystem()
+				mask := uint32(linux.STATX_TYPE | linux.STATX_MODE | linux.STATX_UID | linux.STATX_GID)
+				stat, err := vfsObj.StatAt(ctx, fs.creds, &vfs.PathOperation{
+					Root:  child.lowerVD,
+					Start: child.lowerVD,
+				}, &vfs.StatOptions{
+					Mask: mask,
+				})
+				if err != nil {
+					return nil, err
+				}
+				if err := fs.verifyStat(ctx, child, stat); err != nil {
+					return nil, err
+				}
 			}
 		}
 		return child, nil
@@ -298,13 +457,7 @@ func (fs *filesystem) getChildLocked(ctx context.Context, parent *dentry, name s
 func (fs *filesystem) lookupAndVerifyLocked(ctx context.Context, parent *dentry, name string) (*dentry, error) {
 	vfsObj := fs.vfsfs.VirtualFilesystem()
 
-	childFilename := fspath.Parse(name)
-	childVD, childErr := vfsObj.GetDentryAt(ctx, fs.creds, &vfs.PathOperation{
-		Root:  parent.lowerVD,
-		Start: parent.lowerVD,
-		Path:  childFilename,
-	}, &vfs.GetDentryOptions{})
-
+	childVD, childErr := parent.getLowerAt(ctx, vfsObj, name)
 	// We will handle ENOENT separately, as it may indicate unexpected
 	// modifications to the file system, and may cause a sentry panic.
 	if childErr != nil && childErr != syserror.ENOENT {
@@ -317,13 +470,7 @@ func (fs *filesystem) lookupAndVerifyLocked(ctx context.Context, parent *dentry,
 		defer childVD.DecRef(ctx)
 	}
 
-	childMerkleFilename := merklePrefix + name
-	childMerkleVD, childMerkleErr := vfsObj.GetDentryAt(ctx, fs.creds, &vfs.PathOperation{
-		Root:  parent.lowerVD,
-		Start: parent.lowerVD,
-		Path:  fspath.Parse(childMerkleFilename),
-	}, &vfs.GetDentryOptions{})
-
+	childMerkleVD, childMerkleErr := parent.getLowerAt(ctx, vfsObj, merklePrefix+name)
 	// We will handle ENOENT separately, as it may indicate unexpected
 	// modifications to the file system, and may cause a sentry panic.
 	if childMerkleErr != nil && childMerkleErr != syserror.ENOENT {
@@ -352,7 +499,7 @@ func (fs *filesystem) lookupAndVerifyLocked(ctx context.Context, parent *dentry,
 		// corresponding Merkle tree is found. This indicates an
 		// unexpected modification to the file system that
 		// removed/renamed the child.
-		return nil, alertIntegrityViolation(childErr, fmt.Sprintf("Target file %s is expected but missing", parentPath+"/"+name))
+		return nil, alertIntegrityViolation(fmt.Sprintf("Target file %s is expected but missing", parentPath+"/"+name))
 	} else if childErr == nil && childMerkleErr == syserror.ENOENT {
 		// If in allowRuntimeEnable mode, and the Merkle tree file is
 		// not created yet, we create an empty Merkle tree file, so that
@@ -360,15 +507,15 @@ func (fs *filesystem) lookupAndVerifyLocked(ctx context.Context, parent *dentry,
 		// file open and ready to use.
 		// This may cause empty and unused Merkle tree files in
 		// allowRuntimeEnable mode, if they are never enabled. This
-		// does not affect verification, as we rely on cached root hash
-		// to decide whether to perform verification, not the existence
-		// of the Merkle tree file. Also, those Merkle tree files are
+		// does not affect verification, as we rely on cached hash to
+		// decide whether to perform verification, not the existence of
+		// the Merkle tree file. Also, those Merkle tree files are
 		// always hidden and cannot be accessed by verity fs users.
 		if fs.allowRuntimeEnable {
 			childMerkleFD, err := vfsObj.OpenAt(ctx, fs.creds, &vfs.PathOperation{
 				Root:  parent.lowerVD,
 				Start: parent.lowerVD,
-				Path:  fspath.Parse(childMerkleFilename),
+				Path:  fspath.Parse(merklePrefix + name),
 			}, &vfs.OpenOptions{
 				Flags: linux.O_RDWR | linux.O_CREAT,
 				Mode:  0644,
@@ -377,11 +524,7 @@ func (fs *filesystem) lookupAndVerifyLocked(ctx context.Context, parent *dentry,
 				return nil, err
 			}
 			childMerkleFD.DecRef(ctx)
-			childMerkleVD, err = vfsObj.GetDentryAt(ctx, fs.creds, &vfs.PathOperation{
-				Root:  parent.lowerVD,
-				Start: parent.lowerVD,
-				Path:  fspath.Parse(childMerkleFilename),
-			}, &vfs.GetDentryOptions{})
+			childMerkleVD, err = parent.getLowerAt(ctx, vfsObj, merklePrefix+name)
 			if err != nil {
 				return nil, err
 			}
@@ -389,7 +532,7 @@ func (fs *filesystem) lookupAndVerifyLocked(ctx context.Context, parent *dentry,
 			// If runtime enable is not allowed. This indicates an
 			// unexpected modification to the file system that
 			// removed/renamed the Merkle tree file.
-			return nil, alertIntegrityViolation(childMerkleErr, fmt.Sprintf("Expected Merkle file for target %s but none found", parentPath+"/"+name))
+			return nil, alertIntegrityViolation(fmt.Sprintf("Expected Merkle file for target %s but none found", parentPath+"/"+name))
 		}
 	} else if childErr == syserror.ENOENT && childMerkleErr == syserror.ENOENT {
 		// Both the child and the corresponding Merkle tree are missing.
@@ -398,7 +541,7 @@ func (fs *filesystem) lookupAndVerifyLocked(ctx context.Context, parent *dentry,
 		// TODO(b/167752508): Investigate possible ways to differentiate
 		// cases that both files are deleted from cases that they never
 		// exist in the file system.
-		return nil, alertIntegrityViolation(childErr, fmt.Sprintf("Failed to find file %s", parentPath+"/"+name))
+		return nil, alertIntegrityViolation(fmt.Sprintf("Failed to find file %s", parentPath+"/"+name))
 	}
 
 	mask := uint32(linux.STATX_TYPE | linux.STATX_MODE | linux.STATX_UID | linux.STATX_GID)
@@ -426,16 +569,21 @@ func (fs *filesystem) lookupAndVerifyLocked(ctx context.Context, parent *dentry,
 	child.parent = parent
 	child.name = name
 
-	// TODO(b/162788573): Verify child metadata.
 	child.mode = uint32(stat.Mode)
 	child.uid = stat.UID
 	child.gid = stat.GID
 
-	// Verify child root hash. This should always be performed unless in
+	// Verify child hash. This should always be performed unless in
 	// allowRuntimeEnable mode and the parent directory hasn't been enabled
 	// yet.
-	if !(fs.allowRuntimeEnable && len(parent.rootHash) == 0) {
+	if parent.verityEnabled() {
 		if _, err := fs.verifyChild(ctx, parent, child); err != nil {
+			child.destroyLocked(ctx)
+			return nil, err
+		}
+	}
+	if child.verityEnabled() {
+		if err := fs.verifyStat(ctx, child, stat); err != nil {
 			child.destroyLocked(ctx)
 			return nil, err
 		}
@@ -637,7 +785,7 @@ func (d *dentry) openLocked(ctx context.Context, rp *vfs.ResolvingPath, opts *vf
 	// missing, it indicates an unexpected modification to the file system.
 	if err != nil {
 		if err == syserror.ENOENT {
-			return nil, alertIntegrityViolation(err, fmt.Sprintf("File %s expected but not found", path))
+			return nil, alertIntegrityViolation(fmt.Sprintf("File %s expected but not found", path))
 		}
 		return nil, err
 	}
@@ -660,7 +808,7 @@ func (d *dentry) openLocked(ctx context.Context, rp *vfs.ResolvingPath, opts *vf
 	// the file system.
 	if err != nil {
 		if err == syserror.ENOENT {
-			return nil, alertIntegrityViolation(err, fmt.Sprintf("Merkle file for %s expected but not found", path))
+			return nil, alertIntegrityViolation(fmt.Sprintf("Merkle file for %s expected but not found", path))
 		}
 		return nil, err
 	}
@@ -685,7 +833,7 @@ func (d *dentry) openLocked(ctx context.Context, rp *vfs.ResolvingPath, opts *vf
 		})
 		if err != nil {
 			if err == syserror.ENOENT {
-				return nil, alertIntegrityViolation(err, fmt.Sprintf("Merkle file for %s expected but not found", path))
+				return nil, alertIntegrityViolation(fmt.Sprintf("Merkle file for %s expected but not found", path))
 			}
 			return nil, err
 		}
@@ -693,22 +841,24 @@ func (d *dentry) openLocked(ctx context.Context, rp *vfs.ResolvingPath, opts *vf
 		// be called if a verity FD is created successfully.
 		defer merkleWriter.DecRef(ctx)
 
-		parentMerkleWriter, err = rp.VirtualFilesystem().OpenAt(ctx, d.fs.creds, &vfs.PathOperation{
-			Root:  d.parent.lowerMerkleVD,
-			Start: d.parent.lowerMerkleVD,
-		}, &vfs.OpenOptions{
-			Flags: linux.O_WRONLY | linux.O_APPEND,
-		})
-		if err != nil {
-			if err == syserror.ENOENT {
-				parentPath, _ := d.fs.vfsfs.VirtualFilesystem().PathnameWithDeleted(ctx, d.fs.rootDentry.lowerVD, d.parent.lowerVD)
-				return nil, alertIntegrityViolation(err, fmt.Sprintf("Merkle file for %s expected but not found", parentPath))
+		if d.parent != nil {
+			parentMerkleWriter, err = rp.VirtualFilesystem().OpenAt(ctx, d.fs.creds, &vfs.PathOperation{
+				Root:  d.parent.lowerMerkleVD,
+				Start: d.parent.lowerMerkleVD,
+			}, &vfs.OpenOptions{
+				Flags: linux.O_WRONLY | linux.O_APPEND,
+			})
+			if err != nil {
+				if err == syserror.ENOENT {
+					parentPath, _ := d.fs.vfsfs.VirtualFilesystem().PathnameWithDeleted(ctx, d.fs.rootDentry.lowerVD, d.parent.lowerVD)
+					return nil, alertIntegrityViolation(fmt.Sprintf("Merkle file for %s expected but not found", parentPath))
+				}
+				return nil, err
 			}
-			return nil, err
+			// parentMerkleWriter is cleaned up if any error occurs. IncRef
+			// will be called if a verity FD is created successfully.
+			defer parentMerkleWriter.DecRef(ctx)
 		}
-		// parentMerkleWriter is cleaned up if any error occurs. IncRef
-		// will be called if a verity FD is created successfully.
-		defer parentMerkleWriter.DecRef(ctx)
 	}
 
 	fd := &fileDescription{
@@ -769,6 +919,8 @@ func (fs *filesystem) SetStatAt(ctx context.Context, rp *vfs.ResolvingPath, opts
 }
 
 // StatAt implements vfs.FilesystemImpl.StatAt.
+// TODO(b/170157489): Investigate whether stats other than Mode/UID/GID should
+// be verified.
 func (fs *filesystem) StatAt(ctx context.Context, rp *vfs.ResolvingPath, opts vfs.StatOptions) (linux.Statx, error) {
 	var ds *[]*dentry
 	fs.renameMu.RLock()
@@ -785,6 +937,11 @@ func (fs *filesystem) StatAt(ctx context.Context, rp *vfs.ResolvingPath, opts vf
 	}, &opts)
 	if err != nil {
 		return linux.Statx{}, err
+	}
+	if d.verityEnabled() {
+		if err := fs.verifyStat(ctx, d, stat); err != nil {
+			return linux.Statx{}, err
+		}
 	}
 	return stat, nil
 }

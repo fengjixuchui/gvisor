@@ -33,6 +33,7 @@ import (
 	"gvisor.dev/gvisor/pkg/waiter"
 )
 
+// +stateify savable
 type socketVFS2 struct {
 	vfsfd vfs.FileDescription
 	vfs.FileDescriptionDefaultImpl
@@ -51,7 +52,7 @@ var _ = socket.SocketVFS2(&socketVFS2{})
 
 func newVFS2Socket(t *kernel.Task, family int, stype linux.SockType, protocol int, fd int, flags uint32) (*vfs.FileDescription, *syserr.Error) {
 	mnt := t.Kernel().SocketMount()
-	d := sockfs.NewDentry(t.Credentials(), mnt)
+	d := sockfs.NewDentry(t, mnt)
 	defer d.DecRef(t)
 
 	s := &socketVFS2{

@@ -5131,6 +5131,7 @@ func TestKeepalive(t *testing.T) {
 }
 
 func executeHandshake(t *testing.T, c *context.Context, srcPort uint16, synCookieInUse bool) (irs, iss seqnum.Value) {
+	t.Helper()
 	// Send a SYN request.
 	irs = seqnum.Value(789)
 	c.SendPacket(nil, &context.Headers{
@@ -5175,6 +5176,7 @@ func executeHandshake(t *testing.T, c *context.Context, srcPort uint16, synCooki
 }
 
 func executeV6Handshake(t *testing.T, c *context.Context, srcPort uint16, synCookieInUse bool) (irs, iss seqnum.Value) {
+	t.Helper()
 	// Send a SYN request.
 	irs = seqnum.Value(789)
 	c.SendV6Packet(nil, &context.Headers{
@@ -5238,13 +5240,14 @@ func TestListenBacklogFull(t *testing.T) {
 
 	// Test acceptance.
 	// Start listening.
-	listenBacklog := 2
+	listenBacklog := 10
 	if err := c.EP.Listen(listenBacklog); err != nil {
 		t.Fatalf("Listen failed: %s", err)
 	}
 
-	for i := 0; i < listenBacklog; i++ {
-		executeHandshake(t, c, context.TestPort+uint16(i), false /*synCookieInUse */)
+	lastPortOffset := uint16(0)
+	for ; int(lastPortOffset) < listenBacklog; lastPortOffset++ {
+		executeHandshake(t, c, context.TestPort+lastPortOffset, false /*synCookieInUse */)
 	}
 
 	time.Sleep(50 * time.Millisecond)
@@ -5252,7 +5255,7 @@ func TestListenBacklogFull(t *testing.T) {
 	// Now execute send one more SYN. The stack should not respond as the backlog
 	// is full at this point.
 	c.SendPacket(nil, &context.Headers{
-		SrcPort: context.TestPort + 2,
+		SrcPort: context.TestPort + uint16(lastPortOffset),
 		DstPort: context.StackPort,
 		Flags:   header.TCPFlagSyn,
 		SeqNum:  seqnum.Value(789),
@@ -5293,7 +5296,7 @@ func TestListenBacklogFull(t *testing.T) {
 	}
 
 	// Now a new handshake must succeed.
-	executeHandshake(t, c, context.TestPort+2, false /*synCookieInUse */)
+	executeHandshake(t, c, context.TestPort+lastPortOffset, false /*synCookieInUse */)
 
 	newEP, _, err := c.EP.Accept(nil)
 	if err == tcpip.ErrWouldBlock {
@@ -6264,14 +6267,27 @@ func TestReceiveBufferAutoTuning(t *testing.T) {
 		rawEP.NextSeqNum--
 		rawEP.SendPacketWithTS(nil, tsVal)
 		rawEP.NextSeqNum++
+
 		if i == 0 {
 			// In the first iteration the receiver based RTT is not
 			// yet known as a result the moderation code should not
 			// increase the advertised window.
 			rawEP.VerifyACKRcvWnd(scaleRcvWnd(curRcvWnd))
 		} else {
-			pkt := c.GetPacket()
-			curRcvWnd = int(header.TCP(header.IPv4(pkt).Payload()).WindowSize()) << c.WindowScale
+			// Read loop above could generate an ACK if the window had dropped to
+			// zero and then read had opened it up.
+			lastACK := c.GetPacket()
+			// Discard any intermediate ACKs and only check the last ACK we get in a
+			// short time period of few ms.
+			for {
+				time.Sleep(1 * time.Millisecond)
+				pkt := c.GetPacketNonBlocking()
+				if pkt == nil {
+					break
+				}
+				lastACK = pkt
+			}
+			curRcvWnd = int(header.TCP(header.IPv4(lastACK).Payload()).WindowSize()) << c.WindowScale
 			// If thew new current window is close maxReceiveBufferSize then terminate
 			// the loop. This can happen before all iterations are done due to timing
 			// differences when running the test.
@@ -6708,6 +6724,13 @@ func TestTCPTimeWaitNewSyn(t *testing.T) {
 	})
 
 	c.CheckNoPacketTimeout("unexpected packet received in response to SYN", 1*time.Second)
+
+	// drain any older notifications from the notification channel before attempting
+	// 2nd connection.
+	select {
+	case <-ch:
+	default:
+	}
 
 	// Send a SYN request w/ sequence number higher than
 	// the highest sequence number sent.
@@ -7328,7 +7351,7 @@ func TestIncreaseWindowOnBufferResize(t *testing.T) {
 
 	// Write chunks of ~30000 bytes. It's important that two
 	// payloads make it equal or longer than MSS.
-	remain := rcvBuf * 2
+	remain := rcvBuf
 	sent := 0
 	data := make([]byte, defaultMTU/2)
 
@@ -7343,7 +7366,6 @@ func TestIncreaseWindowOnBufferResize(t *testing.T) {
 		})
 		sent += len(data)
 		remain -= len(data)
-
 		checker.IPv4(t, c.GetPacket(),
 			checker.PayloadLen(header.TCPMinimumSize),
 			checker.TCP(

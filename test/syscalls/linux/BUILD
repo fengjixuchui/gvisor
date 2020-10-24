@@ -1079,6 +1079,7 @@ cc_binary(
         gtest,
         "//test/util:test_main",
         "//test/util:test_util",
+        "//test/util:thread_util",
     ],
 )
 
@@ -1151,6 +1152,24 @@ cc_binary(
         "//test/util:temp_path",
         "//test/util:test_main",
         "//test/util:test_util",
+    ],
+)
+
+cc_binary(
+    name = "membarrier_test",
+    testonly = 1,
+    srcs = ["membarrier.cc"],
+    linkstatic = 1,
+    deps = [
+        "@com_google_absl//absl/time",
+        gtest,
+        "//test/util:cleanup",
+        "//test/util:logging",
+        "//test/util:memory_util",
+        "//test/util:posix_error",
+        "//test/util:test_main",
+        "//test/util:test_util",
+        "//test/util:thread_util",
     ],
 )
 
@@ -1266,6 +1285,7 @@ cc_binary(
         "//test/util:mount_util",
         "//test/util:multiprocess_util",
         "//test/util:posix_error",
+        "//test/util:save_util",
         "//test/util:temp_path",
         "//test/util:test_main",
         "//test/util:test_util",
@@ -3422,6 +3442,7 @@ cc_binary(
         "@com_google_absl//absl/strings",
         gtest,
         "//test/util:posix_error",
+        "//test/util:save_util",
         "//test/util:temp_path",
         "//test/util:test_main",
         "//test/util:test_util",
@@ -3605,6 +3626,7 @@ cc_binary(
         "//test/util:signal_util",
         "//test/util:test_util",
         "//test/util:thread_util",
+        "//test/util:timer_util",
     ],
 )
 

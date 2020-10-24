@@ -79,7 +79,7 @@ go_template_instance(
     out = "fd_table_refs.go",
     package = "kernel",
     prefix = "FDTable",
-    template = "//pkg/refs_vfs2:refs_template",
+    template = "//pkg/refsvfs2:refs_template",
     types = {
         "T": "FDTable",
     },
@@ -90,9 +90,20 @@ go_template_instance(
     out = "fs_context_refs.go",
     package = "kernel",
     prefix = "FSContext",
-    template = "//pkg/refs_vfs2:refs_template",
+    template = "//pkg/refsvfs2:refs_template",
     types = {
         "T": "FSContext",
+    },
+)
+
+go_template_instance(
+    name = "ipc_namespace_refs",
+    out = "ipc_namespace_refs.go",
+    package = "kernel",
+    prefix = "IPCNamespace",
+    template = "//pkg/refsvfs2:refs_template",
+    types = {
+        "T": "IPCNamespace",
     },
 )
 
@@ -101,7 +112,7 @@ go_template_instance(
     out = "process_group_refs.go",
     package = "kernel",
     prefix = "ProcessGroup",
-    template = "//pkg/refs_vfs2:refs_template",
+    template = "//pkg/refsvfs2:refs_template",
     types = {
         "T": "ProcessGroup",
     },
@@ -112,7 +123,7 @@ go_template_instance(
     out = "session_refs.go",
     package = "kernel",
     prefix = "Session",
-    template = "//pkg/refs_vfs2:refs_template",
+    template = "//pkg/refsvfs2:refs_template",
     types = {
         "T": "Session",
     },
@@ -137,6 +148,7 @@ go_library(
         "fs_context.go",
         "fs_context_refs.go",
         "ipc_namespace.go",
+        "ipc_namespace_refs.go",
         "kcov.go",
         "kcov_unsafe.go",
         "kernel.go",
@@ -204,9 +216,9 @@ go_library(
         "//pkg/abi",
         "//pkg/abi/linux",
         "//pkg/amutex",
-        "//pkg/binary",
         "//pkg/bits",
         "//pkg/bpf",
+        "//pkg/cleanup",
         "//pkg/context",
         "//pkg/coverage",
         "//pkg/cpuid",
@@ -217,7 +229,7 @@ go_library(
         "//pkg/marshal/primitive",
         "//pkg/metric",
         "//pkg/refs",
-        "//pkg/refs_vfs2",
+        "//pkg/refsvfs2",
         "//pkg/safemem",
         "//pkg/secio",
         "//pkg/sentry/arch",

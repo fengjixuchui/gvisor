@@ -57,6 +57,7 @@ java/nio/channels/SocketChannel/SocketOptionTests.java,b/77965901,
 java/nio/channels/spi/SelectorProvider/inheritedChannel/InheritedChannelTest.java,,Fails in Docker
 java/rmi/activation/Activatable/extLoadedImpl/ext.sh,,
 java/rmi/transport/checkLeaseInfoLeak/CheckLeaseLeak.java,,
+java/security/cert/PolicyNode/GetPolicyQualifiers.java,b/170263154,Kokoro executor cert expired
 java/text/Format/NumberFormat/CurrencyFormat.java,,Fails in Docker
 java/text/Format/NumberFormat/CurrencyFormat.java,,Fails in Docker
 java/util/Calendar/JapaneseEraNameTest.java,,
@@ -143,6 +144,7 @@ jdk/jfr/cmd/TestSplit.java,,java.lang.RuntimeException: 'Missing file' missing f
 jdk/jfr/cmd/TestSummary.java,,java.lang.RuntimeException: 'Missing file' missing from stdout/stderr
 jdk/jfr/event/compiler/TestCompilerStats.java,,java.lang.RuntimeException: Field nmetodsSize not in event
 jdk/jfr/event/metadata/TestDefaultConfigurations.java,,Setting 'threshold' in event 'jdk.SecurityPropertyModification' was not configured in the configuration 'default'
+jdk/jfr/event/oldobject/TestLargeRootSet.java,,Flaky - `main' threw exception: java.lang.RuntimeException: Could not find root object
 jdk/jfr/event/runtime/TestActiveSettingEvent.java,,java.lang.Exception: Could not find setting with name jdk.X509Validation#threshold
 jdk/jfr/event/runtime/TestModuleEvents.java,,java.lang.RuntimeException: assertEquals: expected jdk.proxy1 to equal java.base
 jdk/jfr/event/runtime/TestNetworkUtilizationEvent.java,,

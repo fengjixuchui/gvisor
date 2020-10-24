@@ -17,6 +17,7 @@ package mm
 import (
 	"fmt"
 	mrand "math/rand"
+	"sync/atomic"
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/context"
@@ -1273,4 +1274,28 @@ func (mm *MemoryManager) VirtualDataSize() uint64 {
 	mm.mappingMu.RLock()
 	defer mm.mappingMu.RUnlock()
 	return mm.dataAS
+}
+
+// EnableMembarrierPrivate causes future calls to IsMembarrierPrivateEnabled to
+// return true.
+func (mm *MemoryManager) EnableMembarrierPrivate() {
+	atomic.StoreUint32(&mm.membarrierPrivateEnabled, 1)
+}
+
+// IsMembarrierPrivateEnabled returns true if mm.EnableMembarrierPrivate() has
+// previously been called.
+func (mm *MemoryManager) IsMembarrierPrivateEnabled() bool {
+	return atomic.LoadUint32(&mm.membarrierPrivateEnabled) != 0
+}
+
+// EnableMembarrierRSeq causes future calls to IsMembarrierRSeqEnabled to
+// return true.
+func (mm *MemoryManager) EnableMembarrierRSeq() {
+	atomic.StoreUint32(&mm.membarrierRSeqEnabled, 1)
+}
+
+// IsMembarrierRSeqEnabled returns true if mm.EnableMembarrierRSeq() has
+// previously been called.
+func (mm *MemoryManager) IsMembarrierRSeqEnabled() bool {
+	return atomic.LoadUint32(&mm.membarrierRSeqEnabled) != 0
 }

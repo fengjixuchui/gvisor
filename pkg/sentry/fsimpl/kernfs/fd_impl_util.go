@@ -145,8 +145,12 @@ func (fd *GenericDirectoryFD) filesystem() *vfs.Filesystem {
 	return fd.vfsfd.VirtualDentry().Mount().Filesystem()
 }
 
+func (fd *GenericDirectoryFD) dentry() *Dentry {
+	return fd.vfsfd.Dentry().Impl().(*Dentry)
+}
+
 func (fd *GenericDirectoryFD) inode() Inode {
-	return fd.vfsfd.VirtualDentry().Dentry().Impl().(*Dentry).inode
+	return fd.dentry().inode
 }
 
 // IterDirents implements vfs.FileDescriptionImpl.IterDirents. IterDirents holds
@@ -176,8 +180,7 @@ func (fd *GenericDirectoryFD) IterDirents(ctx context.Context, cb vfs.IterDirent
 
 	// Handle "..".
 	if fd.off == 1 {
-		vfsd := fd.vfsfd.VirtualDentry().Dentry()
-		parentInode := genericParentOrSelf(vfsd.Impl().(*Dentry)).inode
+		parentInode := genericParentOrSelf(fd.dentry()).inode
 		stat, err := parentInode.Stat(ctx, fd.filesystem(), opts)
 		if err != nil {
 			return err
@@ -201,12 +204,12 @@ func (fd *GenericDirectoryFD) IterDirents(ctx context.Context, cb vfs.IterDirent
 	// these.
 	childIdx := fd.off - 2
 	for it := fd.children.nthLocked(childIdx); it != nil; it = it.Next() {
-		stat, err := it.Dentry.inode.Stat(ctx, fd.filesystem(), opts)
+		stat, err := it.inode.Stat(ctx, fd.filesystem(), opts)
 		if err != nil {
 			return err
 		}
 		dirent := vfs.Dirent{
-			Name:    it.Name,
+			Name:    it.name,
 			Type:    linux.FileMode(stat.Mode).DirentType(),
 			Ino:     stat.Ino,
 			NextOff: fd.off + 1,
@@ -219,7 +222,7 @@ func (fd *GenericDirectoryFD) IterDirents(ctx context.Context, cb vfs.IterDirent
 
 	var err error
 	relOffset := fd.off - int64(len(fd.children.set)) - 2
-	fd.off, err = fd.inode().IterDirents(ctx, cb, fd.off, relOffset)
+	fd.off, err = fd.inode().IterDirents(ctx, fd.vfsfd.Mount(), cb, fd.off, relOffset)
 	return err
 }
 
@@ -265,8 +268,7 @@ func (fd *GenericDirectoryFD) Stat(ctx context.Context, opts vfs.StatOptions) (l
 // SetStat implements vfs.FileDescriptionImpl.SetStat.
 func (fd *GenericDirectoryFD) SetStat(ctx context.Context, opts vfs.SetStatOptions) error {
 	creds := auth.CredentialsFromContext(ctx)
-	inode := fd.vfsfd.VirtualDentry().Dentry().Impl().(*Dentry).inode
-	return inode.SetStat(ctx, fd.filesystem(), creds, opts)
+	return fd.inode().SetStat(ctx, fd.filesystem(), creds, opts)
 }
 
 // Allocate implements vfs.FileDescriptionImpl.Allocate.

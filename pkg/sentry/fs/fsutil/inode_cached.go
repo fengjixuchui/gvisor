@@ -22,7 +22,6 @@ import (
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/safemem"
 	"gvisor.dev/gvisor/pkg/sentry/fs"
-	"gvisor.dev/gvisor/pkg/sentry/kernel/time"
 	ktime "gvisor.dev/gvisor/pkg/sentry/kernel/time"
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
@@ -444,7 +443,7 @@ func (c *CachingInodeOperations) TouchAccessTime(ctx context.Context, inode *fs.
 // time.
 //
 // Preconditions: c.attrMu is locked for writing.
-func (c *CachingInodeOperations) touchAccessTimeLocked(now time.Time) {
+func (c *CachingInodeOperations) touchAccessTimeLocked(now ktime.Time) {
 	c.attr.AccessTime = now
 	c.dirtyAttr.AccessTime = true
 }
@@ -461,7 +460,7 @@ func (c *CachingInodeOperations) TouchModificationAndStatusChangeTime(ctx contex
 // and status change times in-place to the current time.
 //
 // Preconditions: c.attrMu is locked for writing.
-func (c *CachingInodeOperations) touchModificationAndStatusChangeTimeLocked(now time.Time) {
+func (c *CachingInodeOperations) touchModificationAndStatusChangeTimeLocked(now ktime.Time) {
 	c.attr.ModificationTime = now
 	c.dirtyAttr.ModificationTime = true
 	c.attr.StatusChangeTime = now
@@ -480,7 +479,7 @@ func (c *CachingInodeOperations) TouchStatusChangeTime(ctx context.Context) {
 // in-place to the current time.
 //
 // Preconditions: c.attrMu is locked for writing.
-func (c *CachingInodeOperations) touchStatusChangeTimeLocked(now time.Time) {
+func (c *CachingInodeOperations) touchStatusChangeTimeLocked(now ktime.Time) {
 	c.attr.StatusChangeTime = now
 	c.dirtyAttr.StatusChangeTime = true
 }
@@ -645,7 +644,7 @@ func (rw *inodeReadWriter) ReadToBlocks(dsts safemem.BlockSeq) (uint64, error) {
 					End:   fs.OffsetPageEnd(int64(gapMR.End)),
 				}
 				optMR := gap.Range()
-				err := rw.c.cache.Fill(rw.ctx, reqMR, maxFillRange(reqMR, optMR), mem, usage.PageCache, rw.c.backingFile.ReadToBlocksAt)
+				err := rw.c.cache.Fill(rw.ctx, reqMR, maxFillRange(reqMR, optMR), uint64(rw.c.attr.Size), mem, usage.PageCache, rw.c.backingFile.ReadToBlocksAt)
 				mem.MarkEvictable(rw.c, pgalloc.EvictableRange{optMR.Start, optMR.End})
 				seg, gap = rw.c.cache.Find(uint64(rw.offset))
 				if !seg.Ok() {
@@ -672,9 +671,6 @@ func (rw *inodeReadWriter) ReadToBlocks(dsts safemem.BlockSeq) (uint64, error) {
 				// Continue.
 				seg, gap = gap.NextSegment(), FileRangeGapIterator{}
 			}
-
-		default:
-			break
 		}
 	}
 	unlock()
@@ -768,9 +764,6 @@ func (rw *inodeReadWriter) WriteFromBlocks(srcs safemem.BlockSeq) (uint64, error
 
 			// Continue.
 			seg, gap = gap.NextSegment(), FileRangeGapIterator{}
-
-		default:
-			break
 		}
 	}
 	rw.maybeGrowFile()
@@ -877,7 +870,7 @@ func (c *CachingInodeOperations) Translate(ctx context.Context, required, option
 	}
 
 	mf := c.mfp.MemoryFile()
-	cerr := c.cache.Fill(ctx, required, maxFillRange(required, optional), mf, usage.PageCache, c.backingFile.ReadToBlocksAt)
+	cerr := c.cache.Fill(ctx, required, maxFillRange(required, optional), uint64(c.attr.Size), mf, usage.PageCache, c.backingFile.ReadToBlocksAt)
 
 	var ts []memmap.Translation
 	var translatedEnd uint64

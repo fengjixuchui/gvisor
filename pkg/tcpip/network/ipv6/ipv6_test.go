@@ -15,17 +15,21 @@
 package ipv6
 
 import (
+	"encoding/hex"
+	"fmt"
 	"math"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/buffer"
+	"gvisor.dev/gvisor/pkg/tcpip/checker"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
 	"gvisor.dev/gvisor/pkg/tcpip/link/channel"
 	"gvisor.dev/gvisor/pkg/tcpip/network/testutil"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
 	"gvisor.dev/gvisor/pkg/tcpip/transport/icmp"
+	"gvisor.dev/gvisor/pkg/tcpip/transport/tcp"
 	"gvisor.dev/gvisor/pkg/tcpip/transport/udp"
 	"gvisor.dev/gvisor/pkg/waiter"
 )
@@ -45,6 +49,8 @@ const (
 	fragmentExtHdrID    = uint8(header.IPv6FragmentExtHdrIdentifier)
 	destinationExtHdrID = uint8(header.IPv6DestinationOptionsExtHdrIdentifier)
 	noNextHdrID         = uint8(header.IPv6NoNextHeaderIdentifier)
+
+	extraHeaderReserve = 50
 )
 
 // testReceiveICMP tests receiving an ICMP packet from src to dst. want is the
@@ -53,8 +59,8 @@ func testReceiveICMP(t *testing.T, s *stack.Stack, e *channel.Endpoint, src, dst
 	t.Helper()
 
 	// Receive ICMP packet.
-	hdr := buffer.NewPrependable(header.IPv6MinimumSize + header.ICMPv6NeighborAdvertSize)
-	pkt := header.ICMPv6(hdr.Prepend(header.ICMPv6NeighborAdvertSize))
+	hdr := buffer.NewPrependable(header.IPv6MinimumSize + header.ICMPv6NeighborAdvertMinimumSize)
+	pkt := header.ICMPv6(hdr.Prepend(header.ICMPv6NeighborAdvertMinimumSize))
 	pkt.SetType(header.ICMPv6NeighborAdvert)
 	pkt.SetChecksum(header.ICMPv6Checksum(pkt, src, dst, buffer.VectorisedView{}))
 	payloadLength := hdr.UsedLength()
@@ -136,6 +142,84 @@ func testReceiveUDP(t *testing.T, s *stack.Stack, e *channel.Endpoint, src, dst 
 	}
 }
 
+func compareFragments(packets []*stack.PacketBuffer, sourcePacket *stack.PacketBuffer, mtu uint32, wantFragments []fragmentInfo, proto tcpip.TransportProtocolNumber) error {
+	// sourcePacket does not have its IP Header populated. Let's copy the one
+	// from the first fragment.
+	source := header.IPv6(packets[0].NetworkHeader().View())
+	sourceIPHeadersLen := len(source)
+	vv := buffer.NewVectorisedView(sourcePacket.Size(), sourcePacket.Views())
+	source = append(source, vv.ToView()...)
+
+	var reassembledPayload buffer.VectorisedView
+	for i, fragment := range packets {
+		// Confirm that the packet is valid.
+		allBytes := buffer.NewVectorisedView(fragment.Size(), fragment.Views())
+		fragmentIPHeaders := header.IPv6(allBytes.ToView())
+		if !fragmentIPHeaders.IsValid(len(fragmentIPHeaders)) {
+			return fmt.Errorf("fragment #%d: IP packet is invalid:\n%s", i, hex.Dump(fragmentIPHeaders))
+		}
+
+		fragmentIPHeadersLength := fragment.NetworkHeader().View().Size()
+		if fragmentIPHeadersLength != sourceIPHeadersLen {
+			return fmt.Errorf("fragment #%d: got fragmentIPHeadersLength = %d, want = %d", i, fragmentIPHeadersLength, sourceIPHeadersLen)
+		}
+
+		if got := len(fragmentIPHeaders); got > int(mtu) {
+			return fmt.Errorf("fragment #%d: got len(fragmentIPHeaders) = %d, want <= %d", i, got, mtu)
+		}
+
+		sourceIPHeader := source[:header.IPv6MinimumSize]
+		fragmentIPHeader := fragmentIPHeaders[:header.IPv6MinimumSize]
+
+		if got := fragmentIPHeaders.PayloadLength(); got != wantFragments[i].payloadSize {
+			return fmt.Errorf("fragment #%d: got fragmentIPHeaders.PayloadLength() = %d, want = %d", i, got, wantFragments[i].payloadSize)
+		}
+
+		// We expect the IPv6 Header to be similar across each fragment, besides the
+		// payload length.
+		sourceIPHeader.SetPayloadLength(0)
+		fragmentIPHeader.SetPayloadLength(0)
+		if diff := cmp.Diff(fragmentIPHeader, sourceIPHeader); diff != "" {
+			return fmt.Errorf("fragment #%d: fragmentIPHeader mismatch (-want +got):\n%s", i, diff)
+		}
+
+		if got := fragment.AvailableHeaderBytes(); got != extraHeaderReserve {
+			return fmt.Errorf("fragment #%d: got packet.AvailableHeaderBytes() = %d, want = %d", i, got, extraHeaderReserve)
+		}
+		if fragment.NetworkProtocolNumber != sourcePacket.NetworkProtocolNumber {
+			return fmt.Errorf("fragment #%d: got fragment.NetworkProtocolNumber = %d, want = %d", i, fragment.NetworkProtocolNumber, sourcePacket.NetworkProtocolNumber)
+		}
+
+		if len(packets) > 1 {
+			// If the source packet was big enough that it needed fragmentation, let's
+			// inspect the fragment header. Because no other extension headers are
+			// supported, it will always be the last extension header.
+			fragmentHeader := header.IPv6Fragment(fragmentIPHeaders[fragmentIPHeadersLength-header.IPv6FragmentHeaderSize : fragmentIPHeadersLength])
+
+			if got := fragmentHeader.More(); got != wantFragments[i].more {
+				return fmt.Errorf("fragment #%d: got fragmentHeader.More() = %t, want = %t", i, got, wantFragments[i].more)
+			}
+			if got := fragmentHeader.FragmentOffset(); got != wantFragments[i].offset {
+				return fmt.Errorf("fragment #%d: got fragmentHeader.FragmentOffset() = %d, want = %d", i, got, wantFragments[i].offset)
+			}
+			if got := fragmentHeader.NextHeader(); got != uint8(proto) {
+				return fmt.Errorf("fragment #%d: got fragmentHeader.NextHeader() = %d, want = %d", i, got, uint8(proto))
+			}
+		}
+
+		// Store the reassembled payload as we parse each fragment. The payload
+		// includes the Transport header and everything after.
+		reassembledPayload.AppendView(fragment.TransportHeader().View())
+		reassembledPayload.Append(fragment.Data)
+	}
+
+	if diff := cmp.Diff(buffer.View(source[sourceIPHeadersLen:]), reassembledPayload.ToView()); diff != "" {
+		return fmt.Errorf("reassembledPayload mismatch (-want +got):\n%s", diff)
+	}
+
+	return nil
+}
+
 // TestReceiveOnAllNodesMulticastAddr tests that IPv6 endpoints receive ICMP and
 // UDP packets destined to the IPv6 link-local all-nodes multicast address.
 func TestReceiveOnAllNodesMulticastAddr(t *testing.T) {
@@ -154,7 +238,7 @@ func TestReceiveOnAllNodesMulticastAddr(t *testing.T) {
 				NetworkProtocols:   []stack.NetworkProtocolFactory{NewProtocol},
 				TransportProtocols: []stack.TransportProtocolFactory{test.protocolFactory},
 			})
-			e := channel.New(10, 1280, linkAddr1)
+			e := channel.New(10, header.IPv6MinimumMTU, linkAddr1)
 			if err := s.CreateNIC(1, e); err != nil {
 				t.Fatalf("CreateNIC(_) = %s", err)
 			}
@@ -170,8 +254,6 @@ func TestReceiveOnAllNodesMulticastAddr(t *testing.T) {
 // packets destined to the IPv6 solicited-node address of an assigned IPv6
 // address.
 func TestReceiveOnSolicitedNodeAddr(t *testing.T) {
-	const nicID = 1
-
 	tests := []struct {
 		name            string
 		protocolFactory stack.TransportProtocolFactory
@@ -189,13 +271,13 @@ func TestReceiveOnSolicitedNodeAddr(t *testing.T) {
 				NetworkProtocols:   []stack.NetworkProtocolFactory{NewProtocol},
 				TransportProtocols: []stack.TransportProtocolFactory{test.protocolFactory},
 			})
-			e := channel.New(1, 1280, linkAddr1)
+			e := channel.New(1, header.IPv6MinimumMTU, linkAddr1)
 			if err := s.CreateNIC(nicID, e); err != nil {
 				t.Fatalf("CreateNIC(%d, _) = %s", nicID, err)
 			}
 
 			s.SetRouteTable([]tcpip.Route{
-				tcpip.Route{
+				{
 					Destination: header.IPv6EmptySubnet,
 					NIC:         nicID,
 				},
@@ -295,17 +377,22 @@ func TestAddIpv6Address(t *testing.T) {
 }
 
 func TestReceiveIPv6ExtHdrs(t *testing.T) {
-	const nicID = 1
-
 	tests := []struct {
 		name         string
 		extHdr       func(nextHdr uint8) ([]byte, uint8)
 		shouldAccept bool
+		// Should we expect an ICMP response and if so, with what contents?
+		expectICMP bool
+		ICMPType   header.ICMPv6Type
+		ICMPCode   header.ICMPv6Code
+		pointer    uint32
+		multicast  bool
 	}{
 		{
 			name:         "None",
 			extHdr:       func(nextHdr uint8) ([]byte, uint8) { return []byte{}, nextHdr },
 			shouldAccept: true,
+			expectICMP:   false,
 		},
 		{
 			name: "hopbyhop with unknown option skippable action",
@@ -336,9 +423,10 @@ func TestReceiveIPv6ExtHdrs(t *testing.T) {
 				}, hopByHopExtHdrID
 			},
 			shouldAccept: false,
+			expectICMP:   false,
 		},
 		{
-			name: "hopbyhop with unknown option discard and send icmp action",
+			name: "hopbyhop with unknown option discard and send icmp action (unicast)",
 			extHdr: func(nextHdr uint8) ([]byte, uint8) {
 				return []byte{
 					nextHdr, 1,
@@ -348,12 +436,38 @@ func TestReceiveIPv6ExtHdrs(t *testing.T) {
 
 					// Discard & send ICMP if option is unknown.
 					191, 6, 1, 2, 3, 4, 5, 6,
+					//^ Unknown option.
 				}, hopByHopExtHdrID
 			},
 			shouldAccept: false,
+			expectICMP:   true,
+			ICMPType:     header.ICMPv6ParamProblem,
+			ICMPCode:     header.ICMPv6UnknownOption,
+			pointer:      header.IPv6FixedHeaderSize + 8,
 		},
 		{
-			name: "hopbyhop with unknown option discard and send icmp action unless multicast dest",
+			name: "hopbyhop with unknown option discard and send icmp action (multicast)",
+			extHdr: func(nextHdr uint8) ([]byte, uint8) {
+				return []byte{
+					nextHdr, 1,
+
+					// Skippable unknown.
+					63, 4, 1, 2, 3, 4,
+
+					// Discard & send ICMP if option is unknown.
+					191, 6, 1, 2, 3, 4, 5, 6,
+					//^ Unknown option.
+				}, hopByHopExtHdrID
+			},
+			multicast:    true,
+			shouldAccept: false,
+			expectICMP:   true,
+			ICMPType:     header.ICMPv6ParamProblem,
+			ICMPCode:     header.ICMPv6UnknownOption,
+			pointer:      header.IPv6FixedHeaderSize + 8,
+		},
+		{
+			name: "hopbyhop with unknown option discard and send icmp action unless multicast dest (unicast)",
 			extHdr: func(nextHdr uint8) ([]byte, uint8) {
 				return []byte{
 					nextHdr, 1,
@@ -364,39 +478,97 @@ func TestReceiveIPv6ExtHdrs(t *testing.T) {
 					// Discard & send ICMP unless packet is for multicast destination if
 					// option is unknown.
 					255, 6, 1, 2, 3, 4, 5, 6,
+					//^ Unknown option.
 				}, hopByHopExtHdrID
 			},
-			shouldAccept: false,
+			expectICMP: true,
+			ICMPType:   header.ICMPv6ParamProblem,
+			ICMPCode:   header.ICMPv6UnknownOption,
+			pointer:    header.IPv6FixedHeaderSize + 8,
 		},
 		{
-			name:         "routing with zero segments left",
-			extHdr:       func(nextHdr uint8) ([]byte, uint8) { return []byte{nextHdr, 0, 1, 0, 2, 3, 4, 5}, routingExtHdrID },
+			name: "hopbyhop with unknown option discard and send icmp action unless multicast dest (multicast)",
+			extHdr: func(nextHdr uint8) ([]byte, uint8) {
+				return []byte{
+					nextHdr, 1,
+
+					// Skippable unknown.
+					63, 4, 1, 2, 3, 4,
+
+					// Discard & send ICMP unless packet is for multicast destination if
+					// option is unknown.
+					255, 6, 1, 2, 3, 4, 5, 6,
+					//^ Unknown option.
+				}, hopByHopExtHdrID
+			},
+			multicast:    true,
+			shouldAccept: false,
+			expectICMP:   false,
+		},
+		{
+			name: "routing with zero segments left",
+			extHdr: func(nextHdr uint8) ([]byte, uint8) {
+				return []byte{
+					nextHdr, 0,
+					1, 0, 2, 3, 4, 5,
+				}, routingExtHdrID
+			},
 			shouldAccept: true,
 		},
 		{
-			name:         "routing with non-zero segments left",
-			extHdr:       func(nextHdr uint8) ([]byte, uint8) { return []byte{nextHdr, 0, 1, 1, 2, 3, 4, 5}, routingExtHdrID },
+			name: "routing with non-zero segments left",
+			extHdr: func(nextHdr uint8) ([]byte, uint8) {
+				return []byte{
+					nextHdr, 0,
+					1, 1, 2, 3, 4, 5,
+				}, routingExtHdrID
+			},
 			shouldAccept: false,
+			expectICMP:   true,
+			ICMPType:     header.ICMPv6ParamProblem,
+			ICMPCode:     header.ICMPv6ErroneousHeader,
+			pointer:      header.IPv6FixedHeaderSize + 2,
 		},
 		{
-			name:         "atomic fragment with zero ID",
-			extHdr:       func(nextHdr uint8) ([]byte, uint8) { return []byte{nextHdr, 0, 0, 0, 0, 0, 0, 0}, fragmentExtHdrID },
+			name: "atomic fragment with zero ID",
+			extHdr: func(nextHdr uint8) ([]byte, uint8) {
+				return []byte{
+					nextHdr, 0,
+					0, 0, 0, 0, 0, 0,
+				}, fragmentExtHdrID
+			},
 			shouldAccept: true,
 		},
 		{
-			name:         "atomic fragment with non-zero ID",
-			extHdr:       func(nextHdr uint8) ([]byte, uint8) { return []byte{nextHdr, 0, 0, 0, 1, 2, 3, 4}, fragmentExtHdrID },
+			name: "atomic fragment with non-zero ID",
+			extHdr: func(nextHdr uint8) ([]byte, uint8) {
+				return []byte{
+					nextHdr, 0,
+					0, 0, 1, 2, 3, 4,
+				}, fragmentExtHdrID
+			},
 			shouldAccept: true,
+			expectICMP:   false,
 		},
 		{
-			name:         "fragment",
-			extHdr:       func(nextHdr uint8) ([]byte, uint8) { return []byte{nextHdr, 0, 1, 0, 1, 2, 3, 4}, fragmentExtHdrID },
+			name: "fragment",
+			extHdr: func(nextHdr uint8) ([]byte, uint8) {
+				return []byte{
+					nextHdr, 0,
+					1, 0, 1, 2, 3, 4,
+				}, fragmentExtHdrID
+			},
 			shouldAccept: false,
+			expectICMP:   false,
 		},
 		{
-			name:         "No next header",
-			extHdr:       func(nextHdr uint8) ([]byte, uint8) { return []byte{}, noNextHdrID },
+			name: "No next header",
+			extHdr: func(nextHdr uint8) ([]byte, uint8) {
+				return []byte{},
+					noNextHdrID
+			},
 			shouldAccept: false,
+			expectICMP:   false,
 		},
 		{
 			name: "destination with unknown option skippable action",
@@ -412,6 +584,7 @@ func TestReceiveIPv6ExtHdrs(t *testing.T) {
 				}, destinationExtHdrID
 			},
 			shouldAccept: true,
+			expectICMP:   false,
 		},
 		{
 			name: "destination with unknown option discard action",
@@ -427,9 +600,10 @@ func TestReceiveIPv6ExtHdrs(t *testing.T) {
 				}, destinationExtHdrID
 			},
 			shouldAccept: false,
+			expectICMP:   false,
 		},
 		{
-			name: "destination with unknown option discard and send icmp action",
+			name: "destination with unknown option discard and send icmp action (unicast)",
 			extHdr: func(nextHdr uint8) ([]byte, uint8) {
 				return []byte{
 					nextHdr, 1,
@@ -439,12 +613,38 @@ func TestReceiveIPv6ExtHdrs(t *testing.T) {
 
 					// Discard & send ICMP if option is unknown.
 					191, 6, 1, 2, 3, 4, 5, 6,
+					//^  191 is an unknown option.
 				}, destinationExtHdrID
 			},
 			shouldAccept: false,
+			expectICMP:   true,
+			ICMPType:     header.ICMPv6ParamProblem,
+			ICMPCode:     header.ICMPv6UnknownOption,
+			pointer:      header.IPv6FixedHeaderSize + 8,
 		},
 		{
-			name: "destination with unknown option discard and send icmp action unless multicast dest",
+			name: "destination with unknown option discard and send icmp action (muilticast)",
+			extHdr: func(nextHdr uint8) ([]byte, uint8) {
+				return []byte{
+					nextHdr, 1,
+
+					// Skippable unknown.
+					63, 4, 1, 2, 3, 4,
+
+					// Discard & send ICMP if option is unknown.
+					191, 6, 1, 2, 3, 4, 5, 6,
+					//^  191 is an unknown option.
+				}, destinationExtHdrID
+			},
+			multicast:    true,
+			shouldAccept: false,
+			expectICMP:   true,
+			ICMPType:     header.ICMPv6ParamProblem,
+			ICMPCode:     header.ICMPv6UnknownOption,
+			pointer:      header.IPv6FixedHeaderSize + 8,
+		},
+		{
+			name: "destination with unknown option discard and send icmp action unless multicast dest (unicast)",
 			extHdr: func(nextHdr uint8) ([]byte, uint8) {
 				return []byte{
 					nextHdr, 1,
@@ -455,22 +655,33 @@ func TestReceiveIPv6ExtHdrs(t *testing.T) {
 					// Discard & send ICMP unless packet is for multicast destination if
 					// option is unknown.
 					255, 6, 1, 2, 3, 4, 5, 6,
+					//^ 255 is unknown.
 				}, destinationExtHdrID
 			},
 			shouldAccept: false,
+			expectICMP:   true,
+			ICMPType:     header.ICMPv6ParamProblem,
+			ICMPCode:     header.ICMPv6UnknownOption,
+			pointer:      header.IPv6FixedHeaderSize + 8,
 		},
 		{
-			name: "routing - atomic fragment",
+			name: "destination with unknown option discard and send icmp action unless multicast dest (multicast)",
 			extHdr: func(nextHdr uint8) ([]byte, uint8) {
 				return []byte{
-					// Routing extension header.
-					fragmentExtHdrID, 0, 1, 0, 2, 3, 4, 5,
+					nextHdr, 1,
 
-					// Fragment extension header.
-					nextHdr, 0, 0, 0, 1, 2, 3, 4,
-				}, routingExtHdrID
+					// Skippable unknown.
+					63, 4, 1, 2, 3, 4,
+
+					// Discard & send ICMP unless packet is for multicast destination if
+					// option is unknown.
+					255, 6, 1, 2, 3, 4, 5, 6,
+					//^ 255 is unknown.
+				}, destinationExtHdrID
 			},
-			shouldAccept: true,
+			shouldAccept: false,
+			expectICMP:   false,
+			multicast:    true,
 		},
 		{
 			name: "atomic fragment - routing",
@@ -504,12 +715,42 @@ func TestReceiveIPv6ExtHdrs(t *testing.T) {
 				return []byte{
 					// Routing extension header.
 					hopByHopExtHdrID, 0, 1, 0, 2, 3, 4, 5,
+					// ^^^   The HopByHop extension header may not appear after the first
+					// extension header.
 
 					// Hop By Hop extension header with skippable unknown option.
 					nextHdr, 0, 62, 4, 1, 2, 3, 4,
 				}, routingExtHdrID
 			},
 			shouldAccept: false,
+			expectICMP:   true,
+			ICMPType:     header.ICMPv6ParamProblem,
+			ICMPCode:     header.ICMPv6UnknownHeader,
+			pointer:      header.IPv6FixedHeaderSize,
+		},
+		{
+			name: "routing - hop by hop (with send icmp unknown)",
+			extHdr: func(nextHdr uint8) ([]byte, uint8) {
+				return []byte{
+					// Routing extension header.
+					hopByHopExtHdrID, 0, 1, 0, 2, 3, 4, 5,
+					// ^^^   The HopByHop extension header may not appear after the first
+					// extension header.
+
+					nextHdr, 1,
+
+					// Skippable unknown.
+					63, 4, 1, 2, 3, 4,
+
+					// Skippable unknown.
+					191, 6, 1, 2, 3, 4, 5, 6,
+				}, routingExtHdrID
+			},
+			shouldAccept: false,
+			expectICMP:   true,
+			ICMPType:     header.ICMPv6ParamProblem,
+			ICMPCode:     header.ICMPv6UnknownHeader,
+			pointer:      header.IPv6FixedHeaderSize,
 		},
 		{
 			name:         "No next header",
@@ -553,6 +794,7 @@ func TestReceiveIPv6ExtHdrs(t *testing.T) {
 				}, hopByHopExtHdrID
 			},
 			shouldAccept: false,
+			expectICMP:   false,
 		},
 		{
 			name: "hopbyhop (with skippable unknown) - routing - atomic fragment - destination (with discard unknown)",
@@ -573,6 +815,7 @@ func TestReceiveIPv6ExtHdrs(t *testing.T) {
 				}, hopByHopExtHdrID
 			},
 			shouldAccept: false,
+			expectICMP:   false,
 		},
 	}
 
@@ -582,13 +825,21 @@ func TestReceiveIPv6ExtHdrs(t *testing.T) {
 				NetworkProtocols:   []stack.NetworkProtocolFactory{NewProtocol},
 				TransportProtocols: []stack.TransportProtocolFactory{udp.NewProtocol},
 			})
-			e := channel.New(0, 1280, linkAddr1)
+			e := channel.New(1, header.IPv6MinimumMTU, linkAddr1)
 			if err := s.CreateNIC(nicID, e); err != nil {
 				t.Fatalf("CreateNIC(%d, _) = %s", nicID, err)
 			}
 			if err := s.AddAddress(nicID, ProtocolNumber, addr2); err != nil {
 				t.Fatalf("AddAddress(%d, %d, %s) = %s", nicID, ProtocolNumber, addr2, err)
 			}
+
+			// Add a default route so that a return packet knows where to go.
+			s.SetRouteTable([]tcpip.Route{
+				{
+					Destination: header.IPv6EmptySubnet,
+					NIC:         nicID,
+				},
+			})
 
 			wq := waiter.Queue{}
 			we, ch := waiter.NewChannelEntry(nil)
@@ -631,12 +882,16 @@ func TestReceiveIPv6ExtHdrs(t *testing.T) {
 			// Serialize IPv6 fixed header.
 			payloadLength := hdr.UsedLength()
 			ip := header.IPv6(hdr.Prepend(header.IPv6MinimumSize))
+			dstAddr := tcpip.Address(addr2)
+			if test.multicast {
+				dstAddr = header.IPv6AllNodesMulticastAddress
+			}
 			ip.Encode(&header.IPv6Fields{
 				PayloadLength: uint16(payloadLength),
 				NextHeader:    ipv6NextHdr,
 				HopLimit:      255,
 				SrcAddr:       addr1,
-				DstAddr:       addr2,
+				DstAddr:       dstAddr,
 			})
 
 			e.InjectInbound(ProtocolNumber, stack.NewPacketBuffer(stack.PacketBufferOptions{
@@ -650,6 +905,44 @@ func TestReceiveIPv6ExtHdrs(t *testing.T) {
 					t.Errorf("got UDP Rx Packets = %d, want = 0", got)
 				}
 
+				if !test.expectICMP {
+					if p, ok := e.Read(); ok {
+						t.Fatalf("unexpected packet received: %#v", p)
+					}
+					return
+				}
+
+				// ICMP required.
+				p, ok := e.Read()
+				if !ok {
+					t.Fatalf("expected packet wasn't written out")
+				}
+
+				// Pack the output packet into a single buffer.View as the checkers
+				// assume that.
+				vv := buffer.NewVectorisedView(p.Pkt.Size(), p.Pkt.Views())
+				pkt := vv.ToView()
+				if got, want := len(pkt), header.IPv6FixedHeaderSize+header.ICMPv6MinimumSize+hdr.UsedLength(); got != want {
+					t.Fatalf("got an ICMP packet of size = %d, want = %d", got, want)
+				}
+
+				ipHdr := header.IPv6(pkt)
+				checker.IPv6(t, ipHdr, checker.ICMPv6(
+					checker.ICMPv6Type(test.ICMPType),
+					checker.ICMPv6Code(test.ICMPCode)))
+
+				// We know we are looking at no extension headers in the error ICMP
+				// packets.
+				icmpPkt := header.ICMPv6(ipHdr.Payload())
+				// We know we sent small packets that won't be truncated when reflected
+				// back to us.
+				originalPacket := icmpPkt.Payload()
+				if got, want := icmpPkt.TypeSpecific(), test.pointer; got != want {
+					t.Errorf("unexpected ICMPv6 pointer, got = %d, want = %d\n", got, want)
+				}
+				if diff := cmp.Diff(hdr.View(), buffer.View(originalPacket)); diff != "" {
+					t.Errorf("ICMPv6 payload mismatch (-want +got):\n%s", diff)
+				}
 				return
 			}
 
@@ -683,7 +976,6 @@ type fragmentData struct {
 
 func TestReceiveIPv6Fragments(t *testing.T) {
 	const (
-		nicID             = 1
 		udpPayload1Length = 256
 		udpPayload2Length = 128
 		// Used to test cases where the fragment blocks are not a multiple of
@@ -1552,7 +1844,7 @@ func TestReceiveIPv6Fragments(t *testing.T) {
 				NetworkProtocols:   []stack.NetworkProtocolFactory{NewProtocol},
 				TransportProtocols: []stack.TransportProtocolFactory{udp.NewProtocol},
 			})
-			e := channel.New(0, 1280, linkAddr1)
+			e := channel.New(0, header.IPv6MinimumMTU, linkAddr1)
 			if err := s.CreateNIC(nicID, e); err != nil {
 				t.Fatalf("CreateNIC(%d, _) = %s", nicID, err)
 			}
@@ -1815,7 +2107,6 @@ func TestWriteStats(t *testing.T) {
 				t.Run(test.name, func(t *testing.T) {
 					ep := testutil.NewMockLinkEndpoint(header.IPv6MinimumMTU, tcpip.ErrInvalidEndpointState, test.allowPackets)
 					rt := buildRoute(t, ep)
-
 					var pkts stack.PacketBufferList
 					for i := 0; i < nPackets; i++ {
 						pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
@@ -1857,12 +2148,13 @@ func buildRoute(t *testing.T, ep stack.LinkEndpoint) stack.Route {
 		dst = "\xfc\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x02"
 	)
 	if err := s.AddAddress(1, ProtocolNumber, src); err != nil {
-		t.Fatalf("AddAddress(1, %d, _) failed: %s", ProtocolNumber, err)
+		t.Fatalf("AddAddress(1, %d, %s) failed: %s", ProtocolNumber, src, err)
 	}
 	{
-		subnet, err := tcpip.NewSubnet(dst, tcpip.AddressMask("\xfc\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff"))
+		mask := tcpip.AddressMask("\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff")
+		subnet, err := tcpip.NewSubnet(dst, mask)
 		if err != nil {
-			t.Fatalf("NewSubnet(_, _) failed: %v", err)
+			t.Fatalf("NewSubnet(%s, %s) failed: %v", dst, mask, err)
 		}
 		s.SetRouteTable([]tcpip.Route{{
 			Destination: subnet,
@@ -1871,7 +2163,7 @@ func buildRoute(t *testing.T, ep stack.LinkEndpoint) stack.Route {
 	}
 	rt, err := s.FindRoute(1, src, dst, ProtocolNumber, false /* multicastLoop */)
 	if err != nil {
-		t.Fatalf("got FindRoute(1, _, _, %d, false) = %s, want = nil", ProtocolNumber, err)
+		t.Fatalf("FindRoute(1, %s, %s, %d, false) = %s, want = nil", src, dst, ProtocolNumber, err)
 	}
 	return rt
 }
@@ -1920,5 +2212,293 @@ func TestClearEndpointFromProtocolOnClose(t *testing.T) {
 		if hasEP {
 			t.Fatalf("unexpectedly found ep = %p in set of protocol's endpoints", ep)
 		}
+	}
+}
+
+type fragmentInfo struct {
+	offset      uint16
+	more        bool
+	payloadSize uint16
+}
+
+var fragmentationTests = []struct {
+	description   string
+	mtu           uint32
+	gso           *stack.GSO
+	transHdrLen   int
+	payloadSize   int
+	wantFragments []fragmentInfo
+}{
+	{
+		description: "No fragmentation",
+		mtu:         header.IPv6MinimumMTU,
+		gso:         nil,
+		transHdrLen: 0,
+		payloadSize: 1000,
+		wantFragments: []fragmentInfo{
+			{offset: 0, payloadSize: 1000, more: false},
+		},
+	},
+	{
+		description: "Fragmented",
+		mtu:         header.IPv6MinimumMTU,
+		gso:         nil,
+		transHdrLen: 0,
+		payloadSize: 2000,
+		wantFragments: []fragmentInfo{
+			{offset: 0, payloadSize: 1240, more: true},
+			{offset: 154, payloadSize: 776, more: false},
+		},
+	},
+	{
+		description: "Fragmented with mtu not a multiple of 8",
+		mtu:         header.IPv6MinimumMTU + 1,
+		gso:         nil,
+		transHdrLen: 0,
+		payloadSize: 2000,
+		wantFragments: []fragmentInfo{
+			{offset: 0, payloadSize: 1240, more: true},
+			{offset: 154, payloadSize: 776, more: false},
+		},
+	},
+	{
+		description: "No fragmentation with big header",
+		mtu:         2000,
+		gso:         nil,
+		transHdrLen: 100,
+		payloadSize: 1000,
+		wantFragments: []fragmentInfo{
+			{offset: 0, payloadSize: 1100, more: false},
+		},
+	},
+	{
+		description: "Fragmented with gso none",
+		mtu:         header.IPv6MinimumMTU,
+		gso:         &stack.GSO{Type: stack.GSONone},
+		transHdrLen: 0,
+		payloadSize: 1400,
+		wantFragments: []fragmentInfo{
+			{offset: 0, payloadSize: 1240, more: true},
+			{offset: 154, payloadSize: 176, more: false},
+		},
+	},
+	{
+		description: "Fragmented with big header",
+		mtu:         header.IPv6MinimumMTU,
+		gso:         nil,
+		transHdrLen: 100,
+		payloadSize: 1200,
+		wantFragments: []fragmentInfo{
+			{offset: 0, payloadSize: 1240, more: true},
+			{offset: 154, payloadSize: 76, more: false},
+		},
+	},
+}
+
+func TestFragmentationWritePacket(t *testing.T) {
+	const (
+		ttl            = 42
+		tos            = stack.DefaultTOS
+		transportProto = tcp.ProtocolNumber
+	)
+
+	for _, ft := range fragmentationTests {
+		t.Run(ft.description, func(t *testing.T) {
+			pkt := testutil.MakeRandPkt(ft.transHdrLen, extraHeaderReserve+header.IPv6MinimumSize, []int{ft.payloadSize}, header.IPv6ProtocolNumber)
+			source := pkt.Clone()
+			ep := testutil.NewMockLinkEndpoint(ft.mtu, nil, math.MaxInt32)
+			r := buildRoute(t, ep)
+			err := r.WritePacket(ft.gso, stack.NetworkHeaderParams{
+				Protocol: tcp.ProtocolNumber,
+				TTL:      ttl,
+				TOS:      stack.DefaultTOS,
+			}, pkt)
+			if err != nil {
+				t.Fatalf("WritePacket(_, _, _): = %s", err)
+			}
+			if got := len(ep.WrittenPackets); got != len(ft.wantFragments) {
+				t.Errorf("got len(ep.WrittenPackets) = %d, want = %d", got, len(ft.wantFragments))
+			}
+			if got := int(r.Stats().IP.PacketsSent.Value()); got != len(ft.wantFragments) {
+				t.Errorf("got c.Route.Stats().IP.PacketsSent.Value() = %d, want = %d", got, len(ft.wantFragments))
+			}
+			if got := r.Stats().IP.OutgoingPacketErrors.Value(); got != 0 {
+				t.Errorf("got r.Stats().IP.OutgoingPacketErrors.Value() = %d, want = 0", got)
+			}
+			if err := compareFragments(ep.WrittenPackets, source, ft.mtu, ft.wantFragments, tcp.ProtocolNumber); err != nil {
+				t.Error(err)
+			}
+		})
+	}
+}
+
+func TestFragmentationWritePackets(t *testing.T) {
+	const ttl = 42
+	tests := []struct {
+		description  string
+		insertBefore int
+		insertAfter  int
+	}{
+		{
+			description:  "Single packet",
+			insertBefore: 0,
+			insertAfter:  0,
+		},
+		{
+			description:  "With packet before",
+			insertBefore: 1,
+			insertAfter:  0,
+		},
+		{
+			description:  "With packet after",
+			insertBefore: 0,
+			insertAfter:  1,
+		},
+		{
+			description:  "With packet before and after",
+			insertBefore: 1,
+			insertAfter:  1,
+		},
+	}
+	tinyPacket := testutil.MakeRandPkt(header.TCPMinimumSize, extraHeaderReserve+header.IPv6MinimumSize, []int{1}, header.IPv6ProtocolNumber)
+
+	for _, test := range tests {
+		t.Run(test.description, func(t *testing.T) {
+			for _, ft := range fragmentationTests {
+				t.Run(ft.description, func(t *testing.T) {
+					var pkts stack.PacketBufferList
+					for i := 0; i < test.insertBefore; i++ {
+						pkts.PushBack(tinyPacket.Clone())
+					}
+					pkt := testutil.MakeRandPkt(ft.transHdrLen, extraHeaderReserve+header.IPv6MinimumSize, []int{ft.payloadSize}, header.IPv6ProtocolNumber)
+					source := pkt
+					pkts.PushBack(pkt.Clone())
+					for i := 0; i < test.insertAfter; i++ {
+						pkts.PushBack(tinyPacket.Clone())
+					}
+
+					ep := testutil.NewMockLinkEndpoint(ft.mtu, nil, math.MaxInt32)
+					r := buildRoute(t, ep)
+
+					wantTotalPackets := len(ft.wantFragments) + test.insertBefore + test.insertAfter
+					n, err := r.WritePackets(ft.gso, pkts, stack.NetworkHeaderParams{
+						Protocol: tcp.ProtocolNumber,
+						TTL:      ttl,
+						TOS:      stack.DefaultTOS,
+					})
+					if n != wantTotalPackets || err != nil {
+						t.Errorf("got WritePackets(_, _, _) = (%d, %s), want = (%d, nil)", n, err, wantTotalPackets)
+					}
+					if got := len(ep.WrittenPackets); got != wantTotalPackets {
+						t.Errorf("got len(ep.WrittenPackets) = %d, want = %d", got, wantTotalPackets)
+					}
+					if got := int(r.Stats().IP.PacketsSent.Value()); got != wantTotalPackets {
+						t.Errorf("got c.Route.Stats().IP.PacketsSent.Value() = %d, want = %d", got, wantTotalPackets)
+					}
+					if got := r.Stats().IP.OutgoingPacketErrors.Value(); got != 0 {
+						t.Errorf("got r.Stats().IP.OutgoingPacketErrors.Value() = %d, want = 0", got)
+					}
+
+					if wantTotalPackets == 0 {
+						return
+					}
+
+					fragments := ep.WrittenPackets[test.insertBefore : len(ft.wantFragments)+test.insertBefore]
+					if err := compareFragments(fragments, source, ft.mtu, ft.wantFragments, tcp.ProtocolNumber); err != nil {
+						t.Error(err)
+					}
+				})
+			}
+		})
+	}
+}
+
+// TestFragmentationErrors checks that errors are returned from WritePacket
+// correctly.
+func TestFragmentationErrors(t *testing.T) {
+	const ttl = 42
+
+	tests := []struct {
+		description    string
+		mtu            uint32
+		transHdrLen    int
+		payloadSize    int
+		allowPackets   int
+		outgoingErrors int
+		mockError      *tcpip.Error
+		wantError      *tcpip.Error
+	}{
+		{
+			description:    "No frag",
+			mtu:            2000,
+			payloadSize:    1000,
+			transHdrLen:    0,
+			allowPackets:   0,
+			outgoingErrors: 1,
+			mockError:      tcpip.ErrAborted,
+			wantError:      tcpip.ErrAborted,
+		},
+		{
+			description:    "Error on first frag",
+			mtu:            1300,
+			payloadSize:    3000,
+			transHdrLen:    0,
+			allowPackets:   0,
+			outgoingErrors: 3,
+			mockError:      tcpip.ErrAborted,
+			wantError:      tcpip.ErrAborted,
+		},
+		{
+			description:    "Error on second frag",
+			mtu:            1500,
+			payloadSize:    4000,
+			transHdrLen:    0,
+			allowPackets:   1,
+			outgoingErrors: 2,
+			mockError:      tcpip.ErrAborted,
+			wantError:      tcpip.ErrAborted,
+		},
+		{
+			description:    "Error when MTU is smaller than transport header",
+			mtu:            header.IPv6MinimumMTU,
+			transHdrLen:    1500,
+			payloadSize:    500,
+			allowPackets:   0,
+			outgoingErrors: 1,
+			mockError:      nil,
+			wantError:      tcpip.ErrMessageTooLong,
+		},
+		{
+			description:    "Error when MTU is smaller than IPv6 minimum MTU",
+			mtu:            header.IPv6MinimumMTU - 1,
+			transHdrLen:    0,
+			payloadSize:    500,
+			allowPackets:   0,
+			outgoingErrors: 1,
+			mockError:      nil,
+			wantError:      tcpip.ErrInvalidEndpointState,
+		},
+	}
+
+	for _, ft := range tests {
+		t.Run(ft.description, func(t *testing.T) {
+			pkt := testutil.MakeRandPkt(ft.transHdrLen, extraHeaderReserve+header.IPv6MinimumSize, []int{ft.payloadSize}, header.IPv6ProtocolNumber)
+			ep := testutil.NewMockLinkEndpoint(ft.mtu, ft.mockError, ft.allowPackets)
+			r := buildRoute(t, ep)
+			err := r.WritePacket(&stack.GSO{}, stack.NetworkHeaderParams{
+				Protocol: tcp.ProtocolNumber,
+				TTL:      ttl,
+				TOS:      stack.DefaultTOS,
+			}, pkt)
+			if err != ft.wantError {
+				t.Errorf("got WritePacket(_, _, _) = %s, want = %s", err, ft.wantError)
+			}
+			if got := int(r.Stats().IP.PacketsSent.Value()); got != ft.allowPackets {
+				t.Errorf("got r.Stats().IP.PacketsSent.Value() = %d, want = %d", got, ft.allowPackets)
+			}
+			if got := int(r.Stats().IP.OutgoingPacketErrors.Value()); got != ft.outgoingErrors {
+				t.Errorf("got r.Stats().IP.OutgoingPacketErrors.Value() = %d, want = %d", got, ft.outgoingErrors)
+			}
+		})
 	}
 }

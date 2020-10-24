@@ -31,7 +31,7 @@ go_template_instance(
     out = "dentry_refs.go",
     package = "kernfs",
     prefix = "Dentry",
-    template = "//pkg/refs_vfs2:refs_template",
+    template = "//pkg/refsvfs2:refs_template",
     types = {
         "T": "Dentry",
     },
@@ -42,7 +42,7 @@ go_template_instance(
     out = "static_directory_refs.go",
     package = "kernfs",
     prefix = "StaticDirectory",
-    template = "//pkg/refs_vfs2:refs_template",
+    template = "//pkg/refsvfs2:refs_template",
     types = {
         "T": "StaticDirectory",
     },
@@ -53,7 +53,7 @@ go_template_instance(
     out = "dir_refs.go",
     package = "kernfs_test",
     prefix = "dir",
-    template = "//pkg/refs_vfs2:refs_template",
+    template = "//pkg/refsvfs2:refs_template",
     types = {
         "T": "dir",
     },
@@ -64,9 +64,20 @@ go_template_instance(
     out = "readonly_dir_refs.go",
     package = "kernfs_test",
     prefix = "readonlyDir",
-    template = "//pkg/refs_vfs2:refs_template",
+    template = "//pkg/refsvfs2:refs_template",
     types = {
         "T": "readonlyDir",
+    },
+)
+
+go_template_instance(
+    name = "synthetic_directory_refs",
+    out = "synthetic_directory_refs.go",
+    package = "kernfs",
+    prefix = "syntheticDirectory",
+    template = "//pkg/refsvfs2:refs_template",
+    types = {
+        "T": "syntheticDirectory",
     },
 )
 
@@ -84,6 +95,7 @@ go_library(
         "static_directory_refs.go",
         "symlink.go",
         "synthetic_directory.go",
+        "synthetic_directory_refs.go",
     ],
     visibility = ["//pkg/sentry:internal"],
     deps = [
@@ -92,8 +104,10 @@ go_library(
         "//pkg/fspath",
         "//pkg/log",
         "//pkg/refs",
+        "//pkg/refsvfs2",
         "//pkg/sentry/fs/lock",
         "//pkg/sentry/kernel/auth",
+        "//pkg/sentry/kernel/time",
         "//pkg/sentry/memmap",
         "//pkg/sentry/socket/unix/transport",
         "//pkg/sentry/vfs",
@@ -117,6 +131,7 @@ go_test(
         "//pkg/context",
         "//pkg/log",
         "//pkg/refs",
+        "//pkg/refsvfs2",
         "//pkg/sentry/contexttest",
         "//pkg/sentry/fsimpl/testutil",
         "//pkg/sentry/kernel/auth",

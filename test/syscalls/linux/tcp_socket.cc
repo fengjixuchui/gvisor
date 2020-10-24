@@ -903,6 +903,58 @@ TEST_P(SimpleTcpSocketTest, NonBlockingConnectNoListener) {
   EXPECT_EQ(err, ECONNREFUSED);
 }
 
+TEST_P(SimpleTcpSocketTest, SelfConnectSendRecv_NoRandomSave) {
+  // Initialize address to the loopback one.
+  sockaddr_storage addr =
+      ASSERT_NO_ERRNO_AND_VALUE(InetLoopbackAddr(GetParam()));
+  socklen_t addrlen = sizeof(addr);
+
+  const FileDescriptor s =
+      ASSERT_NO_ERRNO_AND_VALUE(Socket(GetParam(), SOCK_STREAM, IPPROTO_TCP));
+
+  ASSERT_THAT(
+      (bind)(s.get(), reinterpret_cast<struct sockaddr*>(&addr), addrlen),
+      SyscallSucceeds());
+  // Get the bound port.
+  ASSERT_THAT(
+      getsockname(s.get(), reinterpret_cast<struct sockaddr*>(&addr), &addrlen),
+      SyscallSucceeds());
+  ASSERT_THAT(RetryEINTR(connect)(
+                  s.get(), reinterpret_cast<struct sockaddr*>(&addr), addrlen),
+              SyscallSucceeds());
+
+  constexpr int kBufSz = 1 << 20;  // 1 MiB
+  std::vector<char> writebuf(kBufSz);
+
+  // Start reading the response in a loop.
+  int read_bytes = 0;
+  ScopedThread t([&s, &read_bytes]() {
+    // Too many syscalls.
+    const DisableSave ds;
+
+    char readbuf[2500] = {};
+    int n = -1;
+    while (n != 0) {
+      ASSERT_THAT(n = RetryEINTR(read)(s.get(), &readbuf, sizeof(readbuf)),
+                  SyscallSucceeds());
+      read_bytes += n;
+    }
+  });
+
+  // Try to send the whole thing.
+  int n;
+  ASSERT_THAT(n = SendFd(s.get(), writebuf.data(), kBufSz, 0),
+              SyscallSucceeds());
+
+  // We should have written the whole thing.
+  EXPECT_EQ(n, kBufSz);
+  EXPECT_THAT(shutdown(s.get(), SHUT_WR), SyscallSucceedsWithValue(0));
+  t.Join();
+
+  // We should have read the whole thing.
+  EXPECT_EQ(read_bytes, kBufSz);
+}
+
 TEST_P(SimpleTcpSocketTest, NonBlockingConnect) {
   const FileDescriptor listener =
       ASSERT_NO_ERRNO_AND_VALUE(Socket(GetParam(), SOCK_STREAM, IPPROTO_TCP));
@@ -1671,6 +1723,63 @@ TEST_P(SimpleTcpSocketTest, CloseNonConnectedLingerOption) {
 
   // Close() should not linger and return immediately.
   ASSERT_LT((end_time - start_time), absl::Seconds(kLingerTimeout));
+}
+
+// Tests that SO_ACCEPTCONN returns non zero value for listening sockets.
+TEST_P(TcpSocketTest, GetSocketAcceptConnListener) {
+  int got = -1;
+  socklen_t length = sizeof(got);
+  ASSERT_THAT(getsockopt(listener_, SOL_SOCKET, SO_ACCEPTCONN, &got, &length),
+              SyscallSucceeds());
+  ASSERT_EQ(length, sizeof(got));
+  EXPECT_EQ(got, 1);
+}
+
+// Tests that SO_ACCEPTCONN returns zero value for not listening sockets.
+TEST_P(TcpSocketTest, GetSocketAcceptConnNonListener) {
+  int got = -1;
+  socklen_t length = sizeof(got);
+  ASSERT_THAT(getsockopt(s_, SOL_SOCKET, SO_ACCEPTCONN, &got, &length),
+              SyscallSucceeds());
+  ASSERT_EQ(length, sizeof(got));
+  EXPECT_EQ(got, 0);
+
+  ASSERT_THAT(getsockopt(t_, SOL_SOCKET, SO_ACCEPTCONN, &got, &length),
+              SyscallSucceeds());
+  ASSERT_EQ(length, sizeof(got));
+  EXPECT_EQ(got, 0);
+}
+
+TEST_P(SimpleTcpSocketTest, GetSocketAcceptConnWithShutdown) {
+  // TODO(b/171345701): Fix the TCP state for listening socket on shutdown.
+  SKIP_IF(IsRunningOnGvisor());
+
+  FileDescriptor s =
+      ASSERT_NO_ERRNO_AND_VALUE(Socket(GetParam(), SOCK_STREAM, IPPROTO_TCP));
+
+  // Initialize address to the loopback one.
+  sockaddr_storage addr =
+      ASSERT_NO_ERRNO_AND_VALUE(InetLoopbackAddr(GetParam()));
+  socklen_t addrlen = sizeof(addr);
+
+  // Bind to some port then start listening.
+  ASSERT_THAT(bind(s.get(), reinterpret_cast<struct sockaddr*>(&addr), addrlen),
+              SyscallSucceeds());
+
+  ASSERT_THAT(listen(s.get(), SOMAXCONN), SyscallSucceeds());
+
+  int got = -1;
+  socklen_t length = sizeof(got);
+  ASSERT_THAT(getsockopt(s.get(), SOL_SOCKET, SO_ACCEPTCONN, &got, &length),
+              SyscallSucceeds());
+  ASSERT_EQ(length, sizeof(got));
+  EXPECT_EQ(got, 1);
+
+  EXPECT_THAT(shutdown(s.get(), SHUT_RD), SyscallSucceeds());
+  ASSERT_THAT(getsockopt(s.get(), SOL_SOCKET, SO_ACCEPTCONN, &got, &length),
+              SyscallSucceeds());
+  ASSERT_EQ(length, sizeof(got));
+  EXPECT_EQ(got, 0);
 }
 
 INSTANTIATE_TEST_SUITE_P(AllInetTests, SimpleTcpSocketTest,

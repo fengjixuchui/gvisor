@@ -23,7 +23,6 @@ import (
 	"gvisor.dev/gvisor/pkg/sleep"
 	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/tcpip"
-	"gvisor.dev/gvisor/pkg/tcpip/buffer"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
 )
 
@@ -32,14 +31,18 @@ var _ NetworkInterface = (*NIC)(nil)
 // NIC represents a "network interface card" to which the networking stack is
 // attached.
 type NIC struct {
+	LinkEndpoint
+
 	stack   *Stack
 	id      tcpip.NICID
 	name    string
-	linkEP  LinkEndpoint
 	context NICContext
 
-	stats            NICStats
-	neigh            *neighborCache
+	stats NICStats
+	neigh *neighborCache
+
+	// The network endpoints themselves may be modified by calling the interface's
+	// methods, but the map reference and entries must be constant.
 	networkEndpoints map[tcpip.NetworkProtocolNumber]NetworkEndpoint
 
 	// enabled is set to 1 when the NIC is enabled and 0 when it is disabled.
@@ -88,10 +91,11 @@ func newNIC(stack *Stack, id tcpip.NICID, name string, ep LinkEndpoint, ctx NICC
 	// of IPv6 is supported on this endpoint's LinkEndpoint.
 
 	nic := &NIC{
+		LinkEndpoint: ep,
+
 		stack:            stack,
 		id:               id,
 		name:             name,
-		linkEP:           ep,
 		context:          ctx,
 		stats:            makeNICStats(),
 		networkEndpoints: make(map[tcpip.NetworkProtocolNumber]NetworkEndpoint),
@@ -127,9 +131,13 @@ func newNIC(stack *Stack, id tcpip.NICID, name string, ep LinkEndpoint, ctx NICC
 		nic.networkEndpoints[netNum] = netProto.NewEndpoint(nic, stack, nud, nic)
 	}
 
-	nic.linkEP.Attach(nic)
+	nic.LinkEndpoint.Attach(nic)
 
 	return nic
+}
+
+func (n *NIC) getNetworkEndpoint(proto tcpip.NetworkProtocolNumber) NetworkEndpoint {
+	return n.networkEndpoints[proto]
 }
 
 // Enabled implements NetworkInterface.
@@ -211,10 +219,9 @@ func (n *NIC) remove() *tcpip.Error {
 	for _, ep := range n.networkEndpoints {
 		ep.Close()
 	}
-	n.networkEndpoints = nil
 
 	// Detach from link endpoint, so no packet comes in.
-	n.linkEP.Attach(nil)
+	n.LinkEndpoint.Attach(nil)
 	return nil
 }
 
@@ -234,7 +241,73 @@ func (n *NIC) isPromiscuousMode() bool {
 
 // IsLoopback implements NetworkInterface.
 func (n *NIC) IsLoopback() bool {
-	return n.linkEP.Capabilities()&CapabilityLoopback != 0
+	return n.LinkEndpoint.Capabilities()&CapabilityLoopback != 0
+}
+
+// WritePacket implements NetworkLinkEndpoint.
+func (n *NIC) WritePacket(r *Route, gso *GSO, protocol tcpip.NetworkProtocolNumber, pkt *PacketBuffer) *tcpip.Error {
+	// As per relevant RFCs, we should queue packets while we wait for link
+	// resolution to complete.
+	//
+	// RFC 1122 section 2.3.2.2 (for IPv4):
+	//   The link layer SHOULD save (rather than discard) at least
+	//   one (the latest) packet of each set of packets destined to
+	//   the same unresolved IP address, and transmit the saved
+	//   packet when the address has been resolved.
+	//
+	// RFC 4861 section 5.2 (for IPv6):
+	//   Once the IP address of the next-hop node is known, the sender
+	//   examines the Neighbor Cache for link-layer information about that
+	//   neighbor.  If no entry exists, the sender creates one, sets its state
+	//   to INCOMPLETE, initiates Address Resolution, and then queues the data
+	//   packet pending completion of address resolution.
+	if ch, err := r.Resolve(nil); err != nil {
+		if err == tcpip.ErrWouldBlock {
+			r := r.Clone()
+			n.stack.linkResQueue.enqueue(ch, &r, protocol, pkt)
+			return nil
+		}
+		return err
+	}
+
+	return n.writePacket(r, gso, protocol, pkt)
+}
+
+// WritePacketToRemote implements NetworkInterface.
+func (n *NIC) WritePacketToRemote(remoteLinkAddr tcpip.LinkAddress, gso *GSO, protocol tcpip.NetworkProtocolNumber, pkt *PacketBuffer) *tcpip.Error {
+	r := Route{
+		NetProto:          protocol,
+		RemoteLinkAddress: remoteLinkAddr,
+	}
+	return n.writePacket(&r, gso, protocol, pkt)
+}
+
+func (n *NIC) writePacket(r *Route, gso *GSO, protocol tcpip.NetworkProtocolNumber, pkt *PacketBuffer) *tcpip.Error {
+	// WritePacket takes ownership of pkt, calculate numBytes first.
+	numBytes := pkt.Size()
+
+	if err := n.LinkEndpoint.WritePacket(r, gso, protocol, pkt); err != nil {
+		return err
+	}
+
+	n.stats.Tx.Packets.Increment()
+	n.stats.Tx.Bytes.IncrementBy(uint64(numBytes))
+	return nil
+}
+
+// WritePackets implements NetworkLinkEndpoint.
+func (n *NIC) WritePackets(r *Route, gso *GSO, pkts PacketBufferList, protocol tcpip.NetworkProtocolNumber) (int, *tcpip.Error) {
+	// TODO(gvisor.dev/issue/4458): Queue packets whie link address resolution
+	// is being peformed like WritePacket.
+	writtenPackets, err := n.LinkEndpoint.WritePackets(r, gso, pkts, protocol)
+	n.stats.Tx.Packets.IncrementBy(uint64(writtenPackets))
+	writtenBytes := 0
+	for i, pb := 0, pkts.Front(); i < writtenPackets && pb != nil; i, pb = i+1, pb.Next() {
+		writtenBytes += pb.Size()
+	}
+
+	n.stats.Tx.Bytes.IncrementBy(uint64(writtenBytes))
+	return writtenPackets, err
 }
 
 // setSpoofing enables or disables address spoofing.
@@ -483,9 +556,9 @@ func (n *NIC) isInGroup(addr tcpip.Address) bool {
 
 func (n *NIC) handlePacket(protocol tcpip.NetworkProtocolNumber, dst, src tcpip.Address, remotelinkAddr tcpip.LinkAddress, addressEndpoint AssignableAddressEndpoint, pkt *PacketBuffer) {
 	r := makeRoute(protocol, dst, src, n, addressEndpoint, false /* handleLocal */, false /* multicastLoop */)
+	defer r.Release()
 	r.RemoteLinkAddress = remotelinkAddr
-	addressEndpoint.NetworkEndpoint().HandlePacket(&r, pkt)
-	addressEndpoint.DecRef()
+	n.getNetworkEndpoint(protocol).HandlePacket(&r, pkt)
 }
 
 // DeliverNetworkPacket finds the appropriate network protocol endpoint and
@@ -519,7 +592,7 @@ func (n *NIC) DeliverNetworkPacket(remote, local tcpip.LinkAddress, protocol tcp
 	// If no local link layer address is provided, assume it was sent
 	// directly to this NIC.
 	if local == "" {
-		local = n.linkEP.LinkAddress()
+		local = n.LinkEndpoint.LinkAddress()
 	}
 
 	// Are any packet type sockets listening for this network protocol?
@@ -599,11 +672,11 @@ func (n *NIC) DeliverNetworkPacket(remote, local tcpip.LinkAddress, protocol tcp
 		n := r.nic
 		if addressEndpoint := n.getAddressOrCreateTempInner(protocol, dst, false, NeverPrimaryEndpoint); addressEndpoint != nil {
 			if n.isValidForOutgoing(addressEndpoint) {
-				r.LocalLinkAddress = n.linkEP.LinkAddress()
+				r.LocalLinkAddress = n.LinkEndpoint.LinkAddress()
 				r.RemoteLinkAddress = remote
 				r.RemoteAddress = src
 				// TODO(b/123449044): Update the source NIC as well.
-				addressEndpoint.NetworkEndpoint().HandlePacket(&r, pkt)
+				n.getNetworkEndpoint(protocol).HandlePacket(&r, pkt)
 				addressEndpoint.DecRef()
 				r.Release()
 				return
@@ -614,21 +687,23 @@ func (n *NIC) DeliverNetworkPacket(remote, local tcpip.LinkAddress, protocol tcp
 
 		// n doesn't have a destination endpoint.
 		// Send the packet out of n.
-		// TODO(b/128629022): move this logic to route.WritePacket.
 		// TODO(gvisor.dev/issue/1085): According to the RFC, we must decrease the TTL field for ipv4/ipv6.
-		if ch, err := r.Resolve(nil); err != nil {
-			if err == tcpip.ErrWouldBlock {
-				n.stack.forwarder.enqueue(ch, n, &r, protocol, pkt)
-				// forwarder will release route.
-				return
-			}
+
+		// pkt may have set its header and may not have enough headroom for
+		// link-layer header for the other link to prepend. Here we create a new
+		// packet to forward.
+		fwdPkt := NewPacketBuffer(PacketBufferOptions{
+			ReserveHeaderBytes: int(n.LinkEndpoint.MaxHeaderLength()),
+			// We need to do a deep copy of the IP packet because WritePacket (and
+			// friends) take ownership of the packet buffer, but we do not own it.
+			Data: PayloadSince(pkt.NetworkHeader()).ToVectorisedView(),
+		})
+
+		// TODO(b/143425874) Decrease the TTL field in forwarded packets.
+		if err := n.WritePacket(&r, nil, protocol, fwdPkt); err != nil {
 			n.stack.stats.IP.InvalidDestinationAddressesReceived.Increment()
-			r.Release()
-			return
 		}
 
-		// The link-address resolution finished immediately.
-		n.forwardPacket(&r, protocol, pkt)
 		r.Release()
 		return
 	}
@@ -652,32 +727,9 @@ func (n *NIC) DeliverOutboundPacket(remote, local tcpip.LinkAddress, protocol tc
 		p.PktType = tcpip.PacketOutgoing
 		// Add the link layer header as outgoing packets are intercepted
 		// before the link layer header is created.
-		n.linkEP.AddHeader(local, remote, protocol, p)
+		n.LinkEndpoint.AddHeader(local, remote, protocol, p)
 		ep.HandlePacket(n.id, local, protocol, p)
 	}
-}
-
-func (n *NIC) forwardPacket(r *Route, protocol tcpip.NetworkProtocolNumber, pkt *PacketBuffer) {
-	// TODO(b/143425874) Decrease the TTL field in forwarded packets.
-
-	// pkt may have set its header and may not have enough headroom for link-layer
-	// header for the other link to prepend. Here we create a new packet to
-	// forward.
-	fwdPkt := NewPacketBuffer(PacketBufferOptions{
-		ReserveHeaderBytes: int(n.linkEP.MaxHeaderLength()),
-		Data:               buffer.NewVectorisedView(pkt.Size(), pkt.Views()),
-	})
-
-	// WritePacket takes ownership of fwdPkt, calculate numBytes first.
-	numBytes := fwdPkt.Size()
-
-	if err := n.linkEP.WritePacket(r, nil /* gso */, protocol, fwdPkt); err != nil {
-		r.Stats().IP.OutgoingPacketErrors.Increment()
-		return
-	}
-
-	n.stats.Tx.Packets.Increment()
-	n.stats.Tx.Bytes.IncrementBy(uint64(numBytes))
 }
 
 // DeliverTransportPacket delivers the packets to the appropriate transport
@@ -685,10 +737,8 @@ func (n *NIC) forwardPacket(r *Route, protocol tcpip.NetworkProtocolNumber, pkt 
 func (n *NIC) DeliverTransportPacket(r *Route, protocol tcpip.TransportProtocolNumber, pkt *PacketBuffer) TransportPacketDisposition {
 	state, ok := n.stack.transportProtocols[protocol]
 	if !ok {
-		// TODO(gvisor.dev/issue/4365): Let the caller know that the transport
-		// protocol is unrecognized.
 		n.stack.stats.UnknownProtocolRcvdPackets.Increment()
-		return TransportPacketHandled
+		return TransportPacketProtocolUnreachable
 	}
 
 	transProto := state.proto
@@ -790,11 +840,6 @@ func (n *NIC) ID() tcpip.NICID {
 // Name implements NetworkInterface.
 func (n *NIC) Name() string {
 	return n.name
-}
-
-// LinkEndpoint implements NetworkInterface.
-func (n *NIC) LinkEndpoint() LinkEndpoint {
-	return n.linkEP
 }
 
 // nudConfigs gets the NUD configurations for n.

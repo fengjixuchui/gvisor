@@ -56,7 +56,6 @@ go_library(
     srcs = [
         "addressable_endpoint_state.go",
         "conntrack.go",
-        "forwarder.go",
         "headertype_string.go",
         "icmp_rate_limit.go",
         "iptables.go",
@@ -73,6 +72,7 @@ go_library(
         "nud.go",
         "packet_buffer.go",
         "packet_buffer_list.go",
+        "pending_packets.go",
         "rand.go",
         "registration.go",
         "route.go",
@@ -139,7 +139,7 @@ go_test(
     name = "stack_test",
     size = "small",
     srcs = [
-        "forwarder_test.go",
+        "forwarding_test.go",
         "linkaddrcache_test.go",
         "neighbor_cache_test.go",
         "neighbor_entry_test.go",

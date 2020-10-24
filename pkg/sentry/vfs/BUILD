@@ -32,7 +32,7 @@ go_template_instance(
     out = "file_description_refs.go",
     package = "vfs",
     prefix = "FileDescription",
-    template = "//pkg/refs_vfs2:refs_template",
+    template = "//pkg/refsvfs2:refs_template",
     types = {
         "T": "FileDescription",
     },
@@ -43,7 +43,7 @@ go_template_instance(
     out = "mount_namespace_refs.go",
     package = "vfs",
     prefix = "MountNamespace",
-    template = "//pkg/refs_vfs2:refs_template",
+    template = "//pkg/refsvfs2:refs_template",
     types = {
         "T": "MountNamespace",
     },
@@ -54,7 +54,7 @@ go_template_instance(
     out = "filesystem_refs.go",
     package = "vfs",
     prefix = "Filesystem",
-    template = "//pkg/refs_vfs2:refs_template",
+    template = "//pkg/refsvfs2:refs_template",
     types = {
         "T": "Filesystem",
     },
@@ -87,12 +87,12 @@ go_library(
         "pathname.go",
         "permissions.go",
         "resolving_path.go",
+        "save_restore.go",
         "vfs.go",
     ],
     visibility = ["//pkg/sentry:internal"],
     deps = [
         "//pkg/abi/linux",
-        "//pkg/binary",
         "//pkg/context",
         "//pkg/fd",
         "//pkg/fdnotifier",
@@ -100,6 +100,7 @@ go_library(
         "//pkg/gohacks",
         "//pkg/log",
         "//pkg/refs",
+        "//pkg/refsvfs2",
         "//pkg/safemem",
         "//pkg/sentry/arch",
         "//pkg/sentry/fs",

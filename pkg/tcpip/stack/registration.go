@@ -208,6 +208,10 @@ const (
 	// transport layer and callers need not take any further action.
 	TransportPacketHandled TransportPacketDisposition = iota
 
+	// TransportPacketProtocolUnreachable indicates that the transport
+	// protocol requested in the packet is not supported.
+	TransportPacketProtocolUnreachable
+
 	// TransportPacketDestinationPortUnreachable indicates that there weren't any
 	// listeners interested in the packet and the transport protocol has no means
 	// to notify the sender.
@@ -322,10 +326,6 @@ const (
 // AssignableAddressEndpoint is a reference counted address endpoint that may be
 // assigned to a NetworkEndpoint.
 type AssignableAddressEndpoint interface {
-	// NetworkEndpoint returns the NetworkEndpoint the receiver is associated
-	// with.
-	NetworkEndpoint() NetworkEndpoint
-
 	// AddressWithPrefix returns the endpoint's address.
 	AddressWithPrefix() tcpip.AddressWithPrefix
 
@@ -475,6 +475,8 @@ type NDPEndpoint interface {
 
 // NetworkInterface is a network interface.
 type NetworkInterface interface {
+	NetworkLinkEndpoint
+
 	// ID returns the interface's ID.
 	ID() tcpip.NICID
 
@@ -489,8 +491,8 @@ type NetworkInterface interface {
 	// Enabled returns true if the interface is enabled.
 	Enabled() bool
 
-	// LinkEndpoint returns the link endpoint backing the interface.
-	LinkEndpoint() LinkEndpoint
+	// WritePacketToRemote writes the packet to the given remote link address.
+	WritePacketToRemote(tcpip.LinkAddress, *GSO, tcpip.NetworkProtocolNumber, *PacketBuffer) *tcpip.Error
 }
 
 // NetworkEndpoint is the interface that needs to be implemented by endpoints
@@ -663,21 +665,14 @@ const (
 	CapabilitySoftwareGSO
 )
 
-// LinkEndpoint is the interface implemented by data link layer protocols (e.g.,
-// ethernet, loopback, raw) and used by network layer protocols to send packets
-// out through the implementer's data link endpoint. When a link header exists,
-// it sets each PacketBuffer's LinkHeader field before passing it up the
-// stack.
-type LinkEndpoint interface {
+// NetworkLinkEndpoint is a data-link layer that supports sending network
+// layer packets.
+type NetworkLinkEndpoint interface {
 	// MTU is the maximum transmission unit for this endpoint. This is
 	// usually dictated by the backing physical network; when such a
 	// physical network doesn't exist, the limit is generally 64k, which
 	// includes the maximum size of an IP packet.
 	MTU() uint32
-
-	// Capabilities returns the set of capabilities supported by the
-	// endpoint.
-	Capabilities() LinkEndpointCapabilities
 
 	// MaxHeaderLength returns the maximum size the data link (and
 	// lower level layers combined) headers can have. Higher levels use this
@@ -686,7 +681,7 @@ type LinkEndpoint interface {
 	MaxHeaderLength() uint16
 
 	// LinkAddress returns the link address (typically a MAC) of the
-	// link endpoint.
+	// endpoint.
 	LinkAddress() tcpip.LinkAddress
 
 	// WritePacket writes a packet with the given protocol through the
@@ -706,6 +701,19 @@ type LinkEndpoint interface {
 	// offload is enabled. If it will be used for something else, it may
 	// require to change syscall filters.
 	WritePackets(r *Route, gso *GSO, pkts PacketBufferList, protocol tcpip.NetworkProtocolNumber) (int, *tcpip.Error)
+}
+
+// LinkEndpoint is the interface implemented by data link layer protocols (e.g.,
+// ethernet, loopback, raw) and used by network layer protocols to send packets
+// out through the implementer's data link endpoint. When a link header exists,
+// it sets each PacketBuffer's LinkHeader field before passing it up the
+// stack.
+type LinkEndpoint interface {
+	NetworkLinkEndpoint
+
+	// Capabilities returns the set of capabilities supported by the
+	// endpoint.
+	Capabilities() LinkEndpointCapabilities
 
 	// WriteRawPacket writes a packet directly to the link. The packet
 	// should already have an ethernet header. It takes ownership of vv.
@@ -759,13 +767,13 @@ type InjectableLinkEndpoint interface {
 // A LinkAddressResolver is an extension to a NetworkProtocol that
 // can resolve link addresses.
 type LinkAddressResolver interface {
-	// LinkAddressRequest sends a request for the LinkAddress of addr. Broadcasts
-	// the request on the local network if remoteLinkAddr is the zero value. The
-	// request is sent on linkEP with localAddr as the source.
+	// LinkAddressRequest sends a request for the link address of the target
+	// address. The request is broadcasted on the local network if a remote link
+	// address is not provided.
 	//
-	// A valid response will cause the discovery protocol's network
-	// endpoint to call AddLinkAddress.
-	LinkAddressRequest(addr, localAddr tcpip.Address, remoteLinkAddr tcpip.LinkAddress, linkEP LinkEndpoint) *tcpip.Error
+	// The request is sent from the passed network interface. If the interface
+	// local address is unspecified, any interface local address may be used.
+	LinkAddressRequest(targetAddr, localAddr tcpip.Address, remoteLinkAddr tcpip.LinkAddress, nic NetworkInterface) *tcpip.Error
 
 	// ResolveStaticAddress attempts to resolve address without sending
 	// requests. It either resolves the name immediately or returns the

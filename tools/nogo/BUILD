@@ -1,15 +1,28 @@
-load("//tools:defs.bzl", "bzl_library", "go_library")
-load("//tools/nogo:defs.bzl", "nogo_dump_tool", "nogo_stdlib")
+load("//tools:defs.bzl", "bzl_library", "go_library", "select_goarch", "select_goos")
+load("//tools/nogo:defs.bzl", "nogo_objdump_tool", "nogo_stdlib", "nogo_target")
 
 package(licenses = ["notice"])
 
-nogo_dump_tool(
-    name = "dump_tool",
+nogo_target(
+    name = "target",
+    goarch = select_goarch(),
+    goos = select_goos(),
+    visibility = ["//visibility:public"],
+)
+
+nogo_objdump_tool(
+    name = "objdump_tool",
     visibility = ["//visibility:public"],
 )
 
 nogo_stdlib(
     name = "stdlib",
+    visibility = ["//visibility:public"],
+)
+
+sh_binary(
+    name = "gentest",
+    srcs = ["gentest.sh"],
     visibility = ["//visibility:public"],
 )
 
@@ -27,6 +40,8 @@ go_library(
     deps = [
         "//tools/checkescape",
         "//tools/checkunsafe",
+        "@co_honnef_go_tools//staticcheck:go_default_library",
+        "@co_honnef_go_tools//stylecheck:go_default_library",
         "@org_golang_x_tools//go/analysis:go_tool_library",
         "@org_golang_x_tools//go/analysis/internal/facts:go_tool_library",
         "@org_golang_x_tools//go/analysis/passes/asmdecl:go_tool_library",

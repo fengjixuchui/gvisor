@@ -14,13 +14,17 @@
 
 #ifndef __linux__
 
+#include "test/util/logging.h"
+
 namespace gvisor {
 namespace testing {
+namespace internal {
 
-void MaybeSave() {
-  // Saving is never available in a non-linux environment.
+void DoCooperativeSave() {
+  TEST_CHECK_MSG(false, "DoCooperativeSave not implemented");
 }
 
+}  // namespace internal
 }  // namespace testing
 }  // namespace gvisor
 
