@@ -6,11 +6,11 @@ import (
 	"gvisor.dev/gvisor/pkg/state"
 )
 
-func (x *SignalFileDescription) StateTypeName() string {
+func (sfd *SignalFileDescription) StateTypeName() string {
 	return "pkg/sentry/fsimpl/signalfd.SignalFileDescription"
 }
 
-func (x *SignalFileDescription) StateFields() []string {
+func (sfd *SignalFileDescription) StateFields() []string {
 	return []string{
 		"vfsfd",
 		"FileDescriptionDefaultImpl",
@@ -21,27 +21,27 @@ func (x *SignalFileDescription) StateFields() []string {
 	}
 }
 
-func (x *SignalFileDescription) beforeSave() {}
+func (sfd *SignalFileDescription) beforeSave() {}
 
-func (x *SignalFileDescription) StateSave(m state.Sink) {
-	x.beforeSave()
-	m.Save(0, &x.vfsfd)
-	m.Save(1, &x.FileDescriptionDefaultImpl)
-	m.Save(2, &x.DentryMetadataFileDescriptionImpl)
-	m.Save(3, &x.NoLockFD)
-	m.Save(4, &x.target)
-	m.Save(5, &x.mask)
+func (sfd *SignalFileDescription) StateSave(stateSinkObject state.Sink) {
+	sfd.beforeSave()
+	stateSinkObject.Save(0, &sfd.vfsfd)
+	stateSinkObject.Save(1, &sfd.FileDescriptionDefaultImpl)
+	stateSinkObject.Save(2, &sfd.DentryMetadataFileDescriptionImpl)
+	stateSinkObject.Save(3, &sfd.NoLockFD)
+	stateSinkObject.Save(4, &sfd.target)
+	stateSinkObject.Save(5, &sfd.mask)
 }
 
-func (x *SignalFileDescription) afterLoad() {}
+func (sfd *SignalFileDescription) afterLoad() {}
 
-func (x *SignalFileDescription) StateLoad(m state.Source) {
-	m.Load(0, &x.vfsfd)
-	m.Load(1, &x.FileDescriptionDefaultImpl)
-	m.Load(2, &x.DentryMetadataFileDescriptionImpl)
-	m.Load(3, &x.NoLockFD)
-	m.Load(4, &x.target)
-	m.Load(5, &x.mask)
+func (sfd *SignalFileDescription) StateLoad(stateSourceObject state.Source) {
+	stateSourceObject.Load(0, &sfd.vfsfd)
+	stateSourceObject.Load(1, &sfd.FileDescriptionDefaultImpl)
+	stateSourceObject.Load(2, &sfd.DentryMetadataFileDescriptionImpl)
+	stateSourceObject.Load(3, &sfd.NoLockFD)
+	stateSourceObject.Load(4, &sfd.target)
+	stateSourceObject.Load(5, &sfd.mask)
 }
 
 func init() {

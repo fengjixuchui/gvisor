@@ -27,12 +27,10 @@ import (
 	"gvisor.dev/gvisor/pkg/usermem"
 )
 
-func (fs *filesystem) newKcovFile(ctx context.Context, creds *auth.Credentials) *kernfs.Dentry {
+func (fs *filesystem) newKcovFile(ctx context.Context, creds *auth.Credentials) kernfs.Inode {
 	k := &kcovInode{}
-	k.InodeAttrs.Init(creds, 0, 0, fs.NextIno(), linux.S_IFREG|0600)
-	d := &kernfs.Dentry{}
-	d.Init(k)
-	return d
+	k.InodeAttrs.Init(ctx, creds, 0, 0, fs.NextIno(), linux.S_IFREG|0600)
+	return k
 }
 
 // kcovInode implements kernfs.Inode.
@@ -104,7 +102,7 @@ func (fd *kcovFD) ConfigureMMap(ctx context.Context, opts *memmap.MMapOpts) erro
 func (fd *kcovFD) Release(ctx context.Context) {
 	// kcov instances have reference counts in Linux, but this seems sufficient
 	// for our purposes.
-	fd.kcov.Reset()
+	fd.kcov.Clear(ctx)
 }
 
 // SetStat implements vfs.FileDescriptionImpl.SetStat.

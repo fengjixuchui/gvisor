@@ -6,11 +6,11 @@ import (
 	"gvisor.dev/gvisor/pkg/state"
 )
 
-func (x *TimerFileDescription) StateTypeName() string {
+func (tfd *TimerFileDescription) StateTypeName() string {
 	return "pkg/sentry/fsimpl/timerfd.TimerFileDescription"
 }
 
-func (x *TimerFileDescription) StateFields() []string {
+func (tfd *TimerFileDescription) StateFields() []string {
 	return []string{
 		"vfsfd",
 		"FileDescriptionDefaultImpl",
@@ -22,29 +22,29 @@ func (x *TimerFileDescription) StateFields() []string {
 	}
 }
 
-func (x *TimerFileDescription) beforeSave() {}
+func (tfd *TimerFileDescription) beforeSave() {}
 
-func (x *TimerFileDescription) StateSave(m state.Sink) {
-	x.beforeSave()
-	m.Save(0, &x.vfsfd)
-	m.Save(1, &x.FileDescriptionDefaultImpl)
-	m.Save(2, &x.DentryMetadataFileDescriptionImpl)
-	m.Save(3, &x.NoLockFD)
-	m.Save(4, &x.events)
-	m.Save(5, &x.timer)
-	m.Save(6, &x.val)
+func (tfd *TimerFileDescription) StateSave(stateSinkObject state.Sink) {
+	tfd.beforeSave()
+	stateSinkObject.Save(0, &tfd.vfsfd)
+	stateSinkObject.Save(1, &tfd.FileDescriptionDefaultImpl)
+	stateSinkObject.Save(2, &tfd.DentryMetadataFileDescriptionImpl)
+	stateSinkObject.Save(3, &tfd.NoLockFD)
+	stateSinkObject.Save(4, &tfd.events)
+	stateSinkObject.Save(5, &tfd.timer)
+	stateSinkObject.Save(6, &tfd.val)
 }
 
-func (x *TimerFileDescription) afterLoad() {}
+func (tfd *TimerFileDescription) afterLoad() {}
 
-func (x *TimerFileDescription) StateLoad(m state.Source) {
-	m.Load(0, &x.vfsfd)
-	m.Load(1, &x.FileDescriptionDefaultImpl)
-	m.Load(2, &x.DentryMetadataFileDescriptionImpl)
-	m.Load(3, &x.NoLockFD)
-	m.Load(4, &x.events)
-	m.Load(5, &x.timer)
-	m.Load(6, &x.val)
+func (tfd *TimerFileDescription) StateLoad(stateSourceObject state.Source) {
+	stateSourceObject.Load(0, &tfd.vfsfd)
+	stateSourceObject.Load(1, &tfd.FileDescriptionDefaultImpl)
+	stateSourceObject.Load(2, &tfd.DentryMetadataFileDescriptionImpl)
+	stateSourceObject.Load(3, &tfd.NoLockFD)
+	stateSourceObject.Load(4, &tfd.events)
+	stateSourceObject.Load(5, &tfd.timer)
+	stateSourceObject.Load(6, &tfd.val)
 }
 
 func init() {

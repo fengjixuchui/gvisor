@@ -170,6 +170,7 @@ func (c *containerMounter) mountAll(conf *config.Config, procArgs *kernel.Create
 	rootProcArgs.MountNamespaceVFS2 = mns
 
 	root := mns.Root()
+	root.IncRef()
 	defer root.DecRef(rootCtx)
 	if root.Mount().ReadOnly() {
 		// Switch to ReadWrite while we setup submounts.
@@ -209,6 +210,9 @@ func (c *containerMounter) createMountNamespaceVFS2(ctx context.Context, conf *c
 		ReadOnly: c.root.Readonly,
 		GetFilesystemOptions: vfs.GetFilesystemOptions{
 			Data: strings.Join(data, ","),
+			InternalData: gofer.InternalFilesystemOptions{
+				UniqueID: "/",
+			},
 		},
 		InternalMount: true,
 	}
@@ -263,10 +267,38 @@ func (c *containerMounter) configureOverlay(ctx context.Context, creds *auth.Cre
 	}
 	cu.Add(func() { lower.DecRef(ctx) })
 
+	// Propagate the lower layer's root's owner, group, and mode to the upper
+	// layer's root for consistency with VFS1.
+	upperRootVD := vfs.MakeVirtualDentry(upper, upper.Root())
+	lowerRootVD := vfs.MakeVirtualDentry(lower, lower.Root())
+	stat, err := c.k.VFS().StatAt(ctx, creds, &vfs.PathOperation{
+		Root:  lowerRootVD,
+		Start: lowerRootVD,
+	}, &vfs.StatOptions{
+		Mask: linux.STATX_UID | linux.STATX_GID | linux.STATX_MODE,
+	})
+	if err != nil {
+		return nil, nil, err
+	}
+	err = c.k.VFS().SetStatAt(ctx, creds, &vfs.PathOperation{
+		Root:  upperRootVD,
+		Start: upperRootVD,
+	}, &vfs.SetStatOptions{
+		Stat: linux.Statx{
+			Mask: (linux.STATX_UID | linux.STATX_GID | linux.STATX_MODE) & stat.Mask,
+			UID:  stat.UID,
+			GID:  stat.GID,
+			Mode: stat.Mode,
+		},
+	})
+	if err != nil {
+		return nil, nil, err
+	}
+
 	// Configure overlay with both layers.
 	overlayOpts.GetFilesystemOptions.InternalData = overlay.FilesystemOptions{
-		UpperRoot:  vfs.MakeVirtualDentry(upper, upper.Root()),
-		LowerRoots: []vfs.VirtualDentry{vfs.MakeVirtualDentry(lower, lower.Root())},
+		UpperRoot:  upperRootVD,
+		LowerRoots: []vfs.VirtualDentry{lowerRootVD},
 	}
 	return &overlayOpts, cu.Release(), nil
 }
@@ -377,6 +409,7 @@ func (c *containerMounter) mountSubmountVFS2(ctx context.Context, conf *config.C
 	}
 
 	root := mns.Root()
+	root.IncRef()
 	defer root.DecRef(ctx)
 	target := &vfs.PathOperation{
 		Root:  root,
@@ -397,6 +430,7 @@ func (c *containerMounter) getMountNameAndOptionsVFS2(conf *config.Config, m *mo
 	fsName := m.Type
 	useOverlay := false
 	var data []string
+	var iopts interface{}
 
 	// Find filesystem name and FS specific data field.
 	switch m.Type {
@@ -421,6 +455,9 @@ func (c *containerMounter) getMountNameAndOptionsVFS2(conf *config.Config, m *mo
 			return "", nil, false, fmt.Errorf("9P mount requires a connection FD")
 		}
 		data = p9MountData(m.fd, c.getMountAccessType(m.Mount), true /* vfs2 */)
+		iopts = gofer.InternalFilesystemOptions{
+			UniqueID: m.Destination,
+		}
 
 		// If configured, add overlay to all writable mounts.
 		useOverlay = conf.Overlay && !mountFlags(m.Options).ReadOnly
@@ -432,7 +469,8 @@ func (c *containerMounter) getMountNameAndOptionsVFS2(conf *config.Config, m *mo
 
 	opts := &vfs.MountOptions{
 		GetFilesystemOptions: vfs.GetFilesystemOptions{
-			Data: strings.Join(data, ","),
+			Data:         strings.Join(data, ","),
+			InternalData: iopts,
 		},
 		InternalMount: true,
 	}
@@ -474,6 +512,7 @@ func (c *containerMounter) mountTmpVFS2(ctx context.Context, conf *config.Config
 	}
 
 	root := mns.Root()
+	root.IncRef()
 	defer root.DecRef(ctx)
 	pop := vfs.PathOperation{
 		Root:  root,
@@ -597,6 +636,7 @@ func (c *containerMounter) mountSharedSubmountVFS2(ctx context.Context, conf *co
 	defer newMnt.DecRef(ctx)
 
 	root := mns.Root()
+	root.IncRef()
 	defer root.DecRef(ctx)
 	target := &vfs.PathOperation{
 		Root:  root,
@@ -617,6 +657,7 @@ func (c *containerMounter) mountSharedSubmountVFS2(ctx context.Context, conf *co
 
 func (c *containerMounter) makeMountPoint(ctx context.Context, creds *auth.Credentials, mns *vfs.MountNamespace, dest string) error {
 	root := mns.Root()
+	root.IncRef()
 	defer root.DecRef(ctx)
 	target := &vfs.PathOperation{
 		Root:  root,
@@ -633,4 +674,22 @@ func (c *containerMounter) makeMountPoint(ctx context.Context, creds *auth.Crede
 		return nil
 	}
 	return c.k.VFS().MakeSyntheticMountpoint(ctx, dest, root, creds)
+}
+
+// configureRestore returns an updated context.Context including filesystem
+// state used by restore defined by conf.
+func (c *containerMounter) configureRestore(ctx context.Context, conf *config.Config) (context.Context, error) {
+	fdmap := make(map[string]int)
+	fdmap["/"] = c.fds.remove()
+	mounts, err := c.prepareMountsVFS2()
+	if err != nil {
+		return ctx, err
+	}
+	for i := range c.mounts {
+		submount := &mounts[i]
+		if submount.fd >= 0 {
+			fdmap[submount.Destination] = submount.fd
+		}
+	}
+	return context.WithValue(ctx, gofer.CtxRestoreServerFDMap, fdmap), nil
 }

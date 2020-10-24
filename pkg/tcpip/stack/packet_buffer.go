@@ -19,6 +19,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/buffer"
+	"gvisor.dev/gvisor/pkg/tcpip/header"
 )
 
 type headerType int
@@ -255,6 +256,20 @@ func (pk *PacketBuffer) Clone() *PacketBuffer {
 	return newPk
 }
 
+// Network returns the network header as a header.Network.
+//
+// Network should only be called when NetworkHeader has been set.
+func (pk *PacketBuffer) Network() header.Network {
+	switch netProto := pk.NetworkProtocolNumber; netProto {
+	case header.IPv4ProtocolNumber:
+		return header.IPv4(pk.NetworkHeader().View())
+	case header.IPv6ProtocolNumber:
+		return header.IPv6(pk.NetworkHeader().View())
+	default:
+		panic(fmt.Sprintf("unknown network protocol number %d", netProto))
+	}
+}
+
 // headerInfo stores metadata about a header in a packet.
 type headerInfo struct {
 	// buf is the memorized slice for both prepended and consumed header.
@@ -296,11 +311,25 @@ func (h PacketHeader) Consume(size int) (v buffer.View, consumed bool) {
 }
 
 // PayloadSince returns packet payload starting from and including a particular
-// header. This method isn't optimized and should be used in test only.
+// header.
+//
+// The returned View is owned by the caller - its backing buffer is separate
+// from the packet header's underlying packet buffer.
 func PayloadSince(h PacketHeader) buffer.View {
-	var v buffer.View
+	size := h.pk.Data.Size()
+	for _, hinfo := range h.pk.headers[h.typ:] {
+		size += len(hinfo.buf)
+	}
+
+	v := make(buffer.View, 0, size)
+
 	for _, hinfo := range h.pk.headers[h.typ:] {
 		v = append(v, hinfo.buf...)
 	}
-	return append(v, h.pk.Data.ToView()...)
+
+	for _, view := range h.pk.Data.Views() {
+		v = append(v, view...)
+	}
+
+	return v
 }

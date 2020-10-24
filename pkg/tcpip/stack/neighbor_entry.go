@@ -27,7 +27,6 @@ import (
 // NeighborEntry describes a neighboring device in the local network.
 type NeighborEntry struct {
 	Addr      tcpip.Address
-	LocalAddr tcpip.Address
 	LinkAddr  tcpip.LinkAddress
 	State     NeighborState
 	UpdatedAt time.Time
@@ -106,15 +105,14 @@ type neighborEntry struct {
 // state, Unknown. Transition out of Unknown by calling either
 // `handlePacketQueuedLocked` or `handleProbeLocked` on the newly created
 // neighborEntry.
-func newNeighborEntry(nic *NIC, remoteAddr tcpip.Address, localAddr tcpip.Address, nudState *NUDState, linkRes LinkAddressResolver) *neighborEntry {
+func newNeighborEntry(nic *NIC, remoteAddr tcpip.Address, nudState *NUDState, linkRes LinkAddressResolver) *neighborEntry {
 	return &neighborEntry{
 		nic:      nic,
 		linkRes:  linkRes,
 		nudState: nudState,
 		neigh: NeighborEntry{
-			Addr:      remoteAddr,
-			LocalAddr: localAddr,
-			State:     Unknown,
+			Addr:  remoteAddr,
+			State: Unknown,
 		},
 	}
 }
@@ -206,6 +204,74 @@ func (e *neighborEntry) setStateLocked(next NeighborState) {
 
 	switch next {
 	case Incomplete:
+		panic(fmt.Sprintf("should never transition to Incomplete with setStateLocked; neigh = %#v, prev state = %s", e.neigh, prev))
+
+	case Reachable:
+		e.job = e.nic.stack.newJob(&e.mu, func() {
+			e.dispatchChangeEventLocked(Stale)
+			e.setStateLocked(Stale)
+		})
+		e.job.Schedule(e.nudState.ReachableTime())
+
+	case Delay:
+		e.job = e.nic.stack.newJob(&e.mu, func() {
+			e.dispatchChangeEventLocked(Probe)
+			e.setStateLocked(Probe)
+		})
+		e.job.Schedule(config.DelayFirstProbeTime)
+
+	case Probe:
+		var retryCounter uint32
+		var sendUnicastProbe func()
+
+		sendUnicastProbe = func() {
+			if retryCounter == config.MaxUnicastProbes {
+				e.dispatchRemoveEventLocked()
+				e.setStateLocked(Failed)
+				return
+			}
+
+			if err := e.linkRes.LinkAddressRequest(e.neigh.Addr, "" /* localAddr */, e.neigh.LinkAddr, e.nic); err != nil {
+				e.dispatchRemoveEventLocked()
+				e.setStateLocked(Failed)
+				return
+			}
+
+			retryCounter++
+			e.job = e.nic.stack.newJob(&e.mu, sendUnicastProbe)
+			e.job.Schedule(config.RetransmitTimer)
+		}
+
+		sendUnicastProbe()
+
+	case Failed:
+		e.notifyWakersLocked()
+		e.job = e.nic.stack.newJob(&e.mu, func() {
+			e.nic.neigh.removeEntryLocked(e)
+		})
+		e.job.Schedule(config.UnreachableTime)
+
+	case Unknown, Stale, Static:
+		// Do nothing
+
+	default:
+		panic(fmt.Sprintf("Invalid state transition from %q to %q", prev, next))
+	}
+}
+
+// handlePacketQueuedLocked advances the state machine according to a packet
+// being queued for outgoing transmission.
+//
+// Follows the logic defined in RFC 4861 section 7.3.3.
+func (e *neighborEntry) handlePacketQueuedLocked(localAddr tcpip.Address) {
+	switch e.neigh.State {
+	case Unknown:
+		e.dispatchAddEventLocked(Incomplete)
+
+		e.neigh.State = Incomplete
+		e.neigh.UpdatedAt = time.Now()
+		config := e.nudState.Config()
+
 		var retryCounter uint32
 		var sendMulticastProbe func()
 
@@ -236,7 +302,14 @@ func (e *neighborEntry) setStateLocked(next NeighborState) {
 				return
 			}
 
-			if err := e.linkRes.LinkAddressRequest(e.neigh.Addr, e.neigh.LocalAddr, "", e.nic.linkEP); err != nil {
+			// As per RFC 4861 section 7.2.2:
+			//
+			//  If the source address of the packet prompting the solicitation is the
+			//  same as one of the addresses assigned to the outgoing interface, that
+			//  address SHOULD be placed in the IP Source Address of the outgoing
+			//  solicitation.
+			//
+			if err := e.linkRes.LinkAddressRequest(e.neigh.Addr, localAddr, "", e.nic); err != nil {
 				// There is no need to log the error here; the NUD implementation may
 				// assume a working link. A valid link should be the responsibility of
 				// the NIC/stack.LinkEndpoint.
@@ -251,75 +324,6 @@ func (e *neighborEntry) setStateLocked(next NeighborState) {
 		}
 
 		sendMulticastProbe()
-
-	case Reachable:
-		e.job = e.nic.stack.newJob(&e.mu, func() {
-			e.dispatchChangeEventLocked(Stale)
-			e.setStateLocked(Stale)
-		})
-		e.job.Schedule(e.nudState.ReachableTime())
-
-	case Delay:
-		e.job = e.nic.stack.newJob(&e.mu, func() {
-			e.dispatchChangeEventLocked(Probe)
-			e.setStateLocked(Probe)
-		})
-		e.job.Schedule(config.DelayFirstProbeTime)
-
-	case Probe:
-		var retryCounter uint32
-		var sendUnicastProbe func()
-
-		sendUnicastProbe = func() {
-			if retryCounter == config.MaxUnicastProbes {
-				e.dispatchRemoveEventLocked()
-				e.setStateLocked(Failed)
-				return
-			}
-
-			if err := e.linkRes.LinkAddressRequest(e.neigh.Addr, e.neigh.LocalAddr, e.neigh.LinkAddr, e.nic.linkEP); err != nil {
-				e.dispatchRemoveEventLocked()
-				e.setStateLocked(Failed)
-				return
-			}
-
-			retryCounter++
-			if retryCounter == config.MaxUnicastProbes {
-				e.dispatchRemoveEventLocked()
-				e.setStateLocked(Failed)
-				return
-			}
-
-			e.job = e.nic.stack.newJob(&e.mu, sendUnicastProbe)
-			e.job.Schedule(config.RetransmitTimer)
-		}
-
-		sendUnicastProbe()
-
-	case Failed:
-		e.notifyWakersLocked()
-		e.job = e.nic.stack.newJob(&e.mu, func() {
-			e.nic.neigh.removeEntryLocked(e)
-		})
-		e.job.Schedule(config.UnreachableTime)
-
-	case Unknown, Stale, Static:
-		// Do nothing
-
-	default:
-		panic(fmt.Sprintf("Invalid state transition from %q to %q", prev, next))
-	}
-}
-
-// handlePacketQueuedLocked advances the state machine according to a packet
-// being queued for outgoing transmission.
-//
-// Follows the logic defined in RFC 4861 section 7.3.3.
-func (e *neighborEntry) handlePacketQueuedLocked() {
-	switch e.neigh.State {
-	case Unknown:
-		e.dispatchAddEventLocked(Incomplete)
-		e.setStateLocked(Incomplete)
 
 	case Stale:
 		e.dispatchChangeEventLocked(Delay)
@@ -406,9 +410,9 @@ func (e *neighborEntry) handleConfirmationLocked(linkAddr tcpip.LinkAddress, fla
 		// INCOMPLETE state." - RFC 4861 section 7.2.5
 
 	case Reachable, Stale, Delay, Probe:
-		sameLinkAddr := e.neigh.LinkAddr == linkAddr
+		isLinkAddrDifferent := len(linkAddr) != 0 && e.neigh.LinkAddr != linkAddr
 
-		if !sameLinkAddr {
+		if isLinkAddrDifferent {
 			if !flags.Override {
 				if e.neigh.State == Reachable {
 					e.dispatchChangeEventLocked(Stale)
@@ -431,7 +435,7 @@ func (e *neighborEntry) handleConfirmationLocked(linkAddr tcpip.LinkAddress, fla
 			}
 		}
 
-		if flags.Solicited && (flags.Override || sameLinkAddr) {
+		if flags.Solicited && (flags.Override || !isLinkAddrDifferent) {
 			if e.neigh.State != Reachable {
 				e.dispatchChangeEventLocked(Reachable)
 			}

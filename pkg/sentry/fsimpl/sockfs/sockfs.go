@@ -46,6 +46,9 @@ func (filesystemType) Name() string {
 	return "sockfs"
 }
 
+// Release implements vfs.FilesystemType.Release.
+func (filesystemType) Release(ctx context.Context) {}
+
 // +stateify savable
 type filesystem struct {
 	kernfs.Filesystem
@@ -105,15 +108,15 @@ func (i *inode) StatFS(ctx context.Context, fs *vfs.Filesystem) (linux.Statfs, e
 // NewDentry constructs and returns a sockfs dentry.
 //
 // Preconditions: mnt.Filesystem() must have been returned by NewFilesystem().
-func NewDentry(creds *auth.Credentials, mnt *vfs.Mount) *vfs.Dentry {
+func NewDentry(ctx context.Context, mnt *vfs.Mount) *vfs.Dentry {
 	fs := mnt.Filesystem().Impl().(*filesystem)
 
 	// File mode matches net/socket.c:sock_alloc.
 	filemode := linux.FileMode(linux.S_IFSOCK | 0600)
 	i := &inode{}
-	i.InodeAttrs.Init(creds, linux.UNNAMED_MAJOR, fs.devMinor, fs.Filesystem.NextIno(), filemode)
+	i.InodeAttrs.Init(ctx, auth.CredentialsFromContext(ctx), linux.UNNAMED_MAJOR, fs.devMinor, fs.Filesystem.NextIno(), filemode)
 
 	d := &kernfs.Dentry{}
-	d.Init(i)
+	d.Init(&fs.Filesystem, i)
 	return d.VFSDentry()
 }

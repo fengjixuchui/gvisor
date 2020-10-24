@@ -18,7 +18,7 @@
 //
 // Lock order:
 //
-// directoryFD.mu / nonDirectoryFD.mu
+// directoryFD.mu / regularFileFD.mu
 //   filesystem.renameMu
 //     dentry.dirMu
 //       dentry.copyMu
@@ -59,6 +59,9 @@ type FilesystemType struct{}
 func (FilesystemType) Name() string {
 	return Name
 }
+
+// Release implements FilesystemType.Release.
+func (FilesystemType) Release(ctx context.Context) {}
 
 // FilesystemOptions may be passed as vfs.GetFilesystemOptions.InternalData to
 // FilesystemType.GetFilesystem.
@@ -450,14 +453,14 @@ type dentry struct {
 	// - If this dentry is copied-up, then wrappedMappable is the Mappable
 	// obtained from a call to the current top layer's
 	// FileDescription.ConfigureMMap(). Once wrappedMappable becomes non-nil
-	// (from a call to nonDirectoryFD.ensureMappable()), it cannot become nil.
+	// (from a call to regularFileFD.ensureMappable()), it cannot become nil.
 	// wrappedMappable is protected by mapsMu and dataMu.
 	//
 	// - isMappable is non-zero iff wrappedMappable is non-nil. isMappable is
 	// accessed using atomic memory operations.
-	mapsMu          sync.Mutex
+	mapsMu          sync.Mutex `state:"nosave"`
 	lowerMappings   memmap.MappingSet
-	dataMu          sync.RWMutex
+	dataMu          sync.RWMutex `state:"nosave"`
 	wrappedMappable memmap.Mappable
 	isMappable      uint32
 

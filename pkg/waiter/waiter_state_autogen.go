@@ -6,11 +6,11 @@ import (
 	"gvisor.dev/gvisor/pkg/state"
 )
 
-func (x *Entry) StateTypeName() string {
+func (e *Entry) StateTypeName() string {
 	return "pkg/waiter.Entry"
 }
 
-func (x *Entry) StateFields() []string {
+func (e *Entry) StateFields() []string {
 	return []string{
 		"Callback",
 		"mask",
@@ -18,95 +18,96 @@ func (x *Entry) StateFields() []string {
 	}
 }
 
-func (x *Entry) beforeSave() {}
+func (e *Entry) beforeSave() {}
 
-func (x *Entry) StateSave(m state.Sink) {
-	x.beforeSave()
-	m.Save(0, &x.Callback)
-	m.Save(1, &x.mask)
-	m.Save(2, &x.waiterEntry)
+func (e *Entry) StateSave(stateSinkObject state.Sink) {
+	e.beforeSave()
+	stateSinkObject.Save(0, &e.Callback)
+	stateSinkObject.Save(1, &e.mask)
+	stateSinkObject.Save(2, &e.waiterEntry)
 }
 
-func (x *Entry) afterLoad() {}
+func (e *Entry) afterLoad() {}
 
-func (x *Entry) StateLoad(m state.Source) {
-	m.Load(0, &x.Callback)
-	m.Load(1, &x.mask)
-	m.Load(2, &x.waiterEntry)
+func (e *Entry) StateLoad(stateSourceObject state.Source) {
+	stateSourceObject.Load(0, &e.Callback)
+	stateSourceObject.Load(1, &e.mask)
+	stateSourceObject.Load(2, &e.waiterEntry)
 }
 
-func (x *Queue) StateTypeName() string {
+func (q *Queue) StateTypeName() string {
 	return "pkg/waiter.Queue"
 }
 
-func (x *Queue) StateFields() []string {
-	return []string{}
-}
-
-func (x *Queue) beforeSave() {}
-
-func (x *Queue) StateSave(m state.Sink) {
-	x.beforeSave()
-	if !state.IsZeroValue(&x.list) {
-		state.Failf("list is %#v, expected zero", &x.list)
+func (q *Queue) StateFields() []string {
+	return []string{
+		"list",
 	}
 }
 
-func (x *Queue) afterLoad() {}
+func (q *Queue) beforeSave() {}
 
-func (x *Queue) StateLoad(m state.Source) {
+func (q *Queue) StateSave(stateSinkObject state.Sink) {
+	q.beforeSave()
+	stateSinkObject.Save(0, &q.list)
 }
 
-func (x *waiterList) StateTypeName() string {
+func (q *Queue) afterLoad() {}
+
+func (q *Queue) StateLoad(stateSourceObject state.Source) {
+	stateSourceObject.Load(0, &q.list)
+}
+
+func (l *waiterList) StateTypeName() string {
 	return "pkg/waiter.waiterList"
 }
 
-func (x *waiterList) StateFields() []string {
+func (l *waiterList) StateFields() []string {
 	return []string{
 		"head",
 		"tail",
 	}
 }
 
-func (x *waiterList) beforeSave() {}
+func (l *waiterList) beforeSave() {}
 
-func (x *waiterList) StateSave(m state.Sink) {
-	x.beforeSave()
-	m.Save(0, &x.head)
-	m.Save(1, &x.tail)
+func (l *waiterList) StateSave(stateSinkObject state.Sink) {
+	l.beforeSave()
+	stateSinkObject.Save(0, &l.head)
+	stateSinkObject.Save(1, &l.tail)
 }
 
-func (x *waiterList) afterLoad() {}
+func (l *waiterList) afterLoad() {}
 
-func (x *waiterList) StateLoad(m state.Source) {
-	m.Load(0, &x.head)
-	m.Load(1, &x.tail)
+func (l *waiterList) StateLoad(stateSourceObject state.Source) {
+	stateSourceObject.Load(0, &l.head)
+	stateSourceObject.Load(1, &l.tail)
 }
 
-func (x *waiterEntry) StateTypeName() string {
+func (e *waiterEntry) StateTypeName() string {
 	return "pkg/waiter.waiterEntry"
 }
 
-func (x *waiterEntry) StateFields() []string {
+func (e *waiterEntry) StateFields() []string {
 	return []string{
 		"next",
 		"prev",
 	}
 }
 
-func (x *waiterEntry) beforeSave() {}
+func (e *waiterEntry) beforeSave() {}
 
-func (x *waiterEntry) StateSave(m state.Sink) {
-	x.beforeSave()
-	m.Save(0, &x.next)
-	m.Save(1, &x.prev)
+func (e *waiterEntry) StateSave(stateSinkObject state.Sink) {
+	e.beforeSave()
+	stateSinkObject.Save(0, &e.next)
+	stateSinkObject.Save(1, &e.prev)
 }
 
-func (x *waiterEntry) afterLoad() {}
+func (e *waiterEntry) afterLoad() {}
 
-func (x *waiterEntry) StateLoad(m state.Source) {
-	m.Load(0, &x.next)
-	m.Load(1, &x.prev)
+func (e *waiterEntry) StateLoad(stateSourceObject state.Source) {
+	stateSourceObject.Load(0, &e.next)
+	stateSourceObject.Load(1, &e.prev)
 }
 
 func init() {

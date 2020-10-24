@@ -6,11 +6,11 @@ import (
 	"gvisor.dev/gvisor/pkg/state"
 )
 
-func (x *FilesystemType) StateTypeName() string {
+func (fst *FilesystemType) StateTypeName() string {
 	return "pkg/sentry/fsimpl/devtmpfs.FilesystemType"
 }
 
-func (x *FilesystemType) StateFields() []string {
+func (fst *FilesystemType) StateFields() []string {
 	return []string{
 		"initErr",
 		"fs",
@@ -18,21 +18,20 @@ func (x *FilesystemType) StateFields() []string {
 	}
 }
 
-func (x *FilesystemType) beforeSave() {}
+func (fst *FilesystemType) beforeSave() {}
 
-func (x *FilesystemType) StateSave(m state.Sink) {
-	x.beforeSave()
-	m.Save(0, &x.initErr)
-	m.Save(1, &x.fs)
-	m.Save(2, &x.root)
+func (fst *FilesystemType) StateSave(stateSinkObject state.Sink) {
+	fst.beforeSave()
+	stateSinkObject.Save(0, &fst.initErr)
+	stateSinkObject.Save(1, &fst.fs)
+	stateSinkObject.Save(2, &fst.root)
 }
 
-func (x *FilesystemType) afterLoad() {}
-
-func (x *FilesystemType) StateLoad(m state.Source) {
-	m.Load(0, &x.initErr)
-	m.Load(1, &x.fs)
-	m.Load(2, &x.root)
+func (fst *FilesystemType) StateLoad(stateSourceObject state.Source) {
+	stateSourceObject.Load(0, &fst.initErr)
+	stateSourceObject.Load(1, &fst.fs)
+	stateSourceObject.Load(2, &fst.root)
+	stateSourceObject.AfterLoad(fst.afterLoad)
 }
 
 func init() {

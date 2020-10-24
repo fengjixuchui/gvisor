@@ -6,56 +6,56 @@ import (
 	"gvisor.dev/gvisor/pkg/state"
 )
 
-func (x *filesystemType) StateTypeName() string {
+func (fsType *filesystemType) StateTypeName() string {
 	return "pkg/sentry/fsimpl/sockfs.filesystemType"
 }
 
-func (x *filesystemType) StateFields() []string {
+func (fsType *filesystemType) StateFields() []string {
 	return []string{}
 }
 
-func (x *filesystemType) beforeSave() {}
+func (fsType *filesystemType) beforeSave() {}
 
-func (x *filesystemType) StateSave(m state.Sink) {
-	x.beforeSave()
+func (fsType *filesystemType) StateSave(stateSinkObject state.Sink) {
+	fsType.beforeSave()
 }
 
-func (x *filesystemType) afterLoad() {}
+func (fsType *filesystemType) afterLoad() {}
 
-func (x *filesystemType) StateLoad(m state.Source) {
+func (fsType *filesystemType) StateLoad(stateSourceObject state.Source) {
 }
 
-func (x *filesystem) StateTypeName() string {
+func (fs *filesystem) StateTypeName() string {
 	return "pkg/sentry/fsimpl/sockfs.filesystem"
 }
 
-func (x *filesystem) StateFields() []string {
+func (fs *filesystem) StateFields() []string {
 	return []string{
 		"Filesystem",
 		"devMinor",
 	}
 }
 
-func (x *filesystem) beforeSave() {}
+func (fs *filesystem) beforeSave() {}
 
-func (x *filesystem) StateSave(m state.Sink) {
-	x.beforeSave()
-	m.Save(0, &x.Filesystem)
-	m.Save(1, &x.devMinor)
+func (fs *filesystem) StateSave(stateSinkObject state.Sink) {
+	fs.beforeSave()
+	stateSinkObject.Save(0, &fs.Filesystem)
+	stateSinkObject.Save(1, &fs.devMinor)
 }
 
-func (x *filesystem) afterLoad() {}
+func (fs *filesystem) afterLoad() {}
 
-func (x *filesystem) StateLoad(m state.Source) {
-	m.Load(0, &x.Filesystem)
-	m.Load(1, &x.devMinor)
+func (fs *filesystem) StateLoad(stateSourceObject state.Source) {
+	stateSourceObject.Load(0, &fs.Filesystem)
+	stateSourceObject.Load(1, &fs.devMinor)
 }
 
-func (x *inode) StateTypeName() string {
+func (i *inode) StateTypeName() string {
 	return "pkg/sentry/fsimpl/sockfs.inode"
 }
 
-func (x *inode) StateFields() []string {
+func (i *inode) StateFields() []string {
 	return []string{
 		"InodeAttrs",
 		"InodeNoopRefCount",
@@ -64,23 +64,23 @@ func (x *inode) StateFields() []string {
 	}
 }
 
-func (x *inode) beforeSave() {}
+func (i *inode) beforeSave() {}
 
-func (x *inode) StateSave(m state.Sink) {
-	x.beforeSave()
-	m.Save(0, &x.InodeAttrs)
-	m.Save(1, &x.InodeNoopRefCount)
-	m.Save(2, &x.InodeNotDirectory)
-	m.Save(3, &x.InodeNotSymlink)
+func (i *inode) StateSave(stateSinkObject state.Sink) {
+	i.beforeSave()
+	stateSinkObject.Save(0, &i.InodeAttrs)
+	stateSinkObject.Save(1, &i.InodeNoopRefCount)
+	stateSinkObject.Save(2, &i.InodeNotDirectory)
+	stateSinkObject.Save(3, &i.InodeNotSymlink)
 }
 
-func (x *inode) afterLoad() {}
+func (i *inode) afterLoad() {}
 
-func (x *inode) StateLoad(m state.Source) {
-	m.Load(0, &x.InodeAttrs)
-	m.Load(1, &x.InodeNoopRefCount)
-	m.Load(2, &x.InodeNotDirectory)
-	m.Load(3, &x.InodeNotSymlink)
+func (i *inode) StateLoad(stateSourceObject state.Source) {
+	stateSourceObject.Load(0, &i.InodeAttrs)
+	stateSourceObject.Load(1, &i.InodeNoopRefCount)
+	stateSourceObject.Load(2, &i.InodeNotDirectory)
+	stateSourceObject.Load(3, &i.InodeNotSymlink)
 }
 
 func init() {

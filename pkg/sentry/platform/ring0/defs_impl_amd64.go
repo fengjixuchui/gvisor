@@ -155,15 +155,41 @@ type KernelOpts struct {
 type KernelArchState struct {
 	KernelOpts
 
+	// cpuEntries is array of kernelEntry for all cpus
+	cpuEntries []kernelEntry
+
 	// globalIDT is our set of interrupt gates.
-	globalIDT idt64
+	globalIDT *idt64
+}
+
+// kernelEntry contains minimal CPU-specific arch state
+// that can be mapped at the upper of the address space.
+// Malicious APP might steal info from it via CPU bugs.
+type kernelEntry struct {
+	// stack is the stack used for interrupts on this CPU.
+	stack [256]byte
+
+	// scratch space for temporary usage.
+	scratch0 uint64
+
+	// stackTop is the top of the stack.
+	stackTop uint64
+
+	// cpuSelf is back reference to CPU.
+	cpuSelf *CPU
+
+	// kernelCR3 is the cr3 used for sentry kernel.
+	kernelCR3 uintptr
+
+	// gdt is the CPU's descriptor table.
+	gdt descriptorTable
+
+	// tss is the CPU's task state.
+	tss TaskState64
 }
 
 // CPUArchState contains CPU-specific arch state.
 type CPUArchState struct {
-	// stack is the stack used for interrupts on this CPU.
-	stack [256]byte
-
 	// errorCode is the error code from the last exception.
 	errorCode uintptr
 
@@ -176,11 +202,7 @@ type CPUArchState struct {
 	// exception.
 	errorType uintptr
 
-	// gdt is the CPU's descriptor table.
-	gdt descriptorTable
-
-	// tss is the CPU's task state.
-	tss TaskState64
+	*kernelEntry
 }
 
 // ErrorCode returns the last error code.
@@ -232,14 +254,21 @@ func Emit(w io.Writer) {
 
 	c := &CPU{}
 	fmt.Fprintf(w, "\n// CPU offsets.\n")
-	fmt.Fprintf(w, "#define CPU_SELF             0x%02x\n", reflect.ValueOf(&c.self).Pointer()-reflect.ValueOf(c).Pointer())
 	fmt.Fprintf(w, "#define CPU_REGISTERS        0x%02x\n", reflect.ValueOf(&c.registers).Pointer()-reflect.ValueOf(c).Pointer())
-	fmt.Fprintf(w, "#define CPU_STACK_TOP        0x%02x\n", reflect.ValueOf(&c.stack[0]).Pointer()-reflect.ValueOf(c).Pointer()+uintptr(len(c.stack)))
 	fmt.Fprintf(w, "#define CPU_ERROR_CODE       0x%02x\n", reflect.ValueOf(&c.errorCode).Pointer()-reflect.ValueOf(c).Pointer())
 	fmt.Fprintf(w, "#define CPU_ERROR_TYPE       0x%02x\n", reflect.ValueOf(&c.errorType).Pointer()-reflect.ValueOf(c).Pointer())
+	fmt.Fprintf(w, "#define CPU_ENTRY            0x%02x\n", reflect.ValueOf(&c.kernelEntry).Pointer()-reflect.ValueOf(c).Pointer())
+
+	e := &kernelEntry{}
+	fmt.Fprintf(w, "\n// CPU entry offsets.\n")
+	fmt.Fprintf(w, "#define ENTRY_SCRATCH0       0x%02x\n", reflect.ValueOf(&e.scratch0).Pointer()-reflect.ValueOf(e).Pointer())
+	fmt.Fprintf(w, "#define ENTRY_STACK_TOP      0x%02x\n", reflect.ValueOf(&e.stackTop).Pointer()-reflect.ValueOf(e).Pointer())
+	fmt.Fprintf(w, "#define ENTRY_CPU_SELF       0x%02x\n", reflect.ValueOf(&e.cpuSelf).Pointer()-reflect.ValueOf(e).Pointer())
+	fmt.Fprintf(w, "#define ENTRY_KERNEL_CR3     0x%02x\n", reflect.ValueOf(&e.kernelCR3).Pointer()-reflect.ValueOf(e).Pointer())
 
 	fmt.Fprintf(w, "\n// Bits.\n")
 	fmt.Fprintf(w, "#define _RFLAGS_IF           0x%02x\n", _RFLAGS_IF)
+	fmt.Fprintf(w, "#define _RFLAGS_IOPL0         0x%02x\n", _RFLAGS_IOPL0)
 	fmt.Fprintf(w, "#define _KERNEL_FLAGS        0x%02x\n", KernelFlagsSet)
 
 	fmt.Fprintf(w, "\n// Vectors.\n")
@@ -313,7 +342,9 @@ const (
 
 	_RFLAGS_AC       = 1 << 18
 	_RFLAGS_NT       = 1 << 14
-	_RFLAGS_IOPL     = 3 << 12
+	_RFLAGS_IOPL0    = 1 << 12
+	_RFLAGS_IOPL1    = 1 << 13
+	_RFLAGS_IOPL     = _RFLAGS_IOPL0 | _RFLAGS_IOPL1
 	_RFLAGS_DF       = 1 << 10
 	_RFLAGS_IF       = 1 << 9
 	_RFLAGS_STEP     = 1 << 8
@@ -341,14 +372,44 @@ const (
 	KernelFlagsSet = _RFLAGS_RESERVED
 
 	// UserFlagsSet are always set in userspace.
-	UserFlagsSet = _RFLAGS_RESERVED | _RFLAGS_IF
+	//
+	// _RFLAGS_IOPL is a set of two bits and it shows the I/O privilege
+	// level. The Current Privilege Level (CPL) of the task must be less
+	// than or equal to the IOPL in order for the task or program to access
+	// I/O ports.
+	//
+	// Here, _RFLAGS_IOPL0 is used only to determine whether the task is
+	// running in the kernel or userspace mode. In the user mode, the CPL is
+	// always 3 and it doesn't matter what IOPL is set if it is bellow CPL.
+	//
+	// We need to have one bit which will be always different in user and
+	// kernel modes. And we have to remember that even though we have
+	// KernelFlagsClear, we still can see some of these flags in the kernel
+	// mode. This can happen when the goruntime switches on a goroutine
+	// which has been saved in the host mode. On restore, the popf
+	// instruction is used to restore flags and this means that all flags
+	// what the goroutine has in the host mode will be restored in the
+	// kernel mode.
+	//
+	// _RFLAGS_IOPL0 is never set in host and kernel modes and we always set
+	// it in the user mode. So if this flag is set, the task is running in
+	// the user mode and if it isn't set, the task is running in the kernel
+	// mode.
+	UserFlagsSet = _RFLAGS_RESERVED | _RFLAGS_IF | _RFLAGS_IOPL0
 
 	// KernelFlagsClear should always be clear in the kernel.
 	KernelFlagsClear = _RFLAGS_STEP | _RFLAGS_IF | _RFLAGS_IOPL | _RFLAGS_AC | _RFLAGS_NT
 
 	// UserFlagsClear are always cleared in userspace.
-	UserFlagsClear = _RFLAGS_NT | _RFLAGS_IOPL
+	UserFlagsClear = _RFLAGS_NT | _RFLAGS_IOPL1
 )
+
+// IsKernelFlags returns true if rflags coresponds to the kernel mode.
+//
+// go:nosplit
+func IsKernelFlags(rflags uint64) bool {
+	return rflags&_RFLAGS_IOPL0 == 0
+}
 
 // Vector is an exception vector.
 type Vector uintptr
@@ -378,7 +439,7 @@ const (
 	VirtualizationException
 	SecurityException = 0x1e
 	SyscallInt80      = 0x80
-	_NR_INTERRUPTS    = SyscallInt80 + 1
+	_NR_INTERRUPTS    = 0x100
 )
 
 // System call vectors.

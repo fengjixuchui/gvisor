@@ -111,6 +111,7 @@ var (
 	ErrBroadcastDisabled         = &Error{msg: "broadcast socket option disabled"}
 	ErrNotPermitted              = &Error{msg: "operation not permitted"}
 	ErrAddressFamilyNotSupported = &Error{msg: "address family not supported by protocol"}
+	ErrMalformedHeader           = &Error{msg: "header is malformed"}
 )
 
 var messageToError map[string]*Error
@@ -159,6 +160,7 @@ func StringToError(s string) *Error {
 			ErrBroadcastDisabled,
 			ErrNotPermitted,
 			ErrAddressFamilyNotSupported,
+			ErrMalformedHeader,
 		}
 
 		messageToError = make(map[string]*Error)
@@ -761,6 +763,10 @@ const (
 	// endpoint that all packets being written have an IP header and the
 	// endpoint should not attach an IP header.
 	IPHdrIncludedOption
+
+	// AcceptConnOption is used by GetSockOptBool to indicate if the
+	// socket is a listening socket.
+	AcceptConnOption
 )
 
 // SockOptInt represents socket options which values have the int type.

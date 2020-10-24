@@ -6,61 +6,61 @@ import (
 	"gvisor.dev/gvisor/pkg/state"
 )
 
-func (x *EvictableRange) StateTypeName() string {
+func (r *EvictableRange) StateTypeName() string {
 	return "pkg/sentry/pgalloc.EvictableRange"
 }
 
-func (x *EvictableRange) StateFields() []string {
+func (r *EvictableRange) StateFields() []string {
 	return []string{
 		"Start",
 		"End",
 	}
 }
 
-func (x *EvictableRange) beforeSave() {}
+func (r *EvictableRange) beforeSave() {}
 
-func (x *EvictableRange) StateSave(m state.Sink) {
-	x.beforeSave()
-	m.Save(0, &x.Start)
-	m.Save(1, &x.End)
+func (r *EvictableRange) StateSave(stateSinkObject state.Sink) {
+	r.beforeSave()
+	stateSinkObject.Save(0, &r.Start)
+	stateSinkObject.Save(1, &r.End)
 }
 
-func (x *EvictableRange) afterLoad() {}
+func (r *EvictableRange) afterLoad() {}
 
-func (x *EvictableRange) StateLoad(m state.Source) {
-	m.Load(0, &x.Start)
-	m.Load(1, &x.End)
+func (r *EvictableRange) StateLoad(stateSourceObject state.Source) {
+	stateSourceObject.Load(0, &r.Start)
+	stateSourceObject.Load(1, &r.End)
 }
 
-func (x *evictableRangeSet) StateTypeName() string {
+func (s *evictableRangeSet) StateTypeName() string {
 	return "pkg/sentry/pgalloc.evictableRangeSet"
 }
 
-func (x *evictableRangeSet) StateFields() []string {
+func (s *evictableRangeSet) StateFields() []string {
 	return []string{
 		"root",
 	}
 }
 
-func (x *evictableRangeSet) beforeSave() {}
+func (s *evictableRangeSet) beforeSave() {}
 
-func (x *evictableRangeSet) StateSave(m state.Sink) {
-	x.beforeSave()
-	var root *evictableRangeSegmentDataSlices = x.saveRoot()
-	m.SaveValue(0, root)
+func (s *evictableRangeSet) StateSave(stateSinkObject state.Sink) {
+	s.beforeSave()
+	var rootValue *evictableRangeSegmentDataSlices = s.saveRoot()
+	stateSinkObject.SaveValue(0, rootValue)
 }
 
-func (x *evictableRangeSet) afterLoad() {}
+func (s *evictableRangeSet) afterLoad() {}
 
-func (x *evictableRangeSet) StateLoad(m state.Source) {
-	m.LoadValue(0, new(*evictableRangeSegmentDataSlices), func(y interface{}) { x.loadRoot(y.(*evictableRangeSegmentDataSlices)) })
+func (s *evictableRangeSet) StateLoad(stateSourceObject state.Source) {
+	stateSourceObject.LoadValue(0, new(*evictableRangeSegmentDataSlices), func(y interface{}) { s.loadRoot(y.(*evictableRangeSegmentDataSlices)) })
 }
 
-func (x *evictableRangenode) StateTypeName() string {
+func (n *evictableRangenode) StateTypeName() string {
 	return "pkg/sentry/pgalloc.evictableRangenode"
 }
 
-func (x *evictableRangenode) StateFields() []string {
+func (n *evictableRangenode) StateFields() []string {
 	return []string{
 		"nrSegments",
 		"parent",
@@ -73,38 +73,38 @@ func (x *evictableRangenode) StateFields() []string {
 	}
 }
 
-func (x *evictableRangenode) beforeSave() {}
+func (n *evictableRangenode) beforeSave() {}
 
-func (x *evictableRangenode) StateSave(m state.Sink) {
-	x.beforeSave()
-	m.Save(0, &x.nrSegments)
-	m.Save(1, &x.parent)
-	m.Save(2, &x.parentIndex)
-	m.Save(3, &x.hasChildren)
-	m.Save(4, &x.maxGap)
-	m.Save(5, &x.keys)
-	m.Save(6, &x.values)
-	m.Save(7, &x.children)
+func (n *evictableRangenode) StateSave(stateSinkObject state.Sink) {
+	n.beforeSave()
+	stateSinkObject.Save(0, &n.nrSegments)
+	stateSinkObject.Save(1, &n.parent)
+	stateSinkObject.Save(2, &n.parentIndex)
+	stateSinkObject.Save(3, &n.hasChildren)
+	stateSinkObject.Save(4, &n.maxGap)
+	stateSinkObject.Save(5, &n.keys)
+	stateSinkObject.Save(6, &n.values)
+	stateSinkObject.Save(7, &n.children)
 }
 
-func (x *evictableRangenode) afterLoad() {}
+func (n *evictableRangenode) afterLoad() {}
 
-func (x *evictableRangenode) StateLoad(m state.Source) {
-	m.Load(0, &x.nrSegments)
-	m.Load(1, &x.parent)
-	m.Load(2, &x.parentIndex)
-	m.Load(3, &x.hasChildren)
-	m.Load(4, &x.maxGap)
-	m.Load(5, &x.keys)
-	m.Load(6, &x.values)
-	m.Load(7, &x.children)
+func (n *evictableRangenode) StateLoad(stateSourceObject state.Source) {
+	stateSourceObject.Load(0, &n.nrSegments)
+	stateSourceObject.Load(1, &n.parent)
+	stateSourceObject.Load(2, &n.parentIndex)
+	stateSourceObject.Load(3, &n.hasChildren)
+	stateSourceObject.Load(4, &n.maxGap)
+	stateSourceObject.Load(5, &n.keys)
+	stateSourceObject.Load(6, &n.values)
+	stateSourceObject.Load(7, &n.children)
 }
 
-func (x *evictableRangeSegmentDataSlices) StateTypeName() string {
+func (e *evictableRangeSegmentDataSlices) StateTypeName() string {
 	return "pkg/sentry/pgalloc.evictableRangeSegmentDataSlices"
 }
 
-func (x *evictableRangeSegmentDataSlices) StateFields() []string {
+func (e *evictableRangeSegmentDataSlices) StateFields() []string {
 	return []string{
 		"Start",
 		"End",
@@ -112,28 +112,28 @@ func (x *evictableRangeSegmentDataSlices) StateFields() []string {
 	}
 }
 
-func (x *evictableRangeSegmentDataSlices) beforeSave() {}
+func (e *evictableRangeSegmentDataSlices) beforeSave() {}
 
-func (x *evictableRangeSegmentDataSlices) StateSave(m state.Sink) {
-	x.beforeSave()
-	m.Save(0, &x.Start)
-	m.Save(1, &x.End)
-	m.Save(2, &x.Values)
+func (e *evictableRangeSegmentDataSlices) StateSave(stateSinkObject state.Sink) {
+	e.beforeSave()
+	stateSinkObject.Save(0, &e.Start)
+	stateSinkObject.Save(1, &e.End)
+	stateSinkObject.Save(2, &e.Values)
 }
 
-func (x *evictableRangeSegmentDataSlices) afterLoad() {}
+func (e *evictableRangeSegmentDataSlices) afterLoad() {}
 
-func (x *evictableRangeSegmentDataSlices) StateLoad(m state.Source) {
-	m.Load(0, &x.Start)
-	m.Load(1, &x.End)
-	m.Load(2, &x.Values)
+func (e *evictableRangeSegmentDataSlices) StateLoad(stateSourceObject state.Source) {
+	stateSourceObject.Load(0, &e.Start)
+	stateSourceObject.Load(1, &e.End)
+	stateSourceObject.Load(2, &e.Values)
 }
 
-func (x *usageInfo) StateTypeName() string {
+func (u *usageInfo) StateTypeName() string {
 	return "pkg/sentry/pgalloc.usageInfo"
 }
 
-func (x *usageInfo) StateFields() []string {
+func (u *usageInfo) StateFields() []string {
 	return []string{
 		"kind",
 		"knownCommitted",
@@ -141,52 +141,52 @@ func (x *usageInfo) StateFields() []string {
 	}
 }
 
-func (x *usageInfo) beforeSave() {}
+func (u *usageInfo) beforeSave() {}
 
-func (x *usageInfo) StateSave(m state.Sink) {
-	x.beforeSave()
-	m.Save(0, &x.kind)
-	m.Save(1, &x.knownCommitted)
-	m.Save(2, &x.refs)
+func (u *usageInfo) StateSave(stateSinkObject state.Sink) {
+	u.beforeSave()
+	stateSinkObject.Save(0, &u.kind)
+	stateSinkObject.Save(1, &u.knownCommitted)
+	stateSinkObject.Save(2, &u.refs)
 }
 
-func (x *usageInfo) afterLoad() {}
+func (u *usageInfo) afterLoad() {}
 
-func (x *usageInfo) StateLoad(m state.Source) {
-	m.Load(0, &x.kind)
-	m.Load(1, &x.knownCommitted)
-	m.Load(2, &x.refs)
+func (u *usageInfo) StateLoad(stateSourceObject state.Source) {
+	stateSourceObject.Load(0, &u.kind)
+	stateSourceObject.Load(1, &u.knownCommitted)
+	stateSourceObject.Load(2, &u.refs)
 }
 
-func (x *reclaimSet) StateTypeName() string {
+func (s *reclaimSet) StateTypeName() string {
 	return "pkg/sentry/pgalloc.reclaimSet"
 }
 
-func (x *reclaimSet) StateFields() []string {
+func (s *reclaimSet) StateFields() []string {
 	return []string{
 		"root",
 	}
 }
 
-func (x *reclaimSet) beforeSave() {}
+func (s *reclaimSet) beforeSave() {}
 
-func (x *reclaimSet) StateSave(m state.Sink) {
-	x.beforeSave()
-	var root *reclaimSegmentDataSlices = x.saveRoot()
-	m.SaveValue(0, root)
+func (s *reclaimSet) StateSave(stateSinkObject state.Sink) {
+	s.beforeSave()
+	var rootValue *reclaimSegmentDataSlices = s.saveRoot()
+	stateSinkObject.SaveValue(0, rootValue)
 }
 
-func (x *reclaimSet) afterLoad() {}
+func (s *reclaimSet) afterLoad() {}
 
-func (x *reclaimSet) StateLoad(m state.Source) {
-	m.LoadValue(0, new(*reclaimSegmentDataSlices), func(y interface{}) { x.loadRoot(y.(*reclaimSegmentDataSlices)) })
+func (s *reclaimSet) StateLoad(stateSourceObject state.Source) {
+	stateSourceObject.LoadValue(0, new(*reclaimSegmentDataSlices), func(y interface{}) { s.loadRoot(y.(*reclaimSegmentDataSlices)) })
 }
 
-func (x *reclaimnode) StateTypeName() string {
+func (n *reclaimnode) StateTypeName() string {
 	return "pkg/sentry/pgalloc.reclaimnode"
 }
 
-func (x *reclaimnode) StateFields() []string {
+func (n *reclaimnode) StateFields() []string {
 	return []string{
 		"nrSegments",
 		"parent",
@@ -199,38 +199,38 @@ func (x *reclaimnode) StateFields() []string {
 	}
 }
 
-func (x *reclaimnode) beforeSave() {}
+func (n *reclaimnode) beforeSave() {}
 
-func (x *reclaimnode) StateSave(m state.Sink) {
-	x.beforeSave()
-	m.Save(0, &x.nrSegments)
-	m.Save(1, &x.parent)
-	m.Save(2, &x.parentIndex)
-	m.Save(3, &x.hasChildren)
-	m.Save(4, &x.maxGap)
-	m.Save(5, &x.keys)
-	m.Save(6, &x.values)
-	m.Save(7, &x.children)
+func (n *reclaimnode) StateSave(stateSinkObject state.Sink) {
+	n.beforeSave()
+	stateSinkObject.Save(0, &n.nrSegments)
+	stateSinkObject.Save(1, &n.parent)
+	stateSinkObject.Save(2, &n.parentIndex)
+	stateSinkObject.Save(3, &n.hasChildren)
+	stateSinkObject.Save(4, &n.maxGap)
+	stateSinkObject.Save(5, &n.keys)
+	stateSinkObject.Save(6, &n.values)
+	stateSinkObject.Save(7, &n.children)
 }
 
-func (x *reclaimnode) afterLoad() {}
+func (n *reclaimnode) afterLoad() {}
 
-func (x *reclaimnode) StateLoad(m state.Source) {
-	m.Load(0, &x.nrSegments)
-	m.Load(1, &x.parent)
-	m.Load(2, &x.parentIndex)
-	m.Load(3, &x.hasChildren)
-	m.Load(4, &x.maxGap)
-	m.Load(5, &x.keys)
-	m.Load(6, &x.values)
-	m.Load(7, &x.children)
+func (n *reclaimnode) StateLoad(stateSourceObject state.Source) {
+	stateSourceObject.Load(0, &n.nrSegments)
+	stateSourceObject.Load(1, &n.parent)
+	stateSourceObject.Load(2, &n.parentIndex)
+	stateSourceObject.Load(3, &n.hasChildren)
+	stateSourceObject.Load(4, &n.maxGap)
+	stateSourceObject.Load(5, &n.keys)
+	stateSourceObject.Load(6, &n.values)
+	stateSourceObject.Load(7, &n.children)
 }
 
-func (x *reclaimSegmentDataSlices) StateTypeName() string {
+func (r *reclaimSegmentDataSlices) StateTypeName() string {
 	return "pkg/sentry/pgalloc.reclaimSegmentDataSlices"
 }
 
-func (x *reclaimSegmentDataSlices) StateFields() []string {
+func (r *reclaimSegmentDataSlices) StateFields() []string {
 	return []string{
 		"Start",
 		"End",
@@ -238,52 +238,52 @@ func (x *reclaimSegmentDataSlices) StateFields() []string {
 	}
 }
 
-func (x *reclaimSegmentDataSlices) beforeSave() {}
+func (r *reclaimSegmentDataSlices) beforeSave() {}
 
-func (x *reclaimSegmentDataSlices) StateSave(m state.Sink) {
-	x.beforeSave()
-	m.Save(0, &x.Start)
-	m.Save(1, &x.End)
-	m.Save(2, &x.Values)
+func (r *reclaimSegmentDataSlices) StateSave(stateSinkObject state.Sink) {
+	r.beforeSave()
+	stateSinkObject.Save(0, &r.Start)
+	stateSinkObject.Save(1, &r.End)
+	stateSinkObject.Save(2, &r.Values)
 }
 
-func (x *reclaimSegmentDataSlices) afterLoad() {}
+func (r *reclaimSegmentDataSlices) afterLoad() {}
 
-func (x *reclaimSegmentDataSlices) StateLoad(m state.Source) {
-	m.Load(0, &x.Start)
-	m.Load(1, &x.End)
-	m.Load(2, &x.Values)
+func (r *reclaimSegmentDataSlices) StateLoad(stateSourceObject state.Source) {
+	stateSourceObject.Load(0, &r.Start)
+	stateSourceObject.Load(1, &r.End)
+	stateSourceObject.Load(2, &r.Values)
 }
 
-func (x *usageSet) StateTypeName() string {
+func (s *usageSet) StateTypeName() string {
 	return "pkg/sentry/pgalloc.usageSet"
 }
 
-func (x *usageSet) StateFields() []string {
+func (s *usageSet) StateFields() []string {
 	return []string{
 		"root",
 	}
 }
 
-func (x *usageSet) beforeSave() {}
+func (s *usageSet) beforeSave() {}
 
-func (x *usageSet) StateSave(m state.Sink) {
-	x.beforeSave()
-	var root *usageSegmentDataSlices = x.saveRoot()
-	m.SaveValue(0, root)
+func (s *usageSet) StateSave(stateSinkObject state.Sink) {
+	s.beforeSave()
+	var rootValue *usageSegmentDataSlices = s.saveRoot()
+	stateSinkObject.SaveValue(0, rootValue)
 }
 
-func (x *usageSet) afterLoad() {}
+func (s *usageSet) afterLoad() {}
 
-func (x *usageSet) StateLoad(m state.Source) {
-	m.LoadValue(0, new(*usageSegmentDataSlices), func(y interface{}) { x.loadRoot(y.(*usageSegmentDataSlices)) })
+func (s *usageSet) StateLoad(stateSourceObject state.Source) {
+	stateSourceObject.LoadValue(0, new(*usageSegmentDataSlices), func(y interface{}) { s.loadRoot(y.(*usageSegmentDataSlices)) })
 }
 
-func (x *usagenode) StateTypeName() string {
+func (n *usagenode) StateTypeName() string {
 	return "pkg/sentry/pgalloc.usagenode"
 }
 
-func (x *usagenode) StateFields() []string {
+func (n *usagenode) StateFields() []string {
 	return []string{
 		"nrSegments",
 		"parent",
@@ -296,38 +296,38 @@ func (x *usagenode) StateFields() []string {
 	}
 }
 
-func (x *usagenode) beforeSave() {}
+func (n *usagenode) beforeSave() {}
 
-func (x *usagenode) StateSave(m state.Sink) {
-	x.beforeSave()
-	m.Save(0, &x.nrSegments)
-	m.Save(1, &x.parent)
-	m.Save(2, &x.parentIndex)
-	m.Save(3, &x.hasChildren)
-	m.Save(4, &x.maxGap)
-	m.Save(5, &x.keys)
-	m.Save(6, &x.values)
-	m.Save(7, &x.children)
+func (n *usagenode) StateSave(stateSinkObject state.Sink) {
+	n.beforeSave()
+	stateSinkObject.Save(0, &n.nrSegments)
+	stateSinkObject.Save(1, &n.parent)
+	stateSinkObject.Save(2, &n.parentIndex)
+	stateSinkObject.Save(3, &n.hasChildren)
+	stateSinkObject.Save(4, &n.maxGap)
+	stateSinkObject.Save(5, &n.keys)
+	stateSinkObject.Save(6, &n.values)
+	stateSinkObject.Save(7, &n.children)
 }
 
-func (x *usagenode) afterLoad() {}
+func (n *usagenode) afterLoad() {}
 
-func (x *usagenode) StateLoad(m state.Source) {
-	m.Load(0, &x.nrSegments)
-	m.Load(1, &x.parent)
-	m.Load(2, &x.parentIndex)
-	m.Load(3, &x.hasChildren)
-	m.Load(4, &x.maxGap)
-	m.Load(5, &x.keys)
-	m.Load(6, &x.values)
-	m.Load(7, &x.children)
+func (n *usagenode) StateLoad(stateSourceObject state.Source) {
+	stateSourceObject.Load(0, &n.nrSegments)
+	stateSourceObject.Load(1, &n.parent)
+	stateSourceObject.Load(2, &n.parentIndex)
+	stateSourceObject.Load(3, &n.hasChildren)
+	stateSourceObject.Load(4, &n.maxGap)
+	stateSourceObject.Load(5, &n.keys)
+	stateSourceObject.Load(6, &n.values)
+	stateSourceObject.Load(7, &n.children)
 }
 
-func (x *usageSegmentDataSlices) StateTypeName() string {
+func (u *usageSegmentDataSlices) StateTypeName() string {
 	return "pkg/sentry/pgalloc.usageSegmentDataSlices"
 }
 
-func (x *usageSegmentDataSlices) StateFields() []string {
+func (u *usageSegmentDataSlices) StateFields() []string {
 	return []string{
 		"Start",
 		"End",
@@ -335,21 +335,21 @@ func (x *usageSegmentDataSlices) StateFields() []string {
 	}
 }
 
-func (x *usageSegmentDataSlices) beforeSave() {}
+func (u *usageSegmentDataSlices) beforeSave() {}
 
-func (x *usageSegmentDataSlices) StateSave(m state.Sink) {
-	x.beforeSave()
-	m.Save(0, &x.Start)
-	m.Save(1, &x.End)
-	m.Save(2, &x.Values)
+func (u *usageSegmentDataSlices) StateSave(stateSinkObject state.Sink) {
+	u.beforeSave()
+	stateSinkObject.Save(0, &u.Start)
+	stateSinkObject.Save(1, &u.End)
+	stateSinkObject.Save(2, &u.Values)
 }
 
-func (x *usageSegmentDataSlices) afterLoad() {}
+func (u *usageSegmentDataSlices) afterLoad() {}
 
-func (x *usageSegmentDataSlices) StateLoad(m state.Source) {
-	m.Load(0, &x.Start)
-	m.Load(1, &x.End)
-	m.Load(2, &x.Values)
+func (u *usageSegmentDataSlices) StateLoad(stateSourceObject state.Source) {
+	stateSourceObject.Load(0, &u.Start)
+	stateSourceObject.Load(1, &u.End)
+	stateSourceObject.Load(2, &u.Values)
 }
 
 func init() {

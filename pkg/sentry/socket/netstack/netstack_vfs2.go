@@ -35,6 +35,8 @@ import (
 
 // SocketVFS2 encapsulates all the state needed to represent a network stack
 // endpoint in the kernel context.
+//
+// +stateify savable
 type SocketVFS2 struct {
 	vfsfd vfs.FileDescription
 	vfs.FileDescriptionDefaultImpl
@@ -55,7 +57,7 @@ func NewVFS2(t *kernel.Task, family int, skType linux.SockType, protocol int, qu
 	}
 
 	mnt := t.Kernel().SocketMount()
-	d := sockfs.NewDentry(t.Credentials(), mnt)
+	d := sockfs.NewDentry(t, mnt)
 	defer d.DecRef(t)
 
 	s := &SocketVFS2{

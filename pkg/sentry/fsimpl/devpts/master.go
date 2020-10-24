@@ -42,9 +42,6 @@ type masterInode struct {
 
 	locks vfs.FileLocks
 
-	// Keep a reference to this inode's dentry.
-	dentry kernfs.Dentry
-
 	// root is the devpts root inode.
 	root *rootInode
 }
@@ -53,7 +50,7 @@ var _ kernfs.Inode = (*masterInode)(nil)
 
 // Open implements kernfs.Inode.Open.
 func (mi *masterInode) Open(ctx context.Context, rp *vfs.ResolvingPath, d *kernfs.Dentry, opts vfs.OpenOptions) (*vfs.FileDescription, error) {
-	t, err := mi.root.allocateTerminal(rp.Credentials())
+	t, err := mi.root.allocateTerminal(ctx, rp.Credentials())
 	if err != nil {
 		return nil, err
 	}
@@ -103,7 +100,7 @@ var _ vfs.FileDescriptionImpl = (*masterFileDescription)(nil)
 
 // Release implements vfs.FileDescriptionImpl.Release.
 func (mfd *masterFileDescription) Release(ctx context.Context) {
-	mfd.inode.root.masterClose(mfd.t)
+	mfd.inode.root.masterClose(ctx, mfd.t)
 }
 
 // EventRegister implements waiter.Waitable.EventRegister.

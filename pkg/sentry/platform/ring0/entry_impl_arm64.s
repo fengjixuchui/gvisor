@@ -3,14 +3,20 @@
 // Automatically generated, do not edit.
 
 // CPU offsets.
-#define CPU_SELF             0x00
-#define CPU_REGISTERS        0x288
-#define CPU_STACK_TOP        0x110
-#define CPU_ERROR_CODE       0x110
-#define CPU_ERROR_TYPE       0x118
+#define CPU_REGISTERS        0x28
+#define CPU_ERROR_CODE       0x10
+#define CPU_ERROR_TYPE       0x18
+#define CPU_ENTRY            0x20
+
+// CPU entry offsets.
+#define ENTRY_SCRATCH0       0x100
+#define ENTRY_STACK_TOP      0x108
+#define ENTRY_CPU_SELF       0x110
+#define ENTRY_KERNEL_CR3     0x118
 
 // Bits.
 #define _RFLAGS_IF           0x200
+#define _RFLAGS_IOPL0         0x1000
 #define _KERNEL_FLAGS        0x02
 
 // Vectors.
@@ -36,7 +42,7 @@
 #define VirtualizationException    0x14
 #define SecurityException          0x1e
 #define SyscallInt80               0x80
-#define Syscall                    0x81
+#define Syscall                    0x100
 
 // Ptrace registers.
 #define PTRACE_R15      0x00
@@ -110,9 +116,11 @@
 #define SCTLR_M         1 << 0
 #define SCTLR_C         1 << 2
 #define SCTLR_I         1 << 12
+#define SCTLR_DZE       1 << 14
 #define SCTLR_UCT       1 << 15
+#define SCTLR_UCI       1 << 26
 
-#define SCTLR_EL1_DEFAULT       (SCTLR_M | SCTLR_C | SCTLR_I | SCTLR_UCT)
+#define SCTLR_EL1_DEFAULT       (SCTLR_M | SCTLR_C | SCTLR_I | SCTLR_UCT | SCTLR_UCI | SCTLR_DZE)
 
 // cntkctl_el1: counter-timer kernel control register el1.
 #define CNTKCTL_EL0PCTEN 	1 << 0
@@ -360,9 +368,7 @@
 	LOAD_KERNEL_ADDRESS(CPU_SELF(from), RSV_REG); \
 	MOVD $CPU_STACK_TOP(RSV_REG), RSV_REG; \
 	MOVD RSV_REG, RSP; \
-	WORD $0xd538d092; \   //MRS   TPIDR_EL1, R18
-	ISB $15; \
-	DSB $15;
+	WORD $0xd538d092;   //MRS   TPIDR_EL1, R18
 
 // SWITCH_TO_APP_PAGETABLE sets a new pagetable for a container application.
 #define SWITCH_TO_APP_PAGETABLE(from) \
@@ -406,6 +412,8 @@
 	ADD $16, RSP, RSP; \
 	MOVD RSV_REG, PTRACE_R18(R20); \
 	MOVD RSV_REG_APP, PTRACE_R9(R20); \
+	MRS TPIDR_EL0, R3; \
+	MOVD R3, PTRACE_TLS(R20); \
 	WORD $0xd5384003; \      //  MRS SPSR_EL1, R3
 	MOVD R3, PTRACE_PSTATE(R20); \
 	MRS ELR_EL1, R3; \
@@ -418,6 +426,8 @@
 	WORD $0xd538d092; \   //MRS   TPIDR_EL1, R18
 	REGISTERS_SAVE(RSV_REG, CPU_REGISTERS); \	// Save sentry context.
 	MOVD RSV_REG_APP, CPU_REGISTERS+PTRACE_R9(RSV_REG); \
+	MRS TPIDR_EL0, R4; \
+	MOVD R4, CPU_REGISTERS+PTRACE_TLS(RSV_REG); \
 	WORD $0xd5384004; \    //    MRS SPSR_EL1, R4
 	MOVD R4, CPU_REGISTERS+PTRACE_PSTATE(RSV_REG); \
 	MRS ELR_EL1, R4; \
@@ -425,6 +435,19 @@
 	MOVD RSP, R4; \
 	MOVD R4, CPU_REGISTERS+PTRACE_SP(RSV_REG); \
 	LOAD_KERNEL_STACK(RSV_REG);  // Load the temporary stack.
+
+// EXCEPTION_WITH_ERROR is a common exception handler function.
+#define EXCEPTION_WITH_ERROR(user, vector) \
+	WORD $0xd538d092; \	//MRS   TPIDR_EL1, R18
+	WORD $0xd538601a; \	//MRS   FAR_EL1, R26
+	MOVD R26, CPU_FAULT_ADDR(RSV_REG); \
+	MOVD $user, R3; \
+	MOVD R3, CPU_ERROR_TYPE(RSV_REG); \	// Set error type to user.
+	MOVD $vector, R3; \
+	MOVD R3, CPU_VECTOR_CODE(RSV_REG); \
+	MRS ESR_EL1, R3; \
+	MOVD R3, CPU_ERROR_CODE(RSV_REG); \
+	B ·kernelExitToEl1(SB);
 
 // storeAppASID writes the application's asid value.
 TEXT ·storeAppASID(SB),NOSPLIT,$0-8
@@ -441,8 +464,6 @@ TEXT ·Halt(SB),NOSPLIT,$0
 	BNE mmio_exit
 	MOVD $0, CPU_REGISTERS+PTRACE_R9(RSV_REG)
 
-	// Flush dcache.
-	WORD $0xd5087e52   // DC CISW
 mmio_exit:
 	// Disable fpsimd.
 	WORD $0xd5381041 // MRS CPACR_EL1, R1
@@ -459,9 +480,6 @@ mmio_exit:
 	// which hypercall.
 	MRS VBAR_EL1, R9
 	MOVD R0, 0x0(R9)
-
-	// Flush dcahce.
-	WORD $0xd5087e52  // DC CISW
 
 	RET
 
@@ -499,6 +517,8 @@ TEXT ·kernelExitToEl0(SB),NOSPLIT,$0
 	MRS TPIDR_EL1, RSV_REG
 	REGISTERS_SAVE(RSV_REG, CPU_REGISTERS)
 	MOVD RSV_REG_APP, CPU_REGISTERS+PTRACE_R9(RSV_REG)
+	MRS TPIDR_EL0, R3
+	MOVD R3, CPU_REGISTERS+PTRACE_TLS(RSV_REG)
 
 	WORD $0xd5384003    //    MRS SPSR_EL1, R3
 	MOVD R3, CPU_REGISTERS+PTRACE_PSTATE(RSV_REG)
@@ -525,8 +545,18 @@ TEXT ·kernelExitToEl0(SB),NOSPLIT,$0
 	MOVD PTRACE_PSTATE(RSV_REG_APP), R1
 	WORD $0xd5184001  //MSR R1, SPSR_EL1
 
+	// need use kernel space address to excute below code, since
+	// after SWITCH_TO_APP_PAGETABLE the ASID is changed to app's
+	// ASID.
+	WORD $0x10000061		// ADR R1, do_exit_to_el0
+	ORR $0xffff000000000000, R1, R1
+	JMP (R1)
+
+do_exit_to_el0:
 	// RSV_REG & RSV_REG_APP will be loaded at the end.
 	REGISTERS_LOAD(RSV_REG_APP, 0)
+	MOVD PTRACE_TLS(RSV_REG_APP), RSV_REG
+	MSR RSV_REG, TPIDR_EL0
 
 	// switch to user pagetable.
 	MOVD PTRACE_R18(RSV_REG_APP), RSV_REG
@@ -569,8 +599,6 @@ TEXT ·kernelExitToEl1(SB),NOSPLIT,$0
 
 // Start is the CPU entrypoint.
 TEXT ·Start(SB),NOSPLIT,$0
-	// Flush dcache.
-	WORD $0xd5087e52 // DC CISW
 	// Init.
 	MOVD $SCTLR_EL1_DEFAULT, R1
 	MSR R1, SCTLR_EL1
@@ -714,21 +742,7 @@ el0_svc:
 
 el0_da:
 el0_ia:
-	WORD $0xd538d092     //MRS   TPIDR_EL1, R18
-	WORD $0xd538601a     //MRS   FAR_EL1, R26
-
-	MOVD R26, CPU_FAULT_ADDR(RSV_REG)
-
-	MOVD $1, R3
-	MOVD R3, CPU_ERROR_TYPE(RSV_REG) // Set error type to user.
-
-	MOVD $PageFault, R3
-	MOVD R3, CPU_VECTOR_CODE(RSV_REG)
-
-	MRS ESR_EL1, R3
-	MOVD R3, CPU_ERROR_CODE(RSV_REG)
-
-	B ·kernelExitToEl1(SB)
+	EXCEPTION_WITH_ERROR(1, PageFault)
 
 el0_fpsimd_acc:
 	B ·Shutdown(SB)
@@ -743,10 +757,7 @@ el0_sp_pc:
 	B ·Shutdown(SB)
 
 el0_undef:
-	MOVD $El0Sync_undef, R3
-	MOVD R3, CPU_VECTOR_CODE(RSV_REG)
-
-	B ·kernelExitToEl1(SB)
+	EXCEPTION_WITH_ERROR(1, El0Sync_undef)
 
 el0_dbg:
 	B ·Shutdown(SB)

@@ -8,11 +8,11 @@ import (
 	"gvisor.dev/gvisor/pkg/state"
 )
 
-func (x *FeatureSet) StateTypeName() string {
+func (fs *FeatureSet) StateTypeName() string {
 	return "pkg/cpuid.FeatureSet"
 }
 
-func (x *FeatureSet) StateFields() []string {
+func (fs *FeatureSet) StateFields() []string {
 	return []string{
 		"Set",
 		"CPUImplementer",
@@ -23,27 +23,27 @@ func (x *FeatureSet) StateFields() []string {
 	}
 }
 
-func (x *FeatureSet) beforeSave() {}
+func (fs *FeatureSet) beforeSave() {}
 
-func (x *FeatureSet) StateSave(m state.Sink) {
-	x.beforeSave()
-	m.Save(0, &x.Set)
-	m.Save(1, &x.CPUImplementer)
-	m.Save(2, &x.CPUArchitecture)
-	m.Save(3, &x.CPUVariant)
-	m.Save(4, &x.CPUPartnum)
-	m.Save(5, &x.CPURevision)
+func (fs *FeatureSet) StateSave(stateSinkObject state.Sink) {
+	fs.beforeSave()
+	stateSinkObject.Save(0, &fs.Set)
+	stateSinkObject.Save(1, &fs.CPUImplementer)
+	stateSinkObject.Save(2, &fs.CPUArchitecture)
+	stateSinkObject.Save(3, &fs.CPUVariant)
+	stateSinkObject.Save(4, &fs.CPUPartnum)
+	stateSinkObject.Save(5, &fs.CPURevision)
 }
 
-func (x *FeatureSet) afterLoad() {}
+func (fs *FeatureSet) afterLoad() {}
 
-func (x *FeatureSet) StateLoad(m state.Source) {
-	m.Load(0, &x.Set)
-	m.Load(1, &x.CPUImplementer)
-	m.Load(2, &x.CPUArchitecture)
-	m.Load(3, &x.CPUVariant)
-	m.Load(4, &x.CPUPartnum)
-	m.Load(5, &x.CPURevision)
+func (fs *FeatureSet) StateLoad(stateSourceObject state.Source) {
+	stateSourceObject.Load(0, &fs.Set)
+	stateSourceObject.Load(1, &fs.CPUImplementer)
+	stateSourceObject.Load(2, &fs.CPUArchitecture)
+	stateSourceObject.Load(3, &fs.CPUVariant)
+	stateSourceObject.Load(4, &fs.CPUPartnum)
+	stateSourceObject.Load(5, &fs.CPURevision)
 }
 
 func init() {

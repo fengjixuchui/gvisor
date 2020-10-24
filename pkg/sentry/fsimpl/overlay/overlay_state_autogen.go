@@ -6,11 +6,11 @@ import (
 	"gvisor.dev/gvisor/pkg/state"
 )
 
-func (x *directoryFD) StateTypeName() string {
+func (fd *directoryFD) StateTypeName() string {
 	return "pkg/sentry/fsimpl/overlay.directoryFD"
 }
 
-func (x *directoryFD) StateFields() []string {
+func (fd *directoryFD) StateFields() []string {
 	return []string{
 		"fileDescription",
 		"DirectoryFileDescriptionDefaultImpl",
@@ -20,109 +20,77 @@ func (x *directoryFD) StateFields() []string {
 	}
 }
 
-func (x *directoryFD) beforeSave() {}
+func (fd *directoryFD) beforeSave() {}
 
-func (x *directoryFD) StateSave(m state.Sink) {
-	x.beforeSave()
-	m.Save(0, &x.fileDescription)
-	m.Save(1, &x.DirectoryFileDescriptionDefaultImpl)
-	m.Save(2, &x.DentryMetadataFileDescriptionImpl)
-	m.Save(3, &x.off)
-	m.Save(4, &x.dirents)
+func (fd *directoryFD) StateSave(stateSinkObject state.Sink) {
+	fd.beforeSave()
+	stateSinkObject.Save(0, &fd.fileDescription)
+	stateSinkObject.Save(1, &fd.DirectoryFileDescriptionDefaultImpl)
+	stateSinkObject.Save(2, &fd.DentryMetadataFileDescriptionImpl)
+	stateSinkObject.Save(3, &fd.off)
+	stateSinkObject.Save(4, &fd.dirents)
 }
 
-func (x *directoryFD) afterLoad() {}
+func (fd *directoryFD) afterLoad() {}
 
-func (x *directoryFD) StateLoad(m state.Source) {
-	m.Load(0, &x.fileDescription)
-	m.Load(1, &x.DirectoryFileDescriptionDefaultImpl)
-	m.Load(2, &x.DentryMetadataFileDescriptionImpl)
-	m.Load(3, &x.off)
-	m.Load(4, &x.dirents)
+func (fd *directoryFD) StateLoad(stateSourceObject state.Source) {
+	stateSourceObject.Load(0, &fd.fileDescription)
+	stateSourceObject.Load(1, &fd.DirectoryFileDescriptionDefaultImpl)
+	stateSourceObject.Load(2, &fd.DentryMetadataFileDescriptionImpl)
+	stateSourceObject.Load(3, &fd.off)
+	stateSourceObject.Load(4, &fd.dirents)
 }
 
-func (x *nonDirectoryFD) StateTypeName() string {
-	return "pkg/sentry/fsimpl/overlay.nonDirectoryFD"
-}
-
-func (x *nonDirectoryFD) StateFields() []string {
-	return []string{
-		"fileDescription",
-		"copiedUp",
-		"cachedFD",
-		"cachedFlags",
-	}
-}
-
-func (x *nonDirectoryFD) beforeSave() {}
-
-func (x *nonDirectoryFD) StateSave(m state.Sink) {
-	x.beforeSave()
-	m.Save(0, &x.fileDescription)
-	m.Save(1, &x.copiedUp)
-	m.Save(2, &x.cachedFD)
-	m.Save(3, &x.cachedFlags)
-}
-
-func (x *nonDirectoryFD) afterLoad() {}
-
-func (x *nonDirectoryFD) StateLoad(m state.Source) {
-	m.Load(0, &x.fileDescription)
-	m.Load(1, &x.copiedUp)
-	m.Load(2, &x.cachedFD)
-	m.Load(3, &x.cachedFlags)
-}
-
-func (x *FilesystemType) StateTypeName() string {
+func (fstype *FilesystemType) StateTypeName() string {
 	return "pkg/sentry/fsimpl/overlay.FilesystemType"
 }
 
-func (x *FilesystemType) StateFields() []string {
+func (fstype *FilesystemType) StateFields() []string {
 	return []string{}
 }
 
-func (x *FilesystemType) beforeSave() {}
+func (fstype *FilesystemType) beforeSave() {}
 
-func (x *FilesystemType) StateSave(m state.Sink) {
-	x.beforeSave()
+func (fstype *FilesystemType) StateSave(stateSinkObject state.Sink) {
+	fstype.beforeSave()
 }
 
-func (x *FilesystemType) afterLoad() {}
+func (fstype *FilesystemType) afterLoad() {}
 
-func (x *FilesystemType) StateLoad(m state.Source) {
+func (fstype *FilesystemType) StateLoad(stateSourceObject state.Source) {
 }
 
-func (x *FilesystemOptions) StateTypeName() string {
+func (f *FilesystemOptions) StateTypeName() string {
 	return "pkg/sentry/fsimpl/overlay.FilesystemOptions"
 }
 
-func (x *FilesystemOptions) StateFields() []string {
+func (f *FilesystemOptions) StateFields() []string {
 	return []string{
 		"UpperRoot",
 		"LowerRoots",
 	}
 }
 
-func (x *FilesystemOptions) beforeSave() {}
+func (f *FilesystemOptions) beforeSave() {}
 
-func (x *FilesystemOptions) StateSave(m state.Sink) {
-	x.beforeSave()
-	m.Save(0, &x.UpperRoot)
-	m.Save(1, &x.LowerRoots)
+func (f *FilesystemOptions) StateSave(stateSinkObject state.Sink) {
+	f.beforeSave()
+	stateSinkObject.Save(0, &f.UpperRoot)
+	stateSinkObject.Save(1, &f.LowerRoots)
 }
 
-func (x *FilesystemOptions) afterLoad() {}
+func (f *FilesystemOptions) afterLoad() {}
 
-func (x *FilesystemOptions) StateLoad(m state.Source) {
-	m.Load(0, &x.UpperRoot)
-	m.Load(1, &x.LowerRoots)
+func (f *FilesystemOptions) StateLoad(stateSourceObject state.Source) {
+	stateSourceObject.Load(0, &f.UpperRoot)
+	stateSourceObject.Load(1, &f.LowerRoots)
 }
 
-func (x *filesystem) StateTypeName() string {
+func (fs *filesystem) StateTypeName() string {
 	return "pkg/sentry/fsimpl/overlay.filesystem"
 }
 
-func (x *filesystem) StateFields() []string {
+func (fs *filesystem) StateFields() []string {
 	return []string{
 		"vfsfs",
 		"opts",
@@ -133,34 +101,34 @@ func (x *filesystem) StateFields() []string {
 	}
 }
 
-func (x *filesystem) beforeSave() {}
+func (fs *filesystem) beforeSave() {}
 
-func (x *filesystem) StateSave(m state.Sink) {
-	x.beforeSave()
-	m.Save(0, &x.vfsfs)
-	m.Save(1, &x.opts)
-	m.Save(2, &x.creds)
-	m.Save(3, &x.dirDevMinor)
-	m.Save(4, &x.lowerDevMinors)
-	m.Save(5, &x.lastDirIno)
+func (fs *filesystem) StateSave(stateSinkObject state.Sink) {
+	fs.beforeSave()
+	stateSinkObject.Save(0, &fs.vfsfs)
+	stateSinkObject.Save(1, &fs.opts)
+	stateSinkObject.Save(2, &fs.creds)
+	stateSinkObject.Save(3, &fs.dirDevMinor)
+	stateSinkObject.Save(4, &fs.lowerDevMinors)
+	stateSinkObject.Save(5, &fs.lastDirIno)
 }
 
-func (x *filesystem) afterLoad() {}
+func (fs *filesystem) afterLoad() {}
 
-func (x *filesystem) StateLoad(m state.Source) {
-	m.Load(0, &x.vfsfs)
-	m.Load(1, &x.opts)
-	m.Load(2, &x.creds)
-	m.Load(3, &x.dirDevMinor)
-	m.Load(4, &x.lowerDevMinors)
-	m.Load(5, &x.lastDirIno)
+func (fs *filesystem) StateLoad(stateSourceObject state.Source) {
+	stateSourceObject.Load(0, &fs.vfsfs)
+	stateSourceObject.Load(1, &fs.opts)
+	stateSourceObject.Load(2, &fs.creds)
+	stateSourceObject.Load(3, &fs.dirDevMinor)
+	stateSourceObject.Load(4, &fs.lowerDevMinors)
+	stateSourceObject.Load(5, &fs.lastDirIno)
 }
 
-func (x *dentry) StateTypeName() string {
+func (d *dentry) StateTypeName() string {
 	return "pkg/sentry/fsimpl/overlay.dentry"
 }
 
-func (x *dentry) StateFields() []string {
+func (d *dentry) StateFields() []string {
 	return []string{
 		"vfsd",
 		"refs",
@@ -179,9 +147,7 @@ func (x *dentry) StateFields() []string {
 		"devMajor",
 		"devMinor",
 		"ino",
-		"mapsMu",
 		"lowerMappings",
-		"dataMu",
 		"wrappedMappable",
 		"isMappable",
 		"locks",
@@ -189,70 +155,66 @@ func (x *dentry) StateFields() []string {
 	}
 }
 
-func (x *dentry) beforeSave() {}
+func (d *dentry) beforeSave() {}
 
-func (x *dentry) StateSave(m state.Sink) {
-	x.beforeSave()
-	m.Save(0, &x.vfsd)
-	m.Save(1, &x.refs)
-	m.Save(2, &x.fs)
-	m.Save(3, &x.mode)
-	m.Save(4, &x.uid)
-	m.Save(5, &x.gid)
-	m.Save(6, &x.copiedUp)
-	m.Save(7, &x.parent)
-	m.Save(8, &x.name)
-	m.Save(9, &x.children)
-	m.Save(10, &x.dirents)
-	m.Save(11, &x.upperVD)
-	m.Save(12, &x.lowerVDs)
-	m.Save(13, &x.inlineLowerVDs)
-	m.Save(14, &x.devMajor)
-	m.Save(15, &x.devMinor)
-	m.Save(16, &x.ino)
-	m.Save(17, &x.mapsMu)
-	m.Save(18, &x.lowerMappings)
-	m.Save(19, &x.dataMu)
-	m.Save(20, &x.wrappedMappable)
-	m.Save(21, &x.isMappable)
-	m.Save(22, &x.locks)
-	m.Save(23, &x.watches)
+func (d *dentry) StateSave(stateSinkObject state.Sink) {
+	d.beforeSave()
+	stateSinkObject.Save(0, &d.vfsd)
+	stateSinkObject.Save(1, &d.refs)
+	stateSinkObject.Save(2, &d.fs)
+	stateSinkObject.Save(3, &d.mode)
+	stateSinkObject.Save(4, &d.uid)
+	stateSinkObject.Save(5, &d.gid)
+	stateSinkObject.Save(6, &d.copiedUp)
+	stateSinkObject.Save(7, &d.parent)
+	stateSinkObject.Save(8, &d.name)
+	stateSinkObject.Save(9, &d.children)
+	stateSinkObject.Save(10, &d.dirents)
+	stateSinkObject.Save(11, &d.upperVD)
+	stateSinkObject.Save(12, &d.lowerVDs)
+	stateSinkObject.Save(13, &d.inlineLowerVDs)
+	stateSinkObject.Save(14, &d.devMajor)
+	stateSinkObject.Save(15, &d.devMinor)
+	stateSinkObject.Save(16, &d.ino)
+	stateSinkObject.Save(17, &d.lowerMappings)
+	stateSinkObject.Save(18, &d.wrappedMappable)
+	stateSinkObject.Save(19, &d.isMappable)
+	stateSinkObject.Save(20, &d.locks)
+	stateSinkObject.Save(21, &d.watches)
 }
 
-func (x *dentry) afterLoad() {}
+func (d *dentry) afterLoad() {}
 
-func (x *dentry) StateLoad(m state.Source) {
-	m.Load(0, &x.vfsd)
-	m.Load(1, &x.refs)
-	m.Load(2, &x.fs)
-	m.Load(3, &x.mode)
-	m.Load(4, &x.uid)
-	m.Load(5, &x.gid)
-	m.Load(6, &x.copiedUp)
-	m.Load(7, &x.parent)
-	m.Load(8, &x.name)
-	m.Load(9, &x.children)
-	m.Load(10, &x.dirents)
-	m.Load(11, &x.upperVD)
-	m.Load(12, &x.lowerVDs)
-	m.Load(13, &x.inlineLowerVDs)
-	m.Load(14, &x.devMajor)
-	m.Load(15, &x.devMinor)
-	m.Load(16, &x.ino)
-	m.Load(17, &x.mapsMu)
-	m.Load(18, &x.lowerMappings)
-	m.Load(19, &x.dataMu)
-	m.Load(20, &x.wrappedMappable)
-	m.Load(21, &x.isMappable)
-	m.Load(22, &x.locks)
-	m.Load(23, &x.watches)
+func (d *dentry) StateLoad(stateSourceObject state.Source) {
+	stateSourceObject.Load(0, &d.vfsd)
+	stateSourceObject.Load(1, &d.refs)
+	stateSourceObject.Load(2, &d.fs)
+	stateSourceObject.Load(3, &d.mode)
+	stateSourceObject.Load(4, &d.uid)
+	stateSourceObject.Load(5, &d.gid)
+	stateSourceObject.Load(6, &d.copiedUp)
+	stateSourceObject.Load(7, &d.parent)
+	stateSourceObject.Load(8, &d.name)
+	stateSourceObject.Load(9, &d.children)
+	stateSourceObject.Load(10, &d.dirents)
+	stateSourceObject.Load(11, &d.upperVD)
+	stateSourceObject.Load(12, &d.lowerVDs)
+	stateSourceObject.Load(13, &d.inlineLowerVDs)
+	stateSourceObject.Load(14, &d.devMajor)
+	stateSourceObject.Load(15, &d.devMinor)
+	stateSourceObject.Load(16, &d.ino)
+	stateSourceObject.Load(17, &d.lowerMappings)
+	stateSourceObject.Load(18, &d.wrappedMappable)
+	stateSourceObject.Load(19, &d.isMappable)
+	stateSourceObject.Load(20, &d.locks)
+	stateSourceObject.Load(21, &d.watches)
 }
 
-func (x *fileDescription) StateTypeName() string {
+func (fd *fileDescription) StateTypeName() string {
 	return "pkg/sentry/fsimpl/overlay.fileDescription"
 }
 
-func (x *fileDescription) StateFields() []string {
+func (fd *fileDescription) StateFields() []string {
 	return []string{
 		"vfsfd",
 		"FileDescriptionDefaultImpl",
@@ -260,29 +222,64 @@ func (x *fileDescription) StateFields() []string {
 	}
 }
 
-func (x *fileDescription) beforeSave() {}
+func (fd *fileDescription) beforeSave() {}
 
-func (x *fileDescription) StateSave(m state.Sink) {
-	x.beforeSave()
-	m.Save(0, &x.vfsfd)
-	m.Save(1, &x.FileDescriptionDefaultImpl)
-	m.Save(2, &x.LockFD)
+func (fd *fileDescription) StateSave(stateSinkObject state.Sink) {
+	fd.beforeSave()
+	stateSinkObject.Save(0, &fd.vfsfd)
+	stateSinkObject.Save(1, &fd.FileDescriptionDefaultImpl)
+	stateSinkObject.Save(2, &fd.LockFD)
 }
 
-func (x *fileDescription) afterLoad() {}
+func (fd *fileDescription) afterLoad() {}
 
-func (x *fileDescription) StateLoad(m state.Source) {
-	m.Load(0, &x.vfsfd)
-	m.Load(1, &x.FileDescriptionDefaultImpl)
-	m.Load(2, &x.LockFD)
+func (fd *fileDescription) StateLoad(stateSourceObject state.Source) {
+	stateSourceObject.Load(0, &fd.vfsfd)
+	stateSourceObject.Load(1, &fd.FileDescriptionDefaultImpl)
+	stateSourceObject.Load(2, &fd.LockFD)
+}
+
+func (fd *regularFileFD) StateTypeName() string {
+	return "pkg/sentry/fsimpl/overlay.regularFileFD"
+}
+
+func (fd *regularFileFD) StateFields() []string {
+	return []string{
+		"fileDescription",
+		"copiedUp",
+		"cachedFD",
+		"cachedFlags",
+		"lowerWaiters",
+	}
+}
+
+func (fd *regularFileFD) beforeSave() {}
+
+func (fd *regularFileFD) StateSave(stateSinkObject state.Sink) {
+	fd.beforeSave()
+	stateSinkObject.Save(0, &fd.fileDescription)
+	stateSinkObject.Save(1, &fd.copiedUp)
+	stateSinkObject.Save(2, &fd.cachedFD)
+	stateSinkObject.Save(3, &fd.cachedFlags)
+	stateSinkObject.Save(4, &fd.lowerWaiters)
+}
+
+func (fd *regularFileFD) afterLoad() {}
+
+func (fd *regularFileFD) StateLoad(stateSourceObject state.Source) {
+	stateSourceObject.Load(0, &fd.fileDescription)
+	stateSourceObject.Load(1, &fd.copiedUp)
+	stateSourceObject.Load(2, &fd.cachedFD)
+	stateSourceObject.Load(3, &fd.cachedFlags)
+	stateSourceObject.Load(4, &fd.lowerWaiters)
 }
 
 func init() {
 	state.Register((*directoryFD)(nil))
-	state.Register((*nonDirectoryFD)(nil))
 	state.Register((*FilesystemType)(nil))
 	state.Register((*FilesystemOptions)(nil))
 	state.Register((*filesystem)(nil))
 	state.Register((*dentry)(nil))
 	state.Register((*fileDescription)(nil))
+	state.Register((*regularFileFD)(nil))
 }

@@ -103,8 +103,11 @@ type vCPU struct {
 	// tid is the last set tid.
 	tid uint64
 
-	// switches is a count of world switches (informational only).
-	switches uint32
+	// userExits is the count of user exits.
+	userExits uint64
+
+	// guestExits is the count of guest to host world switches.
+	guestExits uint64
 
 	// faults is a count of world faults (informational only).
 	faults uint32
@@ -127,6 +130,7 @@ type vCPU struct {
 	// vCPUArchState is the architecture-specific state.
 	vCPUArchState
 
+	// dieState holds state related to vCPU death.
 	dieState dieState
 }
 
@@ -155,7 +159,7 @@ func (m *machine) newVCPU() *vCPU {
 		fd:      int(fd),
 		machine: m,
 	}
-	c.CPU.Init(&m.kernel, c)
+	c.CPU.Init(&m.kernel, c.id, c)
 	m.vCPUsByID[c.id] = c
 
 	// Ensure the signal mask is correct.
@@ -183,9 +187,6 @@ func newMachine(vm int) (*machine, error) {
 	// Create the machine.
 	m := &machine{fd: vm}
 	m.available.L = &m.mu
-	m.kernel.Init(ring0.KernelOpts{
-		PageTables: pagetables.New(newAllocator()),
-	})
 
 	// Pull the maximum vCPUs.
 	maxVCPUs, _, errno := syscall.RawSyscall(syscall.SYS_IOCTL, uintptr(m.fd), _KVM_CHECK_EXTENSION, _KVM_CAP_MAX_VCPUS)
@@ -197,6 +198,9 @@ func newMachine(vm int) (*machine, error) {
 	log.Debugf("The maximum number of vCPUs is %d.", m.maxVCPUs)
 	m.vCPUsByTID = make(map[uint64]*vCPU)
 	m.vCPUsByID = make([]*vCPU, m.maxVCPUs)
+	m.kernel.Init(ring0.KernelOpts{
+		PageTables: pagetables.New(newAllocator()),
+	}, m.maxVCPUs)
 
 	// Pull the maximum slots.
 	maxSlots, _, errno := syscall.RawSyscall(syscall.SYS_IOCTL, uintptr(m.fd), _KVM_CHECK_EXTENSION, _KVM_CAP_MAX_MEMSLOTS)
@@ -219,15 +223,9 @@ func newMachine(vm int) (*machine, error) {
 			pagetables.MapOpts{AccessType: usermem.AnyAccess},
 			pr.physical)
 
-		// And keep everything in the upper half.
-		m.kernel.PageTables.Map(
-			usermem.Addr(ring0.KernelStartAddress|pr.virtual),
-			pr.length,
-			pagetables.MapOpts{AccessType: usermem.AnyAccess},
-			pr.physical)
-
 		return true // Keep iterating.
 	})
+	m.mapUpperHalf(m.kernel.PageTables)
 
 	var physicalRegionsReadOnly []physicalRegion
 	var physicalRegionsAvailable []physicalRegion
@@ -365,6 +363,11 @@ func (m *machine) Destroy() {
 // Get gets an available vCPU.
 //
 // This will return with the OS thread locked.
+//
+// It is guaranteed that if any OS thread TID is in guest, m.vCPUs[TID] points
+// to the vCPU in which the OS thread TID is running. So if Get() returns with
+// the corrent context in guest, the vCPU of it must be the same as what
+// Get() returns.
 func (m *machine) Get() *vCPU {
 	m.mu.RLock()
 	runtime.LockOSThread()
@@ -469,6 +472,19 @@ func (m *machine) newDirtySet() *dirtySet {
 	}
 }
 
+// dropPageTables drops cached page table entries.
+func (m *machine) dropPageTables(pt *pagetables.PageTables) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	// Clear from all PCIDs.
+	for _, c := range m.vCPUsByID {
+		if c != nil && c.PCIDs != nil {
+			c.PCIDs.Drop(pt)
+		}
+	}
+}
+
 // lock marks the vCPU as in user mode.
 //
 // This should only be called directly when known to be safe, i.e. when
@@ -528,6 +544,8 @@ var pid = syscall.Getpid()
 //
 // This effectively unwinds the state machine.
 func (c *vCPU) bounce(forceGuestExit bool) {
+	origGuestExits := atomic.LoadUint64(&c.guestExits)
+	origUserExits := atomic.LoadUint64(&c.userExits)
 	for {
 		switch state := atomic.LoadUint32(&c.state); state {
 		case vCPUReady, vCPUWaiter:
@@ -582,6 +600,14 @@ func (c *vCPU) bounce(forceGuestExit bool) {
 		default:
 			// Should not happen: the above is exhaustive.
 			panic("invalid state")
+		}
+
+		// Check if we've missed the state transition, but
+		// we can safely return at this point in time.
+		newGuestExits := atomic.LoadUint64(&c.guestExits)
+		newUserExits := atomic.LoadUint64(&c.userExits)
+		if newUserExits != origUserExits && (!forceGuestExit || newGuestExits != origGuestExits) {
+			return
 		}
 	}
 }

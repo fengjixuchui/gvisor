@@ -39,6 +39,9 @@ func (filesystemType) Name() string {
 	return "pipefs"
 }
 
+// Release implements vfs.FilesystemType.Release.
+func (filesystemType) Release(ctx context.Context) {}
+
 // GetFilesystem implements vfs.FilesystemType.GetFilesystem.
 func (filesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.VirtualFilesystem, creds *auth.Credentials, source string, opts vfs.GetFilesystemOptions) (*vfs.Filesystem, *vfs.Dentry, error) {
 	panic("pipefs.filesystemType.GetFilesystem should never be called")
@@ -165,7 +168,7 @@ func NewConnectedPipeFDs(ctx context.Context, mnt *vfs.Mount, flags uint32) (*vf
 	fs := mnt.Filesystem().Impl().(*filesystem)
 	inode := newInode(ctx, fs)
 	var d kernfs.Dentry
-	d.Init(inode)
+	d.Init(&fs.Filesystem, inode)
 	defer d.DecRef(ctx)
 	return inode.pipe.ReaderWriterPair(mnt, d.VFSDentry(), flags)
 }

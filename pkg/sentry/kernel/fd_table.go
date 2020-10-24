@@ -110,7 +110,7 @@ func (f *FDTable) saveDescriptorTable() map[int32]descriptor {
 
 func (f *FDTable) loadDescriptorTable(m map[int32]descriptor) {
 	ctx := context.Background()
-	f.init() // Initialize table.
+	f.initNoLeakCheck() // Initialize table.
 	f.used = 0
 	for fd, d := range m {
 		if file, fileVFS2 := f.setAll(ctx, fd, d.file, d.fileVFS2, d.flags); file != nil || fileVFS2 != nil {
@@ -240,6 +240,10 @@ func (f *FDTable) String() string {
 
 		case fileVFS2 != nil:
 			vfsObj := fileVFS2.Mount().Filesystem().VirtualFilesystem()
+			vd := fileVFS2.VirtualDentry()
+			if vd.Dentry() == nil {
+				panic(fmt.Sprintf("fd %d (type %T) has nil dentry: %#v", fd, fileVFS2.Impl(), fileVFS2))
+			}
 			name, err := vfsObj.PathnameWithDeleted(ctx, vfs.VirtualDentry{}, fileVFS2.VirtualDentry())
 			if err != nil {
 				fmt.Fprintf(&buf, "<err: %v>\n", err)

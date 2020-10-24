@@ -6,34 +6,34 @@ import (
 	"gvisor.dev/gvisor/pkg/state"
 )
 
-func (x *fsFile) StateTypeName() string {
+func (f *fsFile) StateTypeName() string {
 	return "pkg/sentry/fsbridge.fsFile"
 }
 
-func (x *fsFile) StateFields() []string {
+func (f *fsFile) StateFields() []string {
 	return []string{
 		"file",
 	}
 }
 
-func (x *fsFile) beforeSave() {}
+func (f *fsFile) beforeSave() {}
 
-func (x *fsFile) StateSave(m state.Sink) {
-	x.beforeSave()
-	m.Save(0, &x.file)
+func (f *fsFile) StateSave(stateSinkObject state.Sink) {
+	f.beforeSave()
+	stateSinkObject.Save(0, &f.file)
 }
 
-func (x *fsFile) afterLoad() {}
+func (f *fsFile) afterLoad() {}
 
-func (x *fsFile) StateLoad(m state.Source) {
-	m.Load(0, &x.file)
+func (f *fsFile) StateLoad(stateSourceObject state.Source) {
+	stateSourceObject.Load(0, &f.file)
 }
 
-func (x *fsLookup) StateTypeName() string {
+func (l *fsLookup) StateTypeName() string {
 	return "pkg/sentry/fsbridge.fsLookup"
 }
 
-func (x *fsLookup) StateFields() []string {
+func (l *fsLookup) StateFields() []string {
 	return []string{
 		"mntns",
 		"root",
@@ -41,51 +41,51 @@ func (x *fsLookup) StateFields() []string {
 	}
 }
 
-func (x *fsLookup) beforeSave() {}
+func (l *fsLookup) beforeSave() {}
 
-func (x *fsLookup) StateSave(m state.Sink) {
-	x.beforeSave()
-	m.Save(0, &x.mntns)
-	m.Save(1, &x.root)
-	m.Save(2, &x.workingDir)
+func (l *fsLookup) StateSave(stateSinkObject state.Sink) {
+	l.beforeSave()
+	stateSinkObject.Save(0, &l.mntns)
+	stateSinkObject.Save(1, &l.root)
+	stateSinkObject.Save(2, &l.workingDir)
 }
 
-func (x *fsLookup) afterLoad() {}
+func (l *fsLookup) afterLoad() {}
 
-func (x *fsLookup) StateLoad(m state.Source) {
-	m.Load(0, &x.mntns)
-	m.Load(1, &x.root)
-	m.Load(2, &x.workingDir)
+func (l *fsLookup) StateLoad(stateSourceObject state.Source) {
+	stateSourceObject.Load(0, &l.mntns)
+	stateSourceObject.Load(1, &l.root)
+	stateSourceObject.Load(2, &l.workingDir)
 }
 
-func (x *VFSFile) StateTypeName() string {
+func (f *VFSFile) StateTypeName() string {
 	return "pkg/sentry/fsbridge.VFSFile"
 }
 
-func (x *VFSFile) StateFields() []string {
+func (f *VFSFile) StateFields() []string {
 	return []string{
 		"file",
 	}
 }
 
-func (x *VFSFile) beforeSave() {}
+func (f *VFSFile) beforeSave() {}
 
-func (x *VFSFile) StateSave(m state.Sink) {
-	x.beforeSave()
-	m.Save(0, &x.file)
+func (f *VFSFile) StateSave(stateSinkObject state.Sink) {
+	f.beforeSave()
+	stateSinkObject.Save(0, &f.file)
 }
 
-func (x *VFSFile) afterLoad() {}
+func (f *VFSFile) afterLoad() {}
 
-func (x *VFSFile) StateLoad(m state.Source) {
-	m.Load(0, &x.file)
+func (f *VFSFile) StateLoad(stateSourceObject state.Source) {
+	stateSourceObject.Load(0, &f.file)
 }
 
-func (x *vfsLookup) StateTypeName() string {
+func (l *vfsLookup) StateTypeName() string {
 	return "pkg/sentry/fsbridge.vfsLookup"
 }
 
-func (x *vfsLookup) StateFields() []string {
+func (l *vfsLookup) StateFields() []string {
 	return []string{
 		"mntns",
 		"root",
@@ -93,21 +93,21 @@ func (x *vfsLookup) StateFields() []string {
 	}
 }
 
-func (x *vfsLookup) beforeSave() {}
+func (l *vfsLookup) beforeSave() {}
 
-func (x *vfsLookup) StateSave(m state.Sink) {
-	x.beforeSave()
-	m.Save(0, &x.mntns)
-	m.Save(1, &x.root)
-	m.Save(2, &x.workingDir)
+func (l *vfsLookup) StateSave(stateSinkObject state.Sink) {
+	l.beforeSave()
+	stateSinkObject.Save(0, &l.mntns)
+	stateSinkObject.Save(1, &l.root)
+	stateSinkObject.Save(2, &l.workingDir)
 }
 
-func (x *vfsLookup) afterLoad() {}
+func (l *vfsLookup) afterLoad() {}
 
-func (x *vfsLookup) StateLoad(m state.Source) {
-	m.Load(0, &x.mntns)
-	m.Load(1, &x.root)
-	m.Load(2, &x.workingDir)
+func (l *vfsLookup) StateLoad(stateSourceObject state.Source) {
+	stateSourceObject.Load(0, &l.mntns)
+	stateSourceObject.Load(1, &l.root)
+	stateSourceObject.Load(2, &l.workingDir)
 }
 
 func init() {

@@ -42,7 +42,7 @@ type regularFile struct {
 	inode inode
 
 	// memFile is a platform.File used to allocate pages to this regularFile.
-	memFile *pgalloc.MemoryFile
+	memFile *pgalloc.MemoryFile `state:"nosave"`
 
 	// memoryUsageKind is the memory accounting category under which pages backing
 	// this regularFile's contents are accounted.
@@ -92,7 +92,7 @@ type regularFile struct {
 
 func (fs *filesystem) newRegularFile(kuid auth.KUID, kgid auth.KGID, mode linux.FileMode) *inode {
 	file := &regularFile{
-		memFile:         fs.memFile,
+		memFile:         fs.mfp.MemoryFile(),
 		memoryUsageKind: usage.Tmpfs,
 		seals:           linux.F_SEAL_SEAL,
 	}
@@ -293,7 +293,7 @@ func (rf *regularFile) Translate(ctx context.Context, required, optional memmap.
 		optional.End = pgend
 	}
 
-	cerr := rf.data.Fill(ctx, required, optional, rf.memFile, rf.memoryUsageKind, func(_ context.Context, dsts safemem.BlockSeq, _ uint64) (uint64, error) {
+	cerr := rf.data.Fill(ctx, required, optional, rf.size, rf.memFile, rf.memoryUsageKind, func(_ context.Context, dsts safemem.BlockSeq, _ uint64) (uint64, error) {
 		// Newly-allocated pages are zeroed, so we don't need to do anything.
 		return dsts.NumBytes(), nil
 	})
